@@ -362,6 +362,12 @@
                     you replaced Navidrome with Emby but both point at the same files on disk.
                 </p>
                 <p style="margin:0 0 0.5rem;">
+                    <strong>Navidrome 0.64.0 or newer:</strong> Navidrome changed its internal track IDs
+                    in 0.64.0. If AudioMuse-AI was connected before that upgrade, use this page to migrate
+                    from Navidrome to the same Navidrome instance and library. This refreshes the track ID
+                    mappings while keeping the existing analysis. Back up the AudioMuse-AI database first.
+                </p>
+                <p style="margin:0 0 0.5rem;">
                     <strong>Best results:</strong> both providers expose the library from the
                     <em>same mount path</em>. The matcher&rsquo;s most reliable tier is full file-path
                     matching; metadata fallbacks work but are looser and can&rsquo;t always disambiguate

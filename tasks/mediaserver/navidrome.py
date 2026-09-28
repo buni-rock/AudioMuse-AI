@@ -671,6 +671,50 @@ def _create_playlist_batched(playlist_name, item_ids, user_creds=None):
                 )
             return None
 
+    # OpenSubsonic can return status=ok while silently ignoring song IDs that
+    # no longer exist. Navidrome 0.64.0 re-encoded its internal IDs, so a stale
+    # AudioMuse server mapping can otherwise produce a short, apparently
+    # successful playlist. Read the playlist back before reporting success.
+    persisted_playlist = _get_playlist_detail(new_playlist_id, user_creds=user_creds)
+    if persisted_playlist is None:
+        logger.error(
+            "Could not verify the contents of newly created Navidrome playlist '%s' "
+            "(ID: %s); leaving it in place for inspection.",
+            playlist_name,
+            new_playlist_id,
+        )
+        return None
+
+    persisted_entries = _coerce_to_list(persisted_playlist.get('entry'))
+    persisted_ids = [
+        str(entry.get('id')) for entry in persisted_entries
+        if isinstance(entry, dict) and entry.get('id')
+    ]
+    if persisted_ids != [str(item_id) for item_id in item_ids]:
+        logger.error(
+            "Navidrome playlist '%s' (ID: %s) did not persist the requested tracks: "
+            "requested=%d, persisted=%d. The server's track ID mapping may be stale; "
+            "after a Navidrome 0.64.0+ upgrade, run Provider Migration against the "
+            "same Navidrome library to realign IDs.",
+            playlist_name,
+            new_playlist_id,
+            len(item_ids),
+            len(persisted_ids),
+        )
+        delete_response = _navidrome_request(
+            "deletePlaylist",
+            {"id": new_playlist_id},
+            method='post',
+            user_creds=user_creds,
+        )
+        if not (delete_response and delete_response.get("status") == "ok"):
+            logger.error(
+                "Failed to delete incomplete Navidrome playlist '%s' (ID: %s).",
+                playlist_name,
+                new_playlist_id,
+            )
+        return None
+
     new_playlist['Id'] = new_playlist.get('id')
     new_playlist['Name'] = new_playlist.get('name')
 
