@@ -1760,17 +1760,20 @@ ENABLE_PROXY_FIX = os.environ.get("ENABLE_PROXY_FIX", "False").lower() == "true"
 # frontend-only for Native mode; LLM modes also enforce their server-side cap.
 INSTANT_PLAYLIST_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_DEFAULT_N_RESULTS", "50"))
 # Default shown in the chat UI; kept separate so native API defaults remain stable.
-INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS", "30"))
+INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS", "25"))
 INSTANT_PLAYLIST_MAX_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_MAX_N_RESULTS", "200"))
 # Max songs from a single artist in the instant playlist (diversity enforcement)
 MAX_SONGS_PER_ARTIST_PLAYLIST = int(os.environ.get("MAX_SONGS_PER_ARTIST_PLAYLIST", "5"))
+INSTANT_PLAYLIST_MAX_ARTIST_FRACTION = min(
+    1.0, max(0.01, float(os.environ.get("INSTANT_PLAYLIST_MAX_ARTIST_FRACTION", "0.40")))
+)
 # Optional final curation over a bounded set of grounded AudioMuse candidates.
 INSTANT_PLAYLIST_SELECTION_MODE = os.environ.get("INSTANT_PLAYLIST_SELECTION_MODE", "NATIVE").upper()
 if INSTANT_PLAYLIST_SELECTION_MODE not in {"NATIVE", "LLM_RERANK", "LLM_CURATE"}:
     INSTANT_PLAYLIST_SELECTION_MODE = "NATIVE"
 INSTANT_PLAYLIST_LLM_CANDIDATE_POOL = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_CANDIDATE_POOL", "100")))
-INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS", "50")))
-INSTANT_PLAYLIST_LLM_MAX_CANDIDATES = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_MAX_CANDIDATES", "60")))
+INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS", "30")))
+INSTANT_PLAYLIST_LLM_MAX_CANDIDATES = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_MAX_CANDIDATES", "50")))
 INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES = os.environ.get("INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES", "true").lower() == "true"
 # Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down)
 PLAYLIST_ENERGY_ARC = os.environ.get("PLAYLIST_ENERGY_ARC", "False").lower() == "true"

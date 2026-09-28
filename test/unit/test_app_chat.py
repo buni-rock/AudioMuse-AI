@@ -345,27 +345,27 @@ class TestArtistDiversityEnforcement:
 class TestPlaylistLength:
     @pytest.mark.parametrize(
         'ui_cap, requested_count, expected',
-        [(30, 70, 30), (30, 12, 12), (45, 70, 45), (100, 100, 50)],
+        [(25, 70, 25), (25, 12, 12), (45, 70, 30), (100, 100, 30)],
     )
     def test_llm_target_is_bounded_by_ui_and_server_hard_caps(
         self, monkeypatch, ui_cap, requested_count, expected
     ):
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 30)
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS', 50)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 25)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS', 30)
         target, actual_ui_cap, hard_max = app_chat._resolve_llm_song_target(
             {'n': ui_cap}, requested_count
         )
-        assert (target, actual_ui_cap, hard_max) == (expected, ui_cap, 50)
+        assert (target, actual_ui_cap, hard_max) == (expected, ui_cap, 30)
 
     def test_llm_target_without_prompt_count_uses_ui_default(self, monkeypatch):
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 30)
-        assert app_chat._resolve_llm_song_target({}, None) == (30, 30, 50)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 25)
+        assert app_chat._resolve_llm_song_target({}, None) == (25, 25, 30)
 
     @pytest.mark.parametrize(
-        'target, expected', [(10, 40), (20, 40), (25, 50), (30, 60), (40, 60), (50, 60)],
+        'target, expected', [(10, 30), (15, 30), (20, 40), (25, 50), (30, 50)],
     )
     def test_dynamic_llm_candidate_limit_scales_with_target(self, monkeypatch, target, expected):
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 60)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_CANDIDATE_POOL', 100)
         assert app_chat._resolve_llm_candidate_limit(target) == expected
 
@@ -373,14 +373,14 @@ class TestPlaylistLength:
         import tasks.ai.api as ai_api
         import tasks.ai.tool_impl as tool_impl
 
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 60)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES', False)
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
         monkeypatch.setattr(
             ai_api,
             'generate_text',
             lambda *args, **kwargs: json.dumps({
-                'ranked_ids': [f'C{i:03d}' for i in range(35, 0, -1)]
+                'ranked_ids': [f'C{i:03d}' for i in range(50, 20, -1)]
             }),
         )
         songs = [
@@ -392,25 +392,28 @@ class TestPlaylistLength:
             monkeypatch,
             songs,
             {
-                'n': 30, 'selection_mode': 'LLM_RERANK',
+                'n': 25, 'selection_mode': 'LLM_RERANK',
                 'userInput': 'Create a playlist of 70 songs',
             },
             filter_applied=False,
         )
 
         assert [song['item_id'] for song in response['query_results']] == [
-            f'track-{i:03d}' for i in range(34, 4, -1)
+            f'track-{i:03d}' for i in range(49, 24, -1)
         ]
         assert 'Requested song count: 70' in response['message']
-        assert 'Effective song target: 30' in response['message']
-        assert 'LLM candidate limit: 60' in response['message']
-        assert 'Candidates sent to LLM: 60' in response['message']
-        assert 'LLM reranked candidates: 35' in response['message']
+        assert 'Effective song target: 25' in response['message']
+        assert 'LLM candidate limit: 50' in response['message']
+        assert 'Candidates sent to LLM: 50' in response['message']
+        assert 'LLM reranked candidates: 30' in response['message']
+        assert 'Rerank coverage: 60%' in response['message']
+        assert 'Rerank required usable aliases: 30' in response['message']
+        assert 'Rerank status: SUCCESS' in response['message']
         assert 'Native supplementation: disabled' in response['message']
-        assert 'Candidate pool after LLM rerank: 35' in response['message']
+        assert 'Candidate pool after LLM rerank: 30' in response['message']
         assert 'Selection strategy: LLM rerank only' in response['message']
-        assert 'Final requested target: 30' in response['message']
-        assert 'Final playlist: 30' in response['message']
+        assert 'Final requested target: 25' in response['message']
+        assert 'Final playlist: 25' in response['message']
         assert 'Supplemented with' not in response['message']
         assert 'Selection strategy: native fallback' not in response['message']
 
@@ -436,13 +439,13 @@ class TestPlaylistLength:
         import tasks.ai.tool_impl as tool_impl
 
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_SELECTION_MODE', 'LLM_CURATE')
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 60)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
         monkeypatch.setattr(
             ai_api,
             'generate_text',
             lambda *args, **kwargs: json.dumps({
-                'selected_ids': [f'C{i:03d}' for i in range(27, 0, -1)]
+                'selected_ids': [f'C{i:03d}' for i in range(1, 26)]
             }),
         )
         songs = [
@@ -451,23 +454,24 @@ class TestPlaylistLength:
         ]
         response = _run_pipeline_with_pool(
             monkeypatch, songs, {
-                'n': 30, 'selection_mode': 'LLM_CURATE',
+                'n': 25, 'selection_mode': 'LLM_CURATE',
                 'userInput': 'Create a playlist of 70 songs',
             },
             filter_applied=False,
         )
-        assert len(response['query_results']) == 27
+        assert len(response['query_results']) == 25
         assert [song['item_id'] for song in response['query_results']] == [
-            f'track-{i:03d}' for i in reversed(range(27))
+            f'track-{i:03d}' for i in range(25)
         ]
-        assert 'Effective song target: 30' in response['message']
-        assert 'Candidates sent to LLM: 60' in response['message']
-        assert 'LLM selected: 27' in response['message']
+        assert 'Effective song target: 25' in response['message']
+        assert 'Candidates sent to LLM: 50' in response['message']
+        assert 'LLM selected: 25' in response['message']
         assert 'Native supplementation: disabled' in response['message']
         assert 'Selection source: LLM curate only' in response['message']
-        assert 'Final requested target: 30' in response['message']
-        assert 'Final playlist: 27' in response['message']
-        assert 'Reason: curator returned fewer high-confidence candidates than target' in response['message']
+        assert 'Curator prefix overlap: 100%' in response['message']
+        assert 'Potential retrieval-order copy detected' in response['message']
+        assert 'Final requested target: 25' in response['message']
+        assert 'Final playlist: 25' in response['message']
         assert 'Supplemented with' not in response['message']
         assert 'Playlist kept in native/curator rank order (no explicit duration constraint)' in response['message']
 
@@ -477,7 +481,7 @@ class TestPlaylistLength:
         import tasks.playlist_ordering as playlist_ordering
         from tasks import playlist_curation
 
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 60)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES', False)
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {
             item_id: {'duration': 60} for item_id in ids

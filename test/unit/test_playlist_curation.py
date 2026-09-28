@@ -5,6 +5,7 @@ import pytest
 from tasks.playlist_curation import (
     build_llm_candidate_payload,
     curate_candidates_with_llm,
+    effective_llm_artist_cap,
     optimize_playlist_duration,
     rank_candidates_by_ids,
     reorder_preserving_membership,
@@ -65,10 +66,22 @@ def test_curator_provider_failure_is_nonfatal(monkeypatch):
 
 def test_candidate_payload_uses_only_available_audio_metadata():
     payload = build_llm_candidate_payload(
-        [{"item_id": "a", "title": "Song", "artist": "Artist"}],
-        {"a": {"tempo": 120, "energy": None}},
+        [{"item_id": "a", "title": "Song", "artist": "Artist", "duration": 180,
+          "musicnn_similarity": 0.91, "dclap_similarity": 0.87}],
+        {"a": {"tempo": 120, "energy": None, "mood_vector": "symphonic metal:0.8",
+               "other_features": "uplifting:0.9,calm:0.7"}},
     )
-    assert payload == [{"id": "a", "title": "Song", "artist": "Artist", "tempo": 120}]
+    assert payload == [{
+        "id": "a", "native_rank": 1, "title": "Song", "artist": "Artist",
+        "duration_seconds": 180, "musicnn_similarity": 0.91, "dclap_similarity": 0.87,
+        "tempo": 120,
+        "top_moods": ["uplifting", "calm"], "top_genres": ["symphonic metal"],
+    }]
+
+
+@pytest.mark.parametrize("target, expected", [(5, 2), (10, 4), (25, 5)])
+def test_llm_artist_cap_scales_with_target_and_respects_absolute_ceiling(target, expected):
+    assert effective_llm_artist_cap(target, 5, 0.40) == expected
 
 
 def test_duration_optimizer_exact_and_closest_results_respect_count_and_artist_cap():
@@ -150,6 +163,116 @@ def test_valid_curator_ranking_changes_native_order(monkeypatch):
     assert "Use only candidate IDs" in captured["prompt"]
     assert captured["format"]["required"] == ["ranked_ids"]
     assert captured["format"]["additionalProperties"] is False
+    assert captured["format"]["properties"]["ranked_ids"]["minItems"] == 3
+    assert "rank the candidates" in captured["prompt"].lower()
+
+
+def test_target_aware_rerank_retries_then_accepts_target_plus_margin(monkeypatch):
+    import tasks.ai.api as api
+
+    songs = [{'item_id': f'track-{i:03d}', 'title': f'Song {i:03d}'} for i in range(50)]
+    responses = [
+        json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(1, 11)]}),
+        json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(50, 20, -1)]}),
+    ]
+    prompts, schemas = [], []
+
+    def fake_generate(prompt, _config, **kwargs):
+        prompts.append(prompt)
+        schemas.append(kwargs['structured_format'])
+        return responses.pop(0)
+
+    monkeypatch.setattr(api, 'generate_text', fake_generate)
+    logs = []
+    ids, sent = curate_candidates_with_llm(
+        'request', songs, 'LLM_RERANK', {'provider': 'OLLAMA'},
+        limit=50, include_audio=False, log_messages=logs, target_count=25,
+    )
+
+    assert sent == 50
+    assert len(ids) == 30
+    assert prompts[1].startswith('Your previous ranked_ids response did not contain enough')
+    assert schemas[0]['properties']['ranked_ids']['minItems'] == 30
+    assert 'Rerank coverage: 20%' in logs
+    assert 'Rerank status: INCOMPLETE' in logs
+    assert 'Rerank coverage: 60%' in logs
+    assert 'Effective target: 25' in logs
+    assert 'Rerank required usable aliases: 30' in logs
+    assert 'Valid reranked aliases: 30' in logs
+    assert 'Rerank status: SUCCESS' in logs
+
+
+def test_target_aware_rerank_accepts_30_of_50_without_retry(monkeypatch):
+    import tasks.ai.api as api
+    calls = []
+    monkeypatch.setattr(
+        api, 'generate_text',
+        lambda *args, **kwargs: calls.append(1)
+        or json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(50, 20, -1)]}),
+    )
+    logs = []
+    ids, _ = curate_candidates_with_llm(
+        'request', [{'item_id': f'track-{i:03d}'} for i in range(50)],
+        'LLM_RERANK', {}, limit=50, include_audio=False,
+        log_messages=logs, target_count=25,
+    )
+    assert len(ids) == 30
+    assert len(calls) == 1
+    assert 'Rerank coverage: 60%' in logs
+    assert 'Rerank status: SUCCESS' in logs
+
+
+def test_curator_prompt_includes_compact_resolved_seed_profile(monkeypatch):
+    import tasks.ai.api as api
+    import tasks.ai.tool_impl as tool_impl
+
+    monkeypatch.setattr(
+        tool_impl, '_fetch_pool_features',
+        lambda _ids: {'seed-id': {
+            'tempo': 128, 'energy': 0.72, 'duration': 269,
+            'mood_vector': 'symphonic metal:0.92', 'other_features': 'dramatic:0.8',
+            'large_blob': 'must not appear',
+        }},
+    )
+    captured = {}
+    def fake_generate(prompt, *_args, **_kwargs):
+        captured['prompt'] = prompt
+        return '{"selected_ids":["C001"]}'
+    monkeypatch.setattr(api, 'generate_text', fake_generate)
+    ids, _ = curate_candidates_with_llm(
+        'similar to this seed track', [{'item_id': 'seed-id', 'title': 'Harvest', 'artist': 'Nightwish'}],
+        'LLM_CURATE', {'provider': 'OLLAMA'}, include_audio=True, target_count=5,
+        resolved_seed={'item_id': 'seed-id', 'title': 'Harvest', 'artist': 'Nightwish'},
+    )
+    assert ids == ['seed-id']
+    assert 'Resolved seed audio profile:' in captured['prompt']
+    assert '"tempo":128' in captured['prompt'] and '"duration_seconds":269' in captured['prompt']
+    assert '"top_genres":["symphonic metal"]' in captured['prompt']
+    assert 'large_blob' not in captured['prompt']
+
+
+def test_incomplete_rerank_after_retry_is_rejected_for_native_fallback(monkeypatch):
+    import tasks.ai.api as api
+
+    songs = [{'item_id': f'track-{i:03d}'} for i in range(50)]
+    calls = []
+    def fake_generate(*_args, **_kwargs):
+        calls.append(1)
+        count = 10 if len(calls) == 1 else 20
+        return json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(1, count + 1)]})
+    monkeypatch.setattr(api, 'generate_text', fake_generate)
+    logs = []
+    ids, _ = curate_candidates_with_llm(
+        'request', songs, 'LLM_RERANK', {}, limit=50,
+        include_audio=False, log_messages=logs, target_count=25,
+    )
+    assert ids == []
+    assert len(calls) == 2
+    assert 'Rerank status: INCOMPLETE' in logs
+    assert 'Valid reranked aliases: 20' in logs
+    assert 'Rerank required usable aliases: 30' in logs
+    assert 'Curator status: INCOMPLETE_RERANK' in logs
+    assert 'LLM rerank unusable: incomplete after retry; falling back to Native' in logs
 
 
 def test_curator_uses_short_aliases_and_maps_them_back_to_authoritative_tracks(monkeypatch):
@@ -227,7 +350,7 @@ def test_curator_rejects_analysis_object_without_exact_ranked_ids(monkeypatch):
         "request", songs, "LLM_RERANK", {}, include_audio=False, log_messages=logs,
     )
     assert ids == []
-    assert any("expected exactly the 'ranked_ids' property" in line for line in logs)
+    assert any("Curator validation:" in line and "ranked_ids" in line for line in logs)
     assert "Valid aliases: 0" in logs
 
 
@@ -310,6 +433,16 @@ def test_llm_curate_sends_compact_40_candidate_shortlist_with_exact_schema(monke
     assert captured["schema"]["additionalProperties"] is False
     assert captured["max_tokens"] == 1200
     assert "Native shortlist for curator: 40" in logs
+    assert "Curator prefix overlap: 100%" in logs
+    assert "Potential retrieval-order copy detected" in logs
+    assert "Average original native rank: 10.5 / 40" in logs
+    assert "Median original native rank: 10.5" in logs
+    assert "Best native rank selected: 1" in logs
+    assert "Worst native rank selected: 20" in logs
+    assert "Selected distribution:" in logs
+    assert "1-10: 10" in logs and "11-20: 10" in logs
+    assert "native rank and similarity scores are meaningful evidence" in captured["prompt"]
+    assert "Judge similarity to the seed track, not similarity to the seed artist" in captured["prompt"]
     assert any(line.startswith("Serialized candidate payload chars:") for line in logs)
 
 
@@ -548,7 +681,7 @@ def test_seed_search_to_curated_duration_pipeline_keeps_named_seed(monkeypatch):
 
     def fake_generate_text(prompt, *args, **kwargs):
         prompt_seen['text'] = prompt
-        return json.dumps({'ranked_ids': ['C003', 'C002']})
+        return json.dumps({'ranked_ids': ['C003', 'C002', 'C001', 'C004', 'C005', 'C006', 'C007']})
 
     monkeypatch.setattr(api, 'generate_text', fake_generate_text)
     ranked_ids, sent = curate_candidates_with_llm(

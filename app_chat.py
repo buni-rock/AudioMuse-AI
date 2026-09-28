@@ -29,7 +29,6 @@ from flask import Blueprint, copy_current_request_context, render_template, requ
 from flasgger import swag_from  # Import swag_from
 import json  # For JSON serialization of tool arguments
 import logging
-import math
 import queue
 import re
 import threading
@@ -204,7 +203,7 @@ def _resolve_llm_song_target(data, requested_count=None):
 def _resolve_llm_candidate_limit(effective_target):
     return min(
         max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_CANDIDATES)),
-        max(40, int(effective_target) * 2),
+        max(30, int(effective_target) * 2),
         max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
     )
 
@@ -911,6 +910,7 @@ def _run_chat_pipeline(data, log_messages):
                 include_audio=config.INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES,
                 log_messages=log_messages,
                 target_count=target_song_count,
+                resolved_seed=mandatory_seed,
             )
         except Exception as exc:
             logger.exception("Playlist curator failed")
@@ -971,6 +971,17 @@ def _run_chat_pipeline(data, log_messages):
         # --- Phase 1: Artist Diversity Cap on full collected pool ---
         requested_cap = plan_result.get('max_per_artist')
         max_per_artist = requested_cap or MAX_SONGS_PER_ARTIST_PLAYLIST
+        if selection_source in {'LLM rerank only', 'LLM curate only'}:
+            artist_fraction = config.INSTANT_PLAYLIST_MAX_ARTIST_FRACTION
+            absolute_cap = requested_cap or MAX_SONGS_PER_ARTIST_PLAYLIST
+            from tasks.playlist_curation import effective_llm_artist_cap
+            max_per_artist = effective_llm_artist_cap(
+                target_song_count, absolute_cap, artist_fraction,
+            )
+            log_messages.append(
+                f"Dynamic LLM artist cap: {max_per_artist}/artist "
+                f"(target {target_song_count} x {artist_fraction:.0%}, absolute cap {absolute_cap})"
+            )
         artist_song_counts = {}
         diversified_pool = []
         diversity_overflow = []

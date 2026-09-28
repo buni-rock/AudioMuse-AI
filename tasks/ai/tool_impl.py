@@ -689,6 +689,7 @@ def _text_search_sync(
                 "title": r['title'],
                 "artist": r['author'],
                 "album": r.get('album', ''),
+                "dclap_similarity": r.get('similarity'),
             }
             for r in clap_results
         ]
@@ -836,6 +837,10 @@ def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int)
         )
 
         similar_ids = [r['item_id'] for r in similar_results if r['item_id'] != seed_id][:get_songs]
+        similarity_by_id = {
+            str(row['item_id']): row for row in similar_results
+            if row.get('item_id') != seed_id
+        }
 
         if not similar_ids:
             songs = []
@@ -861,6 +866,7 @@ def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int)
                     "title": r['title'],
                     "artist": r['author'],
                     "album": r.get('album', ''),
+                    "musicnn_distance": similarity_by_id.get(str(r['item_id']), {}).get('distance'),
                 }
                 for r in sorted_results
             ]

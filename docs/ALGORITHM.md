@@ -2095,9 +2095,17 @@ Native playlist sizing continues to use the request's `n` (the chat page's
 "Number of songs" box), defaulting to `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`. In
 `LLM_RERANK` and `LLM_CURATE`, the count written in the request is capped by the
 UI value and `INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS`; without an explicit count,
-the UI value is the target. The curator input limit starts at 40 candidates and
-grows with the target, up to `INSTANT_PLAYLIST_LLM_MAX_CANDIDATES`. Successful
-LLM selection keeps only validated LLM candidates (plus a mandatory seed when
+the UI value is the target. The curator input limit starts at 30 candidates and
+grows to twice the effective target, up to `INSTANT_PLAYLIST_LLM_MAX_CANDIDATES`
+and the configured candidate-pool cap. `LLM_RERANK` must return at least the
+effective target plus a five-track safety margin (bounded by the shortlist); one
+stricter retry is made before a full Native fallback. Curator records include
+compact native rank, available similarity scores, audio features, and top mood
+and genre labels. Curation treats native ranking as a strong prior and reports
+the selected tracks' native-rank distribution. Successful LLM pools use a
+target-scaled artist cap (`INSTANT_PLAYLIST_MAX_ARTIST_FRACTION`) bounded by the
+existing absolute per-artist maximum. Successful LLM selection keeps only
+validated LLM candidates (plus a mandatory seed when
 needed) and never restores unselected native candidates. A time budget remains
 active and the rank-aware duration optimizer chooses within the effective song
 cap. A per-artist cap written in the request replaces the default cap and is
