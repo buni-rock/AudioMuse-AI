@@ -1756,11 +1756,11 @@ MOOD_SIMILARITY_ENABLE = os.environ.get("MOOD_SIMILARITY_ENABLE", "False").lower
 ENABLE_PROXY_FIX = os.environ.get("ENABLE_PROXY_FIX", "False").lower() == "true"
 
 # --- Instant Playlist Optimization ---
-# How many songs the instant playlist targets when the caller sends no count, and
-# the ceiling the chat page puts on its own input box. The max is a FRONTEND-only
-# bound (the input's max= attribute): the API applies the default and the floor of
-# 1 but never the ceiling, so a direct API caller can ask for any number.
+# Native API default and chat UI default are separate. The chat input maximum is
+# frontend-only for Native mode; LLM modes also enforce their server-side cap.
 INSTANT_PLAYLIST_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_DEFAULT_N_RESULTS", "50"))
+# Default shown in the chat UI; kept separate so native API defaults remain stable.
+INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS", "30"))
 INSTANT_PLAYLIST_MAX_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_MAX_N_RESULTS", "200"))
 # Max songs from a single artist in the instant playlist (diversity enforcement)
 MAX_SONGS_PER_ARTIST_PLAYLIST = int(os.environ.get("MAX_SONGS_PER_ARTIST_PLAYLIST", "5"))
@@ -1769,7 +1769,8 @@ INSTANT_PLAYLIST_SELECTION_MODE = os.environ.get("INSTANT_PLAYLIST_SELECTION_MOD
 if INSTANT_PLAYLIST_SELECTION_MODE not in {"NATIVE", "LLM_RERANK", "LLM_CURATE"}:
     INSTANT_PLAYLIST_SELECTION_MODE = "NATIVE"
 INSTANT_PLAYLIST_LLM_CANDIDATE_POOL = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_CANDIDATE_POOL", "100")))
-INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES", "40")))
+INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS", "50")))
+INSTANT_PLAYLIST_LLM_MAX_CANDIDATES = max(1, int(os.environ.get("INSTANT_PLAYLIST_LLM_MAX_CANDIDATES", "60")))
 INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES = os.environ.get("INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES", "true").lower() == "true"
 # Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down)
 PLAYLIST_ENERGY_ARC = os.environ.get("PLAYLIST_ENERGY_ARC", "False").lower() == "true"

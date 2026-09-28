@@ -205,7 +205,7 @@ class TestShapeHints:
         assert planner.extract_named_song_seed(request) == 'Dark chest of wonders'
 
     @pytest.mark.parametrize(
-        'request, expected_title, expected_artist',
+        'request_text, expected_title, expected_artist',
         [
             (
                 'I would like you to build me a 30 minutes playlist starting from Dark chest of wonders songs. '
@@ -218,9 +218,9 @@ class TestShapeHints:
         ],
     )
     def test_named_seed_parser_uses_explicit_cues(
-        self, request, expected_title, expected_artist
+        self, request_text, expected_title, expected_artist
     ):
-        details = planner.extract_named_song_seed_details(request)
+        details = planner.extract_named_song_seed_details(request_text)
         assert details['title'] == expected_title
         assert details.get('artist') == expected_artist
 

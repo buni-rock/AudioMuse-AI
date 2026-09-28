@@ -112,12 +112,14 @@ These are the default parameters used when launching analysis or clustering task
 | `CRON_RETRY_MAX_MINUTES`                    | Max minutes a scheduled run that was blocked by a running queue-guard task (analysis, clustering, cleaning, provider migration or any plugin task) waits in the retry list before it is recorded as skipped and not run. | `240`           |
 | `CRON_RETRY_INTERVAL_MINUTES`               | How often the cron manager re-attempts blocked scheduled runs while they are inside the retry window. Clamped to stay below `CRON_RETRY_MAX_MINUTES` so a misconfiguration cannot disable retries. | `10`            |
 | **Instant Playlist General**                |                                                                                                                           |                 |
-| `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`        | Number of songs the instant playlist aims for when the caller sends no count. It is both the value the chat page's "Number of songs" box starts on and the fallback for a direct API call. | `50`            |
+| `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`        | Number of songs a direct API call aims for when it sends no count. | `50`            |
+| `INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS` | Default maximum number of songs shown in the chat page. | `30` |
 | `INSTANT_PLAYLIST_MAX_N_RESULTS`            | Maximum the chat page's "Number of songs" box accepts. Frontend-only: the `/chat/api/chatPlaylist` API enforces no upper bound, so an API caller can ask for more. | `200`           |
 | `MAX_SONGS_PER_ARTIST_PLAYLIST`             | Max songs from a single artist in the instant playlist (diversity enforcement).                                           | `5`             |
 | `INSTANT_PLAYLIST_SELECTION_MODE` | Default final selection mode: `NATIVE`, `LLM_RERANK`, or `LLM_CURATE`. | `NATIVE` |
 | `INSTANT_PLAYLIST_LLM_CANDIDATE_POOL` | Maximum grounded candidates considered by the optional final curator. | `100` |
-| `INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES` | Maximum candidate records included in the curator prompt. | `40` |
+| `INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS` | Server-side maximum playlist size for `LLM_RERANK` and `LLM_CURATE`, regardless of the UI value. | `50` |
+| `INSTANT_PLAYLIST_LLM_MAX_CANDIDATES` | Maximum candidate records included in the LLM prompt; the per-request limit grows with the effective target, starting at 40 and scaling to at most this value, also bounded by `INSTANT_PLAYLIST_LLM_CANDIDATE_POOL`. | `60` |
 | `INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES` | Include available AudioMuse tempo, energy, key, and tag features in the compact curator records. | `true` |
 | `PLAYLIST_ENERGY_ARC`                       | Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down).                                       | `false`         |
 | **Similarity General**                      |                                                                                                                           |                 |

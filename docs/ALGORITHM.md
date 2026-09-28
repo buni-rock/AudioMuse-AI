@@ -2091,14 +2091,18 @@ re-rank on top of that would fight the brainstorm.
 
 #### Streaming and playlist creation
 
-The playlist length comes from the request's `n` (the chat page's "Number of
-songs" box), defaulting to `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`. A count written
-in the request ("15 songs") wins over the box. A time budget ("an hour of")
-sizes the list and then trims it by the tracks' real durations. The pool the
-tools fill is ten times the length, with a floor of 1000, so dedup and the artist
-diversity cap still leave enough to select from. A per-artist cap written in the
-request replaces the default cap and is kept even when the list comes out
-shorter. A journey keeps its path order and is never reordered.
+Native playlist sizing continues to use the request's `n` (the chat page's
+"Number of songs" box), defaulting to `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`. In
+`LLM_RERANK` and `LLM_CURATE`, the count written in the request is capped by the
+UI value and `INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS`; without an explicit count,
+the UI value is the target. The curator input limit starts at 40 candidates and
+grows with the target, up to `INSTANT_PLAYLIST_LLM_MAX_CANDIDATES`. Successful
+LLM selection keeps only validated LLM candidates (plus a mandatory seed when
+needed) and never restores unselected native candidates. A time budget remains
+active and the rank-aware duration optimizer chooses within the effective song
+cap. A per-artist cap written in the request replaces the default cap and is
+kept even when the list comes out shorter. A journey keeps its path order and is
+never reordered.
 
 `POST /chat/api/chatPlaylist` returns the final result in one response.
 `POST /chat/api/chatPlaylistStream` streams the same run as Server-Sent Events, so
@@ -2142,10 +2146,12 @@ failures return a generic message; the real error only reaches the container log
 - `AI_TOOLCALL_TEMPERATURE`: sampling temperature for the tool-calling request.
   Do not set it to 0 with Qwen-family models, greedy decoding degrades their tool
   calls.
-- `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`, `INSTANT_PLAYLIST_MAX_N_RESULTS`: how
-  many songs the playlist aims for when the caller sends no `n`, and the ceiling
-  the chat page puts on its own "Number of songs" box. The maximum is
-  frontend-only: the API enforces the default and a floor of 1, never the cap.
+- `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`, `INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS`,
+  `INSTANT_PLAYLIST_MAX_N_RESULTS`: native API default, chat UI default, and
+  ceiling for the chat page's "Number of songs" box.
+- `INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS`, `INSTANT_PLAYLIST_LLM_MAX_CANDIDATES`:
+  hard playlist-size ceiling and bounded dynamic candidate prompt size for LLM
+  selection modes.
 - `MAX_SONGS_PER_ARTIST_PLAYLIST`: diversity cap inside an instant playlist.
 - `PLAYLIST_ENERGY_ARC`: enable the energy arc when ordering.
 - `AI_BRAINSTORM_SOUND_DESCRIPTIONS_MAX`, `AI_BRAINSTORM_SEED_ARTISTS_MAX`,

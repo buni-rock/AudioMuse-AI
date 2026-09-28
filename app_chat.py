@@ -85,7 +85,7 @@ def chat_home():
         'chat.html',
         title='AudioMuse-AI - Instant Playlist',
         active='chat',
-        instant_playlist_n_results_default=config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS,
+        instant_playlist_n_results_default=config.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS,
         instant_playlist_max_n_results=config.INSTANT_PLAYLIST_MAX_N_RESULTS,
         instant_playlist_selection_mode=config.INSTANT_PLAYLIST_SELECTION_MODE,
     )
@@ -158,7 +158,7 @@ def chat_config_defaults_api():
             "openai_server_url": cfg.OPENAI_SERVER_URL,
             "default_gemini_model_name": cfg.GEMINI_MODEL_NAME,
             "default_mistral_model_name": cfg.MISTRAL_MODEL_NAME,
-            "instant_playlist_default_n_results": cfg.INSTANT_PLAYLIST_DEFAULT_N_RESULTS,
+            "instant_playlist_default_n_results": cfg.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS,
             "instant_playlist_max_n_results": cfg.INSTANT_PLAYLIST_MAX_N_RESULTS,
             "instant_playlist_selection_mode": cfg.INSTANT_PLAYLIST_SELECTION_MODE,
         }
@@ -183,6 +183,30 @@ def _resolve_target_song_count(data):
     except (TypeError, ValueError):
         return config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS
     return max(1, n)
+
+
+def _resolve_llm_song_target(data, requested_count=None):
+    """Apply the UI count and server hard cap to LLM selection modes."""
+    raw_ui_count = (data or {}).get('n')
+    if raw_ui_count is None:
+        ui_cap = int(config.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS)
+    else:
+        try:
+            ui_cap = max(1, int(raw_ui_count))
+        except (TypeError, ValueError):
+            ui_cap = int(config.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS)
+    hard_max = max(1, int(config.INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS))
+    request_cap = min(ui_cap, hard_max)
+    effective_target = min(int(requested_count), request_cap) if requested_count else request_cap
+    return effective_target, ui_cap, hard_max
+
+
+def _resolve_llm_candidate_limit(effective_target):
+    return min(
+        max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_CANDIDATES)),
+        max(40, int(effective_target) * 2),
+        max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
+    )
 
 
 _CLOUD_KEY_CHECKS = {
@@ -655,22 +679,40 @@ def _run_chat_pipeline(data, log_messages):
     # ====================
 
     log_messages.append("\nUsing MCP Agentic Workflow for playlist generation")
+    selection_mode = str(data.get('selection_mode') or config.INSTANT_PLAYLIST_SELECTION_MODE).upper()
+    if selection_mode not in {'NATIVE', 'LLM_RERANK', 'LLM_CURATE'}:
+        selection_mode = 'NATIVE'
     target_song_count = _resolve_target_song_count(data)
     shape = requested_playlist_shape(original_user_input)
     duration_only = bool(shape.get('total_seconds')) and not shape.get('song_count')
-    if shape.get('song_count'):
-        target_song_count = shape['song_count']
-        log_messages.append(f"The request asks for exactly {target_song_count} songs")
-    elif shape.get('total_seconds'):
-        target_song_count = min(
-            config.INSTANT_PLAYLIST_MAX_N_RESULTS,
-            max(100, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
+    if selection_mode in {'LLM_RERANK', 'LLM_CURATE'}:
+        requested_song_count = shape.get('song_count')
+        target_song_count, ui_song_cap, llm_hard_max = _resolve_llm_song_target(
+            data, requested_song_count
         )
+        if requested_song_count is not None:
+            log_messages.append(f"Requested song count: {requested_song_count}")
+        log_messages.append(f"UI song cap: {ui_song_cap}")
+        log_messages.append(f"LLM hard maximum: {llm_hard_max}")
+        log_messages.append(f"Effective song target: {target_song_count}")
+        llm_candidate_limit = _resolve_llm_candidate_limit(target_song_count)
+        log_messages.append(f"LLM candidate limit: {llm_candidate_limit}")
+    else:
+        llm_candidate_limit = None
+        if shape.get('song_count'):
+            target_song_count = shape['song_count']
+            log_messages.append(f"The request asks for exactly {target_song_count} songs")
+        elif shape.get('total_seconds'):
+            target_song_count = min(
+                config.INSTANT_PLAYLIST_MAX_N_RESULTS,
+                max(100, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
+            )
+    if shape.get('total_seconds'):
         log_messages.append("Duration constraint detected")
         log_messages.append(f"Target duration: {int(shape['total_seconds'])} s")
         log_messages.append("Tolerance: 15 s")
-        log_messages.append(f"Duration candidate target: {target_song_count}; final count is selected from actual durations")
-    if not shape.get('total_seconds'):
+        log_messages.append(f"Duration candidate target: at most {target_song_count}; final count is selected from actual durations")
+    elif selection_mode == 'NATIVE':
         log_messages.append(f"Target: {target_song_count} songs")
     log_messages.append(f"Candidate target: {target_song_count} songs")
 
@@ -841,9 +883,6 @@ def _run_chat_pipeline(data, log_messages):
         else:
             log_messages.append("Seed resolved in library but unavailable on the selected music server")
 
-    selection_mode = str(data.get('selection_mode') or config.INSTANT_PLAYLIST_SELECTION_MODE).upper()
-    if selection_mode not in {'NATIVE', 'LLM_RERANK', 'LLM_CURATE'}:
-        selection_mode = 'NATIVE'
     log_messages.append(f"\nSelection mode: {selection_mode}")
     log_messages.append(f"Candidates retrieved: {len(all_songs)}")
     from tasks.playlist_curation import suppress_duplicate_title_artist
@@ -854,14 +893,14 @@ def _run_chat_pipeline(data, log_messages):
             "same-title/same-artist duplicate(s)"
         )
     native_candidate_pool = list(all_songs)
-    log_messages.append(f"Curator input limit: {min(max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)), max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES)))}")
+    if llm_candidate_limit is not None:
+        log_messages.append(f"Candidates shortlisted for LLM: {min(len(all_songs), llm_candidate_limit)}")
     selection_source = 'native'
     candidates_sent = 0
     if selection_mode != 'NATIVE' and all_songs:
         log_messages.append("Curating candidate songs...")
         yield
-        pool_limit = max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL))
-        candidates_sent = min(len(all_songs), pool_limit, max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES)))
+        candidates_sent = min(len(all_songs), llm_candidate_limit)
         log_messages.append(f"Native shortlist for curator: {candidates_sent}")
         log_messages.append(f"Shortlisted for LLM: {candidates_sent}")
         try:
@@ -871,6 +910,7 @@ def _run_chat_pipeline(data, log_messages):
                 limit=candidates_sent,
                 include_audio=config.INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES,
                 log_messages=log_messages,
+                target_count=target_song_count,
             )
         except Exception as exc:
             logger.exception("Playlist curator failed")
@@ -890,23 +930,12 @@ def _run_chat_pipeline(data, log_messages):
         else:
             all_songs = rank_candidates_by_ids(
                 all_songs, valid_ids, mandatory_ids=mandatory_seed_ids,
-                # A successful rerank defines the complete candidate pool. Curate
-                # keeps its existing count-only supplementation behavior.
-                include_unselected=(
-                    selection_mode != 'LLM_RERANK'
-                    and shape.get('total_seconds') is None
-                ),
+                # Successful LLM selection defines the complete candidate pool.
+                include_unselected=False,
             )
-            curated_ids = {str(item_id) for item_id in valid_ids}
-            mandatory_ids_set = {str(item_id) for item_id in mandatory_seed_ids}
-            supplemented = sum(
-                1 for song in all_songs
-                if str(song.get('item_id')) not in curated_ids
-                and str(song.get('item_id')) not in mandatory_ids_set
-            )
+            log_messages.append("Native supplementation: disabled")
             if selection_mode == 'LLM_RERANK':
                 selection_source = 'LLM rerank only'
-                log_messages.append("Native supplementation: disabled")
                 log_messages.append(f"LLM reranked candidates: {len(valid_ids)}")
                 log_messages.append(f"Candidate pool after LLM rerank: {len(all_songs)}")
                 if mandatory_seed_ids and not any(
@@ -915,10 +944,9 @@ def _run_chat_pipeline(data, log_messages):
                 ):
                     log_messages.append("Mandatory seed added outside reranked list: true")
             else:
-                selection_source = 'LLM curate + native supplementation' if supplemented else 'LLM curate'
+                selection_source = 'LLM curate only'
                 log_messages.append(f"Curator selected: {len(valid_ids)} tracks")
-            if supplemented:
-                log_messages.append(f"Supplemented with {supplemented} native candidates")
+                log_messages.append(f"Candidate pool after LLM curate: {len(all_songs)}")
             log_messages.append(f"Selection strategy: {selection_source}")
             song_sources = {s['item_id']: 0 for s in all_songs}
     elif selection_mode != 'NATIVE':
@@ -960,36 +988,6 @@ def _run_chat_pipeline(data, log_messages):
                 f"\nArtist diversity: removed {diversity_removed} excess songs from pool (max {max_per_artist}/artist)"
             )
 
-        # An explicit song-count request is a hard constraint. If successful
-        # reranking leaves too few tracks after the artist cap, abandon that
-        # pool and use the complete native candidate pool for final selection.
-        if (
-            selection_source == 'LLM rerank only'
-            and shape.get('song_count')
-            and len(diversified_pool) < target_song_count
-        ):
-            log_messages.append("LLM rerank candidate pool insufficient for requested song count")
-            log_messages.append(f"Required target: {target_song_count} songs")
-            log_messages.append(f"Available reranked candidates after artist limit: {len(diversified_pool)}")
-            log_messages.append("Fallback reason: insufficient reranked pool")
-            log_messages.append("LLM rerank unusable: insufficient candidates for hard song-count constraint")
-            selection_mode = 'NATIVE'
-            selection_source = 'native fallback'
-            all_songs = list(native_candidate_pool)
-            artist_song_counts = {}
-            diversified_pool = []
-            diversity_overflow = []
-            for song in all_songs:
-                artist = song.get('artist', 'Unknown')
-                artist_song_counts[artist] = artist_song_counts.get(artist, 0) + 1
-                if artist_song_counts[artist] <= max_per_artist:
-                    diversified_pool.append(song)
-                else:
-                    diversity_overflow.append(song)
-            log_messages.append(f"Selection strategy: {selection_source}")
-            log_messages.append(f"Selection source: {selection_source}")
-            log_messages.append(f"Collected native fallback pool: {len(all_songs)} songs")
-
         optimized_duration = False
         duration_target_seconds = shape.get('total_seconds')
         if duration_target_seconds is not None and duration_target_seconds > 0:
@@ -998,13 +996,16 @@ def _run_chat_pipeline(data, log_messages):
                 from tasks.ai.tool_impl import _fetch_pool_features
                 from tasks.playlist_curation import optimize_playlist_duration
                 optimizer_limit = min(100, max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)))
+                if selection_source in {'LLM rerank only', 'LLM curate only'}:
+                    optimizer_limit = min(target_song_count, len(diversified_pool))
                 optimizer_pool = diversified_pool[:optimizer_limit]
                 # Keep mandatory seeds inside the bounded optimization pool.
                 if mandatory_seed_ids:
                     mandatory_set = {str(i) for i in mandatory_seed_ids}
-                    optimizer_pool = [s for s in diversified_pool if str(s['item_id']) in mandatory_set] + [
+                    mandatory_pool = [s for s in diversified_pool if str(s['item_id']) in mandatory_set]
+                    optimizer_pool = mandatory_pool + [
                         s for s in optimizer_pool if str(s['item_id']) not in mandatory_set
-                    ]
+                    ][:max(0, optimizer_limit - len(mandatory_pool))]
                 duration_features = _fetch_pool_features([s['item_id'] for s in optimizer_pool])
                 durations = {key: row.get('duration') for key, row in duration_features.items()}
                 duration_diagnostics = {}
@@ -1040,6 +1041,11 @@ def _run_chat_pipeline(data, log_messages):
                             diversified_pool.append(song)
                         else:
                             diversity_overflow.append(song)
+                    optimizer_limit = min(
+                        100,
+                        max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
+                        target_song_count,
+                    )
                     optimizer_pool = diversified_pool[:optimizer_limit]
                     if mandatory_seed_ids:
                         mandatory_set = {str(i) for i in mandatory_seed_ids}
@@ -1048,7 +1054,7 @@ def _run_chat_pipeline(data, log_messages):
                         ]
                     duration_features = _fetch_pool_features([s['item_id'] for s in optimizer_pool])
                     durations = {key: row.get('duration') for key, row in duration_features.items()}
-                    log_messages.append("Native supplementation: disabled; full native fallback selected")
+                    log_messages.append("LLM candidate pool discarded; full native fallback selected")
                     log_messages.append(f"Selection strategy: {selection_source}")
                     log_messages.append(f"Selection source: {selection_source}")
                     log_messages.append(f"Duration optimizer input after native fallback: {len(optimizer_pool)} candidates")
@@ -1354,6 +1360,19 @@ def _run_chat_pipeline(data, log_messages):
         final_executed_query_str = executed_query_str or "MCP single-pass: No results"
 
     actual_model_used = ai_config.get(f'{ai_provider.lower()}_model')
+
+    if selection_source in {'LLM rerank only', 'LLM curate only', 'native fallback'}:
+        log_messages.append(f"Final requested target: {target_song_count}")
+        final_count = len(final_query_results_list or [])
+        log_messages.append(f"Final playlist: {final_count}")
+        if selection_source == 'LLM curate only' and final_count < target_song_count:
+            log_messages.append(
+                "Reason: curator returned fewer high-confidence candidates than target"
+            )
+        elif selection_source == 'LLM rerank only' and final_count < target_song_count:
+            log_messages.append(
+                "Reason: reranker returned fewer usable candidates than target"
+            )
 
     # The pool stayed canonical for internal selection/ordering; translate the
     # FINAL list to the selected server's provider ids so the response never emits

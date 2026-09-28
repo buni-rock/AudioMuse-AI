@@ -242,7 +242,7 @@ def suppress_duplicate_title_artist(songs):
 
 def curate_candidates_with_llm(
     user_request, songs, mode, ai_config, limit=100, include_audio=False,
-    log_messages=None,
+    log_messages=None, target_count=None,
 ):
     """Call the configured provider and return strictly validated candidate IDs."""
     from tasks.ai.api import generate_text
@@ -274,7 +274,8 @@ def curate_candidates_with_llm(
     candidate_titles = {alias: song.get("title") for alias, song in alias_to_song.items()}
     alias_range = f"{candidate_ids[0]}-{candidate_ids[-1]}" if candidate_ids else "empty"
     serialized_records = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
-    max_curated = min(20, len(records))
+    requested_curated = 20 if target_count is None else max(1, int(target_count))
+    max_curated = min(requested_curated, len(records))
     logger.info(
         "Selection mode: %s; candidates available: %d; candidates sent to curator: %d; alias range: %s",
         mode, len(songs), len(records), alias_range,

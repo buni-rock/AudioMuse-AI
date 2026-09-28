@@ -299,14 +299,14 @@ def test_llm_curate_sends_compact_40_candidate_shortlist_with_exact_schema(monke
     monkeypatch.setattr(api, "generate_text", fake_generate)
     ids, sent = curate_candidates_with_llm(
         "request", songs, "LLM_CURATE", {"provider": "OLLAMA"}, limit=40,
-        include_audio=False, log_messages=logs,
+        include_audio=False, log_messages=logs, target_count=30,
     )
     assert sent == 40
     assert len(ids) == 20
     assert '"id":"C001"' in captured["prompt"] and '"id":"C040"' in captured["prompt"]
     assert "mood_vector" not in captured["prompt"] and "other_features" not in captured["prompt"]
     assert captured["schema"]["required"] == ["selected_ids"]
-    assert captured["schema"]["properties"]["selected_ids"]["maxItems"] == 20
+    assert captured["schema"]["properties"]["selected_ids"]["maxItems"] == 30
     assert captured["schema"]["additionalProperties"] is False
     assert captured["max_tokens"] == 1200
     assert "Native shortlist for curator: 40" in logs
