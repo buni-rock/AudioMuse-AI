@@ -56,7 +56,7 @@ def _song(item_id, artist):
     return {'item_id': item_id, 'artist': artist, 'title': f'{artist} {item_id}'}
 
 
-def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None):
+def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_applied=True):
     import tasks.ai.planner as planner
     import tasks.mcp_helper as mcp_helper
 
@@ -68,7 +68,7 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None):
             'tools_used_history': [],
             'plan_notes': [],
             'executed_query_str': 'stub-query',
-            'filter_applied': True,
+            'filter_applied': filter_applied,
         }
 
     monkeypatch.setattr(planner, 'plan_and_execute_once', _fake_plan)
@@ -340,6 +340,88 @@ class TestArtistDiversityEnforcement:
 
 
 class TestPlaylistLength:
+    def test_successful_llm_rerank_keeps_only_valid_ranked_candidates(self, monkeypatch):
+        import tasks.ai.api as ai_api
+        import tasks.ai.tool_impl as tool_impl
+
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES', 40)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES', False)
+        monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
+        monkeypatch.setattr(
+            ai_api,
+            'generate_text',
+            lambda *args, **kwargs: json.dumps({
+                'ranked_ids': [f'C{i:03d}' for i in range(35, 0, -1)]
+            }),
+        )
+        songs = [
+            {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
+            for i in range(80)
+        ]
+
+        response = _run_pipeline_with_pool(
+            monkeypatch,
+            songs,
+            {'n': 35, 'selection_mode': 'LLM_RERANK'},
+            filter_applied=False,
+        )
+
+        assert [song['item_id'] for song in response['query_results']] == [
+            f'track-{i:03d}' for i in range(34, -1, -1)
+        ]
+        assert 'Candidates sent to LLM: 40' in response['message']
+        assert 'LLM reranked candidates: 35' in response['message']
+        assert 'Native supplementation: disabled' in response['message']
+        assert 'Candidate pool after LLM rerank: 35' in response['message']
+        assert 'Selection strategy: LLM rerank only' in response['message']
+        assert 'Supplemented with' not in response['message']
+
+    def test_no_duration_constraint_skips_optimizer_and_preserves_native_order(self, monkeypatch):
+        from tasks import playlist_curation
+
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_SELECTION_MODE', 'NATIVE')
+        monkeypatch.setattr(
+            playlist_curation,
+            'optimize_playlist_duration',
+            lambda *args, **kwargs: pytest.fail('duration optimizer ran without a duration constraint'),
+        )
+        songs = [_song(f'u{i}', f'Solo{i}') for i in range(8)]
+        response = _run_pipeline_with_pool(
+            monkeypatch, songs, {'n': 4}, filter_applied=False,
+        )
+        assert [song['item_id'] for song in response['query_results']] == ['u0', 'u1', 'u2', 'u3']
+        assert 'Duration optimizer' not in response['message']
+        assert 'Playlist kept in native/curator rank order (no explicit duration constraint)' in response['message']
+
+    def test_count_only_curate_supplements_after_curator_ranks_to_reach_requested_count(self, monkeypatch):
+        import tasks.ai.api as ai_api
+        import tasks.ai.tool_impl as tool_impl
+
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_SELECTION_MODE', 'LLM_CURATE')
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES', 40)
+        monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
+        monkeypatch.setattr(
+            ai_api,
+            'generate_text',
+            lambda *args, **kwargs: json.dumps({
+                'selected_ids': [f'C{i:03d}' for i in range(20, 0, -1)]
+            }),
+        )
+        songs = [
+            {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
+            for i in range(80)
+        ]
+        response = _run_pipeline_with_pool(
+            monkeypatch, songs, {'n': 50, 'selection_mode': 'LLM_CURATE'},
+            filter_applied=False,
+        )
+        assert len(response['query_results']) == 50
+        assert [song['item_id'] for song in response['query_results'][:20]] == [
+            f'track-{i:03d}' for i in reversed(range(20))
+        ]
+        assert 'Selection source: LLM curate + native supplementation' in response['message']
+        assert 'Playlist kept in native/curator rank order (no explicit duration constraint)' in response['message']
+
     def test_request_without_n_falls_back_to_the_configured_default(self, monkeypatch):
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_DEFAULT_N_RESULTS', 50)
         songs = [_song(f'u{i}', f'Solo{i}') for i in range(300)]

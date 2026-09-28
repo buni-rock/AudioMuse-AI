@@ -278,6 +278,14 @@
                 </label>
                 <input id="numResults" name="numResults" type="number" aria-describedby="numResultsHelp" value="{{ instant_playlist_n_results_default }}" min="{{ instant_playlist_n_results_default|min_bound(1) }}" max="{{ instant_playlist_n_results_default|max_bound(instant_playlist_max_n_results) }}" />
             </div>
+            <div>
+                <label for="selectionMode">Final selection:</label>
+                <select id="selectionMode" name="selection_mode">
+                    <option value="NATIVE" {% if instant_playlist_selection_mode == 'NATIVE' %}selected{% endif %}>Native AudioMuse</option>
+                    <option value="LLM_RERANK" {% if instant_playlist_selection_mode == 'LLM_RERANK' %}selected{% endif %}>LLM re-rank</option>
+                    <option value="LLM_CURATE" {% if instant_playlist_selection_mode == 'LLM_CURATE' %}selected{% endif %}>LLM curate</option>
+                </select>
+            </div>
         </div>
 
         <!-- Submit Button -->
@@ -338,6 +346,7 @@
             const playlistForm = document.getElementById('playlistForm');
             const userInput = document.getElementById('userInput');
             const numResultsInput = document.getElementById('numResults');
+            const selectionModeInput = document.getElementById('selectionMode');
             const submitButton = document.getElementById('submitChat');
             const responseArea = document.getElementById('responseArea');
             const submitButtonText = submitButton.querySelector('span');
@@ -444,6 +453,7 @@
                     userInput: userInput.value,
                     ai_provider: aiProviderSelect.value,
                     ai_model: null,
+                    selection_mode: selectionModeInput.value,
                     n: Math.min(Math.max(Number.isNaN(nInput) ? defaultN : nInput, 1), maxN)
                 };
 
@@ -645,7 +655,19 @@
                 if (m.moved != null) return 'Re-ranked by ' + dimText + ' - ' + (m.matched || 0) + ' of ' + (m.total || m.poolSize || '?') + ' matched and moved to the top.';
                 return LIVE_PENDING.filter;
             }
+            function durationSummary(m) {
+                const parts = [];
+                const retrieved = m.candidatesRetrieved != null ? m.candidatesRetrieved : m.seqRetrieved;
+                if (retrieved > 0) parts.push('Retrieved ' + retrieved + ' songs');
+                if (m.llmShortlisted != null) parts.push('shortlisted ' + m.llmShortlisted + ' for LLM');
+                if (m.llmActionCount != null) parts.push(m.llmAction + ' ' + m.llmActionCount);
+                const minutes = m.targetDuration / 60;
+                const target = Number.isInteger(minutes) ? minutes + '-minute' : Math.floor(minutes) + ':' + String(m.targetDuration % 60).padStart(2, '0');
+                parts.push('selected ' + m.durationSelected + ' for the ' + target + ' target');
+                return parts.join(' · ') + '.';
+            }
             function assembleHeadline(m) {
+                if (m.durationSelected != null && m.targetDuration != null) return durationSummary(m);
                 if (m.funnel) {
                     let h = 'Trimmed ' + m.funnel.a + ' → ' + m.funnel.c + ' songs';
                     const ex = [];
@@ -833,6 +855,8 @@
                     filterRan: false, filterDims: [], relaxSteps: [],
                     matched: null, total: null, moved: null, filterUnchanged: false, categoricalPriority: false,
                     collected: null, diversityRemoved: 0, ratingRemoved: 0,
+                    candidatesRetrieved: null, llmShortlisted: null, llmActionCount: null, llmAction: '',
+                    durationSelected: null, targetDuration: null,
                     funnel: null, ordered: false, filterRankedOrder: false,
                     success: false, noSongs: false, planningFailed: false, notesPlain: null
                 };
@@ -840,6 +864,11 @@
                     const t = raw.trim();
                     if (!t) continue;
                     let m;
+                    if ((m = t.match(/^Candidates retrieved:\s*(\d+)$/i))) model.candidatesRetrieved = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^Shortlisted for LLM:\s*(\d+)$/i))) model.llmShortlisted = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^(LLM ranked|LLM selected):\s*(\d+)$/i))) { model.llmAction = m[1]; model.llmActionCount = Number.parseInt(m[2], 10); }
+                    else if ((m = t.match(/^Selected for duration target:\s*(\d+) songs$/i))) model.durationSelected = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^Target duration:\s*(\d+) s$/i))) model.targetDuration = Number.parseInt(m[1], 10);
                     const reasoningMatch = t.match(/^AI reasoning:(.+)$/);
                     const roseMatch = t.match(/re-rank:\s*(\d+)\/(\d+)\s*matched the filter and rose to the top;\s*(\d+)\s*songs shifted/i);
                     if ((m = t.match(/^Request:\s*'(.*)'$/))) model.request = m[1];
@@ -960,7 +989,9 @@
                 }
 
                 // 5. Built the playlist
-                if (model.funnel) {
+                if (model.durationSelected != null && model.targetDuration != null) {
+                    steps.push({ icon: '🎼', title: 'Built the playlist', headline: durationSummary(model), variant: 'success' });
+                } else if (model.funnel) {
                     let h5 = 'Trimmed ' + model.funnel.a + ' → ' + model.funnel.c + ' songs';
                     const extras = [];
                     if (model.diversityRemoved > 0) extras.push('artist variety');

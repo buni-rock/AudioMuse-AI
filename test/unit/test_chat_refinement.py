@@ -193,6 +193,140 @@ class TestShapeHints:
         shape = planner.requested_playlist_shape('give me 20 songs, one per artist')
         assert shape == {'song_count': 20, 'max_per_artist': 1}
 
+    def test_thirty_minute_budget_is_seconds_not_song_count(self):
+        shape = planner.requested_playlist_shape('30 minute playlist')
+        assert shape == {'total_seconds': 1800.0}
+
+    def test_named_seed_extraction_handles_starting_from_request(self):
+        request = (
+            'I would like a 30 minute playlist starting from Dark chest of wonders songs. '
+            'The playlist should contain similar songs to this one.'
+        )
+        assert planner.extract_named_song_seed(request) == 'Dark chest of wonders'
+
+    @pytest.mark.parametrize(
+        'request, expected_title, expected_artist',
+        [
+            (
+                'I would like you to build me a 30 minutes playlist starting from Dark chest of wonders songs. '
+                'The playlist should contain similar songs to this one.',
+                'Dark chest of wonders', None,
+            ),
+            ('make me songs similar to Dark Chest Of Wonders', 'Dark Chest Of Wonders', None),
+            ('start with Dark Chest Of Wonders by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
+            ('based on "Dark Chest Of Wonders" by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
+        ],
+    )
+    def test_named_seed_parser_uses_explicit_cues(
+        self, request, expected_title, expected_artist
+    ):
+        details = planner.extract_named_song_seed_details(request)
+        assert details['title'] == expected_title
+        assert details.get('artist') == expected_artist
+
+    def test_named_seed_parser_does_not_treat_would_like_as_a_seed(self):
+        assert planner.extract_named_song_seed('I would like you to build a 30 minutes playlist') is None
+
+    def test_planner_failure_rescues_named_seed_with_seed_search(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            planner, 'call_ai_for_plan', lambda *a, **k: {'error': 'invalid JSON: unexpected text'}
+        )
+
+        def capture_finish(plan, *args, **kwargs):
+            captured['plan'] = plan
+            if False:
+                yield
+            return {'songs': []}
+
+        monkeypatch.setattr(planner, '_finish_plan', capture_finish)
+        request = 'starting from Dark Chest Of Wonders, make similar songs'
+        log_messages = []
+        pipeline = planner.plan_and_execute_once(
+            user_message=request,
+            tools=[],
+            ai_config={'provider': 'OLLAMA'},
+            log_messages=log_messages,
+            raw_user_request=request,
+        )
+        with pytest.raises(StopIteration):
+            while True:
+                next(pipeline)
+        call = captured['plan'].primaries[0]
+        assert call['name'] == 'seed_search'
+        assert call['arguments']['seeds'][0]['title'] == 'Dark Chest Of Wonders'
+        assert any('invalid JSON: unexpected text' in line for line in log_messages)
+
+
+class TestSeedNormalization:
+    @pytest.mark.parametrize(
+        'seed',
+        [
+            {'type': 'song', 'title': 'Dark Chest of Wonders'},
+            {'type': 'song', 'name': 'Dark Chest of Wonders'},
+            {'kind': 'song', 'title': 'Dark Chest of Wonders'},
+            {'kind': 'track', 'song_title': 'Dark Chest of Wonders'},
+        ],
+    )
+    def test_title_only_song_aliases_resolve_to_internal_seed_shape(self, seed, monkeypatch):
+        monkeypatch.setattr(
+            tool_impl, 'resolve_song_by_title',
+            lambda title, artist_hint='': {
+                'item_id': 'seed-opaque', 'title': 'Dark Chest Of Wonders',
+                'author': 'Nightwish', 'album': 'Once',
+            },
+        )
+        logs = []
+        out = planner.validate_plan_args(
+            [{'name': 'seed_search', 'arguments': {'seeds': [seed]}}],
+            user_wants_rating=False, log_messages=logs,
+        )
+        assert out[0]['arguments']['seeds'] == [
+            {'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish'}
+        ]
+        assert any('seed normalized:' in line for line in logs)
+
+    def test_artist_kind_and_name_alias_normalize(self):
+        logs = []
+        out = planner.validate_plan_args(
+            [{'name': 'seed_search', 'arguments': {'seeds': [
+                {'kind': 'artist', 'artist_name': 'Nightwish'}
+            ]}}],
+            user_wants_rating=False, log_messages=logs,
+        )
+        assert out[0]['arguments']['seeds'] == [
+            {'type': 'artist', 'name': 'Nightwish'}
+        ]
+
+    def test_library_resolved_song_replaces_a_conflicting_planner_artist_seed(self):
+        plan = ToolPlan(primaries=[
+            {'name': 'seed_search', 'arguments': {'seeds': [
+                {'type': 'artist', 'name': 'Dark Chest Of Wonders'}
+            ]}},
+            {'name': 'text_match', 'arguments': {'query': 'female vocals'}}
+        ])
+        logs = []
+        planner._lock_resolved_seed(
+            plan,
+            {
+                'item_id': 'fp-authoritative', 'title': 'Dark Chest Of Wonders',
+                'artist': 'Nightwish', 'album': 'End Of An Era',
+            },
+            'starting from Dark Chest Of Wonders, find similar songs',
+            logs,
+        )
+        assert plan.primaries == [
+            {'name': 'seed_search', 'arguments': {'seeds': [{
+                'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish'
+            }], 'blend_mode': 'union', '_resolved_track': {
+                'item_id': 'fp-authoritative', 'title': 'Dark Chest Of Wonders',
+                'artist': 'Nightwish', 'album': 'End Of An Era',
+            }}},
+            {'name': 'text_match', 'arguments': {'query': 'female vocals'}},
+        ]
+        assert 'Authoritative seed locked: true' in logs
+        assert 'Mandatory retrieval: seed_search' in logs
+
 
 class TestPlanRepairs:
     def test_a_point_tempo_is_widened(self):

@@ -332,6 +332,79 @@ def _fuzzy_match_author_title(
     }
 
 
+def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Dict]:
+    """Resolve a song title, preferring matches available on the selected server."""
+    title = (song_title or "").strip()
+    artist_hint = (artist_hint or "").strip()
+    if not title:
+        return None
+    db_conn = get_db_connection()
+    try:
+        with db_conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """SELECT item_id, title, author, album,
+                          COUNT(*) OVER() AS _match_count
+                   FROM public.score
+                   WHERE LOWER(title) = LOWER(%s)
+                   ORDER BY CASE WHEN %s <> '' AND LOWER(COALESCE(author, '')) = LOWER(%s)
+                                 THEN 0 ELSE 1 END,
+                            LENGTH(COALESCE(author, '')), item_id""",
+                (title, artist_hint, artist_hint),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        if rows:
+            match_count = int(rows[0].get('_match_count', len(rows)) or len(rows))
+            available_ids = set()
+            try:
+                from app_server_context import resolve_request_server_id
+                from tasks.mediaserver import registry
+
+                try:
+                    server_id = resolve_request_server_id()
+                except RuntimeError:  # Utility callers may not have an HTTP request.
+                    server_id = None
+                available_ids = set(registry.translate_ids(
+                    [row['item_id'] for row in rows], server_id, conn=db_conn
+                ))
+            except Exception:
+                logger.warning(
+                    "Could not scope exact song seed matches to the selected server; "
+                    "using deterministic library matching",
+                    exc_info=True,
+                )
+
+            def match_key(row):
+                return (
+                    0 if artist_hint and (row.get('author') or '').casefold() == artist_hint.casefold() else 1,
+                    0 if row['item_id'] in available_ids else 1,
+                    len(row.get('author') or ''),
+                    str(row.get('item_id') or ''),
+                )
+
+            resolved = min(rows, key=match_key)
+            resolved.pop('_match_count', None)
+            resolved['_match_count'] = match_count
+            if match_count > 1:
+                logger.info(
+                    "Song seed title %r matched %d library tracks; selected %r by %r%s%s",
+                    title, match_count, resolved.get('title'), resolved.get('author'),
+                    " using the requested artist hint" if artist_hint and
+                    (resolved.get('author') or '').casefold() == artist_hint.casefold() else
+                    " using deterministic best match",
+                    "; available on selected server" if resolved.get('item_id') in available_ids else
+                    "; unavailable on selected server",
+                )
+            return resolved
+        match = _fuzzy_match_author_title(db_conn, artist_hint, title)
+        if match:
+            resolved = dict(match)
+            resolved['_match_count'] = 1
+            return resolved
+        return None
+    finally:
+        db_conn.close()
+
+
 def _normalized_ilike_sql(column: str) -> str:
     hyphen = chr(0x2010)
     return (

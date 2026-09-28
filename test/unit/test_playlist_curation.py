@@ -1,0 +1,653 @@
+import json
+
+import pytest
+
+from tasks.playlist_curation import (
+    build_llm_candidate_payload,
+    curate_candidates_with_llm,
+    optimize_playlist_duration,
+    rank_candidates_by_ids,
+    reorder_preserving_membership,
+    inspect_llm_candidate_selection,
+    validate_llm_candidate_selection,
+)
+
+
+def test_llm_selection_rejects_unknown_and_duplicate_ids():
+    raw = json.dumps({"selected_ids": ["a", "invented", "a", "b"]})
+    assert validate_llm_candidate_selection(raw, ["a", "b"], "LLM_CURATE") == ["a", "b"]
+
+
+def test_bad_response_is_empty_and_falls_back_to_native(monkeypatch):
+    import tasks.ai.api as api
+    monkeypatch.setattr(api, "generate_text", lambda *a, **k: "not json")
+    ids, sent = curate_candidates_with_llm(
+        "request", [{"item_id": "a"}, {"item_id": "b"}], "LLM_CURATE", {}, include_audio=False
+    )
+    assert ids == []
+    assert sent == 2
+
+
+def test_curator_distinguishes_provider_error_from_valid_empty_alias_response(monkeypatch):
+    import tasks.ai.api as api
+    songs = [{"item_id": "a"}]
+    logs = []
+    monkeypatch.setattr(api, "generate_text", lambda *a, **k: "Error: AI service is currently unavailable.")
+    ids, _ = curate_candidates_with_llm(
+        "request", songs, "LLM_RERANK", {"provider": "OLLAMA", "ollama_model": "qwen3.5:9b"},
+        include_audio=False, log_messages=logs,
+    )
+    assert ids == []
+    assert any(line.startswith("Curator status: PROVIDER_ERROR") for line in logs)
+    assert not any("JSON parsing: failure" in line for line in logs)
+
+    logs.clear()
+    monkeypatch.setattr(api, "generate_text", lambda *a, **k: '{"ranked_ids":[]}')
+    ids, _ = curate_candidates_with_llm(
+        "request", songs, "LLM_RERANK", {"provider": "OLLAMA", "ollama_model": "qwen3.5:9b"},
+        include_audio=False, log_messages=logs,
+    )
+    assert ids == []
+    assert "Curator JSON parsing: success" in logs
+    assert "Curator validation: response contained no exact candidate IDs" in logs
+
+
+def test_curator_provider_failure_is_nonfatal(monkeypatch):
+    import tasks.ai.api as api
+    def fail(*args, **kwargs):
+        raise TimeoutError("timeout")
+    monkeypatch.setattr(api, "generate_text", fail)
+    ids, _ = curate_candidates_with_llm(
+        "request", [{"item_id": "a"}, {"item_id": "b"}], "LLM_RERANK", {}, include_audio=False
+    )
+    assert ids == []
+
+
+def test_candidate_payload_uses_only_available_audio_metadata():
+    payload = build_llm_candidate_payload(
+        [{"item_id": "a", "title": "Song", "artist": "Artist"}],
+        {"a": {"tempo": 120, "energy": None}},
+    )
+    assert payload == [{"id": "a", "title": "Song", "artist": "Artist", "tempo": 120}]
+
+
+def test_duration_optimizer_exact_and_closest_results_respect_count_and_artist_cap():
+    songs = [
+        {"item_id": "a", "artist": "X"},
+        {"item_id": "b", "artist": "X"},
+        {"item_id": "c", "artist": "Y"},
+    ]
+    exact = optimize_playlist_duration(songs, {"a": 180, "b": 200, "c": 120}, 300, 2, 1)
+    assert {s["item_id"] for s in exact} == {"a", "c"}
+    closest = optimize_playlist_duration(songs, {"a": 180, "b": 200, "c": 120}, 299, 2, 1)
+    assert sum({"a": 180, "b": 200, "c": 120}[s["item_id"]] for s in closest) == 300
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"ranked_ids":["opaque-a","opaque-b"]}',
+        '```json\n { "ranked_ids" : [ "opaque-a", "opaque-b" ] } \n```',
+        'The result is below:\n```json\n{"ranked_ids":["opaque-a","opaque-b"]}\n```\nDone.',
+    ],
+)
+def test_curator_accepts_plain_fenced_and_surrounded_json(raw):
+    assert validate_llm_candidate_selection(raw, ["opaque-a", "opaque-b"], "LLM_RERANK") == [
+        "opaque-a", "opaque-b"
+    ]
+
+
+def test_curator_diagnostics_identify_titles_unknown_ids_wrong_key_and_duplicates():
+    ids, diag = inspect_llm_candidate_selection(
+        '{"selected_ids":["Nightwish Song","invented","opaque-a","opaque-a"]}',
+        ["opaque-a", "opaque-b"], "LLM_CURATE",
+        candidate_titles={"opaque-a": "Nightwish Song"},
+    )
+    assert ids == ["opaque-a"]
+    assert diag["invalid_ids"] == [
+        {"value": "Nightwish Song", "reason": "title returned instead of ID"},
+        {"value": "invented", "reason": "ID was not present in the candidate map"},
+    ]
+    assert diag["duplicates_removed"] == ["opaque-a"]
+    _, wrong_key = inspect_llm_candidate_selection(
+        '{"songs":["opaque-a"]}', ["opaque-a"], "LLM_RERANK"
+    )
+    assert "ranked_ids" in wrong_key["rejection_reason"]
+
+
+def test_malformed_json_is_rejected_with_reason():
+    ids, diag = inspect_llm_candidate_selection(
+        '{"ranked_ids":[', ["opaque-a"], "LLM_RERANK"
+    )
+    assert ids == []
+    assert diag["rejection_reason"].startswith("invalid JSON:")
+
+
+def test_valid_curator_ranking_changes_native_order(monkeypatch):
+    import tasks.ai.api as api
+
+    songs = [
+        {"item_id": "opaque-z", "title": "Z song", "artist": "Z"},
+        {"item_id": "opaque-b", "title": "B song", "artist": "B"},
+        {"item_id": "opaque-a", "title": "A song", "artist": "A"},
+    ]
+    captured = {}
+
+    def fake_generate(prompt, config, **kwargs):
+        captured["prompt"] = prompt
+        captured["format"] = kwargs.get("structured_format")
+        return '{"ranked_ids":["C003","C002","C001"]}'
+
+    monkeypatch.setattr(api, "generate_text", fake_generate)
+    ids, sent = curate_candidates_with_llm(
+        "similar to a seed", songs, "LLM_RERANK", {"provider": "OLLAMA"},
+        include_audio=False,
+    )
+    ranked = rank_candidates_by_ids(songs, ids)
+    assert sent == 3
+    assert [s["item_id"] for s in ranked] == ["opaque-a", "opaque-b", "opaque-z"]
+    assert [s["item_id"] for s in ranked] != [s["item_id"] for s in songs]
+    assert "Use only candidate IDs" in captured["prompt"]
+    assert captured["format"]["required"] == ["ranked_ids"]
+    assert captured["format"]["additionalProperties"] is False
+
+
+def test_curator_uses_short_aliases_and_maps_them_back_to_authoritative_tracks(monkeypatch):
+    import tasks.ai.api as api
+
+    songs = [
+        {"item_id": "fp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "title": "A", "artist": "AA"},
+        {"item_id": "fp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "title": "B", "artist": "BB"},
+    ]
+    captured = {}
+
+    def fake_generate(prompt, config, **kwargs):
+        captured["prompt"] = prompt
+        return '{"ranked_ids":["C002","C001"]}'
+
+    monkeypatch.setattr(api, "generate_text", fake_generate)
+    ids, sent = curate_candidates_with_llm("request", songs, "LLM_RERANK", {}, include_audio=False)
+    assert sent == 2
+    assert ids == [songs[1]["item_id"], songs[0]["item_id"]]
+    assert '"id":"C001"' in captured["prompt"] and '"id":"C002"' in captured["prompt"]
+    assert "fp_aaaaaaaa" not in captured["prompt"]
+    assert "fp_bbbbbbbb" not in captured["prompt"]
+
+
+def test_curator_alias_validation_rejects_unknown_and_deduplicates(monkeypatch):
+    import tasks.ai.api as api
+    songs = [{"item_id": "fp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+             {"item_id": "fp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+    monkeypatch.setattr(
+        api, "generate_text",
+        lambda *a, **k: '{"ranked_ids":["C002","C999","C002","C001"]}',
+    )
+    ids, _ = curate_candidates_with_llm("request", songs, "LLM_RERANK", {}, include_audio=False)
+    assert ids == [songs[1]["item_id"], songs[0]["item_id"]]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"selected_ids":["C003","C001"]}',
+        '["C003","C001"]',
+        '{"id":"C003"}',
+        '{"ids":["C003","C001"]}',
+        '{"ranked_ids":["C003"],"summary":"analysis"}',
+    ],
+)
+def test_curator_rejects_responses_outside_the_exact_ranked_schema(raw):
+    aliases, diagnostics = inspect_llm_candidate_selection(
+        raw, ["C001", "C002", "C003"], "LLM_RERANK",
+    )
+    assert aliases == []
+    assert diagnostics["normalized_alias_count"] == 0
+
+
+def test_curator_normalization_rejects_unknown_alias_but_keeps_valid_alias():
+    aliases, diagnostics = inspect_llm_candidate_selection(
+        '{"ranked_ids":["C999","C001"]}', ["C001", "C002"], "LLM_RERANK",
+    )
+    assert aliases == ["C001"]
+    assert diagnostics["invalid_ids"] == [
+        {"value": "C999", "reason": "ID was not present in the candidate map"}
+    ]
+
+
+def test_curator_rejects_analysis_object_without_exact_ranked_ids(monkeypatch):
+    import tasks.ai.api as api
+    songs = [
+        {"item_id": "track-a", "title": "Song A"},
+        {"item_id": "track-b", "title": "Song B"},
+        {"item_id": "track-c", "title": "Song C"},
+    ]
+    logs = []
+    monkeypatch.setattr(api, "generate_text", lambda *a, **k: '{"summary":"analysis","high_energy_tracks":["C003"]}')
+    ids, _ = curate_candidates_with_llm(
+        "request", songs, "LLM_RERANK", {}, include_audio=False, log_messages=logs,
+    )
+    assert ids == []
+    assert any("expected exactly the 'ranked_ids' property" in line for line in logs)
+    assert "Valid aliases: 0" in logs
+
+
+def test_partial_rerank_supplements_remaining_candidates_in_native_order():
+    songs = [{"item_id": f"track-{alias}", "alias": alias} for alias in ("C001", "C002", "C003", "C004")]
+    ranked = rank_candidates_by_ids(
+        songs, ["track-C003"], include_unselected=True,
+    )
+    assert [song["item_id"] for song in ranked] == [
+        "track-C003", "track-C001", "track-C002", "track-C004",
+    ]
+
+
+def test_llm_curate_uses_aliases_and_maps_to_real_ids(monkeypatch):
+    import tasks.ai.api as api
+    songs = [{"item_id": "fp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+             {"item_id": "fp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+    monkeypatch.setattr(
+        api, "generate_text",
+        lambda *a, **k: '{"selected_ids":["C002"]}',
+    )
+    ids, _ = curate_candidates_with_llm("request", songs, "LLM_CURATE", {}, include_audio=False)
+    assert ids == [songs[1]["item_id"]]
+
+
+def test_duration_optimizer_uses_real_durations_and_keeps_mandatory_seed():
+    from tasks.ai.planner import requested_playlist_shape
+
+    request = "30 minute playlist"
+    shape = requested_playlist_shape(request)
+    assert shape["total_seconds"] == 1800
+    songs = [
+        {"item_id": "seed-opaque", "artist": "Nightwish", "title": "Dark Chest Of Wonders"},
+        {"item_id": "id-240", "artist": "A"},
+        {"item_id": "id-220", "artist": "B"},
+        {"item_id": "id-300", "artist": "C"},
+        {"item_id": "id-190", "artist": "D"},
+        {"item_id": "id-360", "artist": "E"},
+        {"item_id": "id-218", "artist": "F"},
+    ]
+    durations = {
+        "seed-opaque": 269, "id-240": 240, "id-220": 220, "id-300": 300,
+        "id-190": 190, "id-360": 360, "id-218": 218,
+    }
+    result = optimize_playlist_duration(
+        songs, durations, shape["total_seconds"], 100, 1,
+        mandatory_ids=["seed-opaque"],
+    )
+    assert result[0]["item_id"] == "seed-opaque"
+    assert sum(durations[s["item_id"]] for s in result) == 1797
+
+
+def test_llm_curate_sends_compact_40_candidate_shortlist_with_exact_schema(monkeypatch):
+    import tasks.ai.api as api
+
+    songs = [
+        {
+            "item_id": f"track-{i:03d}", "title": f"Song {i:03d}",
+            "artist": "Artist", "album": "Album", "duration": 180,
+        }
+        for i in range(1, 41)
+    ]
+    captured, logs = {}, []
+
+    def fake_generate(prompt, config, **kwargs):
+        captured.update(prompt=prompt, schema=kwargs.get("structured_format"), max_tokens=kwargs.get("max_tokens"))
+        return '{"selected_ids":["C001","C002","C003","C004","C005","C006","C007","C008","C009","C010","C011","C012","C013","C014","C015","C016","C017","C018","C019","C020"]}'
+
+    monkeypatch.setattr(api, "generate_text", fake_generate)
+    ids, sent = curate_candidates_with_llm(
+        "request", songs, "LLM_CURATE", {"provider": "OLLAMA"}, limit=40,
+        include_audio=False, log_messages=logs,
+    )
+    assert sent == 40
+    assert len(ids) == 20
+    assert '"id":"C001"' in captured["prompt"] and '"id":"C040"' in captured["prompt"]
+    assert "mood_vector" not in captured["prompt"] and "other_features" not in captured["prompt"]
+    assert captured["schema"]["required"] == ["selected_ids"]
+    assert captured["schema"]["properties"]["selected_ids"]["maxItems"] == 20
+    assert captured["schema"]["additionalProperties"] is False
+    assert captured["max_tokens"] == 1200
+    assert "Native shortlist for curator: 40" in logs
+    assert any(line.startswith("Serialized candidate payload chars:") for line in logs)
+
+
+def test_curator_rejects_analysis_report_even_when_it_contains_candidate_ids():
+    aliases, diag = inspect_llm_candidate_selection(
+        '{"summary":"tracks C001-C040 are energetic","high_energy_tracks":["C001"]}',
+        [f"C{i:03d}" for i in range(1, 41)], "LLM_CURATE",
+    )
+    assert aliases == []
+    assert diag["json_top_level_type"] == "dict"
+    assert diag["normalization_input_type"] == "dict"
+    assert diag["normalization_output_aliases"] == []
+
+
+def test_playlist_suppresses_normalized_title_artist_duplicates():
+    from tasks.playlist_curation import suppress_duplicate_title_artist
+
+    songs = [
+        {"item_id": "a", "title": "(01) [Disturbed] Remnants", "artist": "Disturbed"},
+        {"item_id": "b", "title": "remnants", "artist": "DISTURBED"},
+        {"item_id": "c", "title": "Remnants", "artist": "Another artist"},
+        {"item_id": "d", "title": "Untitled", "artist": ""},
+    ]
+    kept, removed = suppress_duplicate_title_artist(songs)
+    assert [song["item_id"] for song in kept] == ["a", "c", "d"]
+    assert removed == 1
+
+
+def test_curator_candidate_window_probe_checks_first_last_and_count(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import probe_curator_candidate_window
+
+    captured = {}
+
+    def fake_generate(prompt, config, **kwargs):
+        captured.update(prompt=prompt, schema=kwargs.get("structured_format"))
+        return '{"first_id":"C001","last_id":"C040","candidate_count":40}'
+
+    monkeypatch.setattr(api, "generate_text", fake_generate)
+    result = probe_curator_candidate_window({"provider": "OLLAMA"}, count=40)
+    assert result["status"] == "SUCCESS"
+    assert result["candidate_count_sent"] == 40
+    assert '"id":"C001"' in captured["prompt"]
+    assert '"id":"C040"' in captured["prompt"]
+    assert captured["schema"]["additionalProperties"] is False
+
+
+def test_duration_optimizer_prefers_rank_over_exact_duration_inside_tolerance():
+    from tasks.playlist_curation import optimize_playlist_duration
+
+    songs = [
+        {"item_id": f"high-{i}", "artist": f"High{i}"}
+        for i in range(5)
+    ] + [
+        {"item_id": f"low-{i}", "artist": f"Low{i}"}
+        for i in range(5)
+    ]
+    durations = dict(zip(
+        [s["item_id"] for s in songs],
+        [350, 360, 360, 360, 363, 350, 360, 360, 360, 370],
+    ))
+    diagnostics = {}
+    result = optimize_playlist_duration(
+        songs, durations, 1800, count=5, max_per_artist=1,
+        exact_count=True, tolerance_seconds=15, diagnostics=diagnostics,
+    )
+    assert sum(durations[s["item_id"]] for s in result) == 1793
+    assert diagnostics["ranking_cost"] == 15
+    assert diagnostics["best_exact_ranking_cost"] > diagnostics["ranking_cost"]
+
+
+def test_duration_optimizer_uses_exact_duration_when_rank_cost_ties():
+    from tasks.playlist_curation import optimize_playlist_duration
+
+    songs = [
+        {"item_id": key, "artist": key}
+        for key in ("rank-1", "rank-2", "rank-3", "rank-4")
+    ]
+    durations = {"rank-1": 1000, "rank-2": 900, "rank-3": 900, "rank-4": 795}
+    result = optimize_playlist_duration(
+        songs, durations, 1800, count=2, max_per_artist=1,
+        exact_count=True, tolerance_seconds=15,
+    )
+    assert sum(durations[s["item_id"]] for s in result) == 1800
+    assert {s["item_id"] for s in result} == {"rank-2", "rank-3"}
+
+
+def test_duration_optimizer_uses_closest_duration_when_none_fits_tolerance():
+    from tasks.playlist_curation import optimize_playlist_duration
+
+    songs = [
+        {"item_id": key, "artist": key}
+        for key in ("high-a", "high-b", "lower-a", "lower-b")
+    ]
+    durations = {"high-a": 1000, "high-b": 750, "lower-a": 900, "lower-b": 870}
+    diagnostics = {}
+    result = optimize_playlist_duration(
+        songs, durations, 1800, count=2, max_per_artist=1,
+        exact_count=True, tolerance_seconds=15, diagnostics=diagnostics,
+    )
+    assert sum(durations[s["item_id"]] for s in result) == 1770
+    assert diagnostics["solutions_in_tolerance"] == 0
+
+
+def test_duration_optimizer_always_keeps_mandatory_seed():
+    from tasks.playlist_curation import optimize_playlist_duration
+
+    songs = [
+        {"item_id": "seed", "artist": "Seed Artist"},
+        {"item_id": "a", "artist": "Artist A"},
+        {"item_id": "b", "artist": "Artist B"},
+    ]
+    result = optimize_playlist_duration(
+        songs, {"seed": 300, "a": 750, "b": 750}, 1800,
+        count=3, max_per_artist=1, mandatory_ids=["seed"],
+    )
+    assert [song["item_id"] for song in result] == ["seed", "a", "b"]
+
+
+def test_duration_optimizer_uses_llm_curate_order_for_ranks_and_output():
+    from tasks.playlist_curation import optimize_playlist_duration
+
+    songs = [{"item_id": key, "artist": key} for key in ("C001", "C002", "C005", "C010")]
+    diagnostics = {}
+    result = optimize_playlist_duration(
+        songs, {song["item_id"]: 600 for song in songs}, 1200,
+        count=2, max_per_artist=1, exact_count=True,
+        ranked_ids=["C005", "C002", "C010", "C001"],
+        tolerance_seconds=0, diagnostics=diagnostics,
+    )
+    assert [song["item_id"] for song in result] == ["C005", "C002"]
+    assert diagnostics["selected_ranks"] == [1, 2]
+
+
+def test_duration_optimizer_uses_native_order_when_no_curator_order_is_supplied():
+    from tasks.playlist_curation import optimize_playlist_duration
+
+    songs = [{"item_id": key, "artist": key} for key in ("native-a", "native-b", "native-c")]
+    result = optimize_playlist_duration(
+        songs, {song["item_id"]: 600 for song in songs}, 1200,
+        count=2, max_per_artist=1, exact_count=True, tolerance_seconds=0,
+    )
+    assert [song["item_id"] for song in result] == ["native-a", "native-b"]
+
+
+def test_mandatory_seed_survives_curation_and_ordering_membership_is_unchanged():
+    songs = [
+        {"item_id": "seed-opaque", "title": "Dark Chest Of Wonders"},
+        {"item_id": "id-a"},
+        {"item_id": "id-b"},
+    ]
+    curated = rank_candidates_by_ids(
+        songs, ["id-b"], mandatory_ids=["seed-opaque"], include_unselected=False
+    )
+    assert [song["item_id"] for song in curated] == ["seed-opaque", "id-b"]
+    before = {song["item_id"] for song in curated}
+    after = {song["item_id"] for song in reorder_preserving_membership(curated, ["id-b"])}
+    assert before == after
+
+
+
+def test_title_only_seed_dispatch_resolves_track_before_similarity_search(monkeypatch):
+    import tasks.ai.tools as tools
+
+    monkeypatch.setattr(
+        tools, "resolve_song_by_title",
+        lambda title: {"item_id": "seed-opaque", "title": "Dark Chest Of Wonders", "author": "Nightwish"},
+    )
+    called = {}
+
+    def similarity(title, artist, count):
+        called.update(title=title, artist=artist, count=count)
+        return {"songs": [{"item_id": "neighbor-opaque"}], "message": "similarity results"}
+
+    monkeypatch.setattr(tools, "_song_similarity_api_sync", similarity)
+    result = tools._dispatch_seed_search(
+        {"seeds": [{"type": "song", "title": "Dark chest of wonders"}], "get_songs": 20},
+        {},
+    )
+    assert called["title"] == "Dark Chest Of Wonders"
+    assert called["artist"] == "Nightwish"
+    assert result["songs"][0]["item_id"] == "neighbor-opaque"
+    assert "Seed ID: seed-opaque" in result["message"]
+
+
+def test_seed_search_to_curated_duration_pipeline_keeps_named_seed(monkeypatch):
+    from tasks.ai import api, planner, tool_impl, tools
+
+    request = (
+        'I would like you to build me a 30 minutes playlist starting from Dark chest of wonders songs. '
+        'The playlist should contain similar songs to this one.'
+    )
+    duration = planner.requested_playlist_shape(request)['total_seconds']
+    assert duration == 1800
+
+    resolved = {
+        'item_id': 'seed-opaque', 'title': 'Dark Chest Of Wonders',
+        'author': 'Nightwish', 'album': 'Once',
+    }
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist_hint='': resolved)
+    planner_calls = [{
+        'name': 'seed_search',
+        'arguments': {'seeds': [{'type': 'song', 'title': 'Dark Chest of Wonders'}]},
+    }]
+    normalized_calls = planner.validate_plan_args(
+        planner_calls, user_wants_rating=False, request_text=request,
+    )
+    assert [call['name'] for call in normalized_calls] == ['seed_search']
+    seed = normalized_calls[0]['arguments']['seeds'][0]
+    assert seed == {'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish'}
+
+    similarity_called = {}
+    candidates = [
+        {'item_id': 'candidate-a', 'title': 'A', 'artist': 'Artist A'},
+        {'item_id': 'candidate-b', 'title': 'B', 'artist': 'Artist B'},
+        {'item_id': 'candidate-c', 'title': 'C', 'artist': 'Artist C'},
+        {'item_id': 'candidate-d', 'title': 'D', 'artist': 'Artist D'},
+        {'item_id': 'candidate-e', 'title': 'E', 'artist': 'Artist E'},
+        {'item_id': 'candidate-f', 'title': 'F', 'artist': 'Artist F'},
+    ]
+
+    def fake_similarity(title, artist, count):
+        similarity_called.update(title=title, artist=artist)
+        return {'songs': candidates, 'message': 'mock similarity results'}
+
+    monkeypatch.setattr(tools, '_song_similarity_api_sync', fake_similarity)
+    retrieved = tools._dispatch_seed_search(normalized_calls[0]['arguments'], {})
+    assert similarity_called == {'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish'}
+    assert retrieved['songs']
+    candidate_pool = [
+        {'item_id': resolved['item_id'], 'title': resolved['title'], 'artist': 'Nightwish'},
+        *retrieved['songs'],
+    ]
+
+    prompt_seen = {}
+
+    def fake_generate_text(prompt, *args, **kwargs):
+        prompt_seen['text'] = prompt
+        return json.dumps({'ranked_ids': ['C003', 'C002']})
+
+    monkeypatch.setattr(api, 'generate_text', fake_generate_text)
+    ranked_ids, sent = curate_candidates_with_llm(
+        request, candidate_pool, 'LLM_RERANK', {}, limit=100,
+    )
+    assert sent > 0
+    assert '"id":"C001"' in prompt_seen['text']
+    assert '"id":"C007"' in prompt_seen['text']
+    assert all(song['item_id'] not in prompt_seen['text'] for song in candidate_pool)
+    curated = rank_candidates_by_ids(
+        candidate_pool, ranked_ids, mandatory_ids=['seed-opaque'], include_unselected=True,
+    )
+    assert curated[0]['item_id'] == 'seed-opaque'
+
+    durations = {
+        'seed-opaque': 269, 'candidate-a': 240, 'candidate-b': 220,
+        'candidate-c': 300, 'candidate-d': 190, 'candidate-e': 360,
+        'candidate-f': 250,
+    }
+    final = optimize_playlist_duration(
+        curated, durations, duration, count=100, max_per_artist=10,
+        mandatory_ids=['seed-opaque'],
+    )
+    assert 'seed-opaque' in {song['item_id'] for song in final}
+    assert len(final) < 10
+    assert not any(call['name'] == 'text_match' for call in normalized_calls)
+
+
+def test_planner_and_curator_share_ollama_chat_adapter_and_curator_validates_aliases(monkeypatch):
+    from tasks.ai import api
+    from tasks.ai.providers import openai
+
+    calls = []
+
+    def fake_chat(url, model, payload, *, timeout, operation):
+        calls.append((operation, url, model, payload, timeout))
+        if operation == "planner":
+            return {"message": {"tool_calls": [{"function": {"name": "lookup", "arguments": {}}}]}}
+        return {"message": {"content": '{"ranked_ids":["C002","C001"]}'}}
+
+    monkeypatch.setattr(openai, "_ollama_chat_request", fake_chat)
+    config = {"provider": "OLLAMA", "ollama_url": "http://ollama:11434", "ollama_model": "qwen3.5:9b"}
+    plan = api.call_with_tools(
+        "find tracks", [{"name": "lookup", "description": "lookup", "inputSchema": {"type": "object", "properties": {}}}],
+        config, log_messages=[],
+    )
+    assert "tool_calls" in plan
+
+    logs = []
+    ids, sent = curate_candidates_with_llm(
+        "request", [{"item_id": "track-a"}, {"item_id": "track-b"}],
+        "LLM_RERANK", config, include_audio=False, log_messages=logs,
+    )
+    assert sent == 2
+    assert ids == ["track-b", "track-a"]
+    assert [call[0] for call in calls] == ["planner", "text"]
+    assert calls[0][1] == calls[1][1] == "http://ollama:11434/api/chat"
+    assert calls[0][2] == calls[1][2] == "qwen3.5:9b"
+    assert "Curator status: SUCCESS" in logs
+    assert "Valid aliases: 2" in logs
+
+
+def test_direct_curator_provider_probe_uses_curator_adapter(monkeypatch):
+    from tasks.ai.providers import openai
+    from tasks.playlist_curation import probe_curator_provider
+
+    seen = {}
+
+    def fake_chat(url, model, payload, *, timeout, operation):
+        seen.update(url=url, model=model, payload=payload, operation=operation)
+        return {"message": {"content": '{"ranked_ids":["C002","C001"]}'}}
+
+    monkeypatch.setattr(openai, "_ollama_chat_request", fake_chat)
+    result = probe_curator_provider({
+        "provider": "OLLAMA", "ollama_url": "http://ollama:11434", "ollama_model": "qwen3.5:9b",
+    })
+    assert result["status"] == "SUCCESS"
+    assert result["parsed"]["ranked_ids"] == ["C002", "C001"]
+    assert seen["operation"] == "text"
+    assert [m["role"] for m in seen["payload"]["messages"]] == ["system", "user"]
+    assert seen["payload"]["format"]["required"] == ["ranked_ids"]
+    assert seen["payload"]["format"]["additionalProperties"] is False
+
+
+def test_curator_provider_failure_logs_reason_and_returns_empty_for_native_fallback(monkeypatch, caplog):
+    import httpx
+    from tasks.ai.providers import openai
+
+    def fail(*args, **kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(openai, "_ollama_chat_request", fail)
+    logs = []
+    ids, _ = curate_candidates_with_llm(
+        "request", [{"item_id": "track-a"}], "LLM_RERANK",
+        {"provider": "OLLAMA", "ollama_url": "http://ollama:11434", "ollama_model": "qwen3.5:9b"},
+        include_audio=False, log_messages=logs,
+    )
+    assert ids == []
+    assert "ConnectError" in caplog.text
+    assert any(line.startswith("Curator status: PROVIDER_ERROR") for line in logs)
+    assert "Curator JSON parsing: failure" not in logs

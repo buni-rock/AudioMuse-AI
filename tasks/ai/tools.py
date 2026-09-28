@@ -36,6 +36,7 @@ from tasks.ai.tool_impl import (
     _lyrics_search_sync,
     _song_alchemy_sync,
     _song_similarity_api_sync,
+    resolve_song_by_title,
     _text_search_sync,
 )
 from tasks.mcp_helper import get_db_connection as _get_db_connection
@@ -149,8 +150,22 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
         if stype == "song":
             title = (seed.get("title") or seed.get("song_title") or "").strip()
             artist = (seed.get("artist") or seed.get("song_artist") or "").strip()
-            if not title or not artist:
-                messages.append(f"seed_search: skipping malformed song seed {seed}")
+            if not title:
+                messages.append("seed_search: skipping song seed with no title")
+                continue
+            if not artist:
+                resolved = resolve_song_by_title(title)
+                if not resolved:
+                    messages.append(f"seed_search: title-only seed could not be resolved: {title}")
+                    continue
+                title = resolved.get("title") or title
+                artist = resolved.get("author") or resolved.get("artist") or ""
+                messages.append(
+                    f"Seed resolved: true; Seed ID: {resolved.get('item_id')}; "
+                    f"Seed title: {title}; Seed artist: {artist}"
+                )
+            if not artist:
+                messages.append(f"seed_search: resolved seed has no artist: {title}")
                 continue
             res = _song_similarity_api_sync(title, artist, per_seed_budget)
         elif stype == "artist":

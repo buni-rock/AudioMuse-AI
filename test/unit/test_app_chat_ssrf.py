@@ -18,6 +18,7 @@ Main Features:
 """
 
 import sys
+import time
 import types
 import logging
 from unittest.mock import patch
@@ -75,6 +76,8 @@ def _install_fakes(planner_calls):
     fake_planner = types.ModuleType('tasks.ai.planner')
     fake_planner.plan_and_execute_once = _planner
     fake_planner.requested_playlist_shape = lambda text: {}
+    fake_planner.extract_named_song_seed = lambda text: None
+    fake_planner.extract_named_song_seed_details = lambda text: None
 
     fake_mcp = types.ModuleType('tasks.mcp_helper')
     fake_mcp.get_library_context = lambda: {'total_songs': 0}
@@ -115,6 +118,24 @@ class TestChatEndpointUrlAcceptance:
             )
         assert resp.status_code != 400
         assert planner_calls
+
+
+class TestChatStreamKeepalive:
+    def test_stream_sends_heartbeat_while_pipeline_is_blocked(self, client, app_chat_mod, monkeypatch):
+        def slow_pipeline(data, log_messages):
+            log_messages.append("Starting slow step")
+            yield
+            time.sleep(0.04)
+            log_messages.append("Finished slow step")
+            return ({"ok": True}, 200)
+
+        monkeypatch.setattr(app_chat_mod, "_run_chat_pipeline", slow_pipeline)
+        monkeypatch.setattr(app_chat_mod, "_SSE_HEARTBEAT_SECONDS", 0.01)
+
+        response = client.post("/api/chatPlaylistStream", json={"userInput": "test"})
+        body = response.get_data(as_text=True)
+        assert ": keep-alive\n\n" in body
+        assert '"type": "done"' in body
 
 
 class TestChatLogMasking:

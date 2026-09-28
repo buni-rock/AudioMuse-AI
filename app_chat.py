@@ -25,12 +25,14 @@ Main Features:
   the default and is not relaxed; a journey keeps its path order.
 """
 
-from flask import Blueprint, render_template, request, jsonify, Response, stream_with_context, g
+from flask import Blueprint, copy_current_request_context, render_template, request, jsonify, Response, stream_with_context, g
 from flasgger import swag_from  # Import swag_from
 import json  # For JSON serialization of tool arguments
 import logging
 import math
+import queue
 import re
+import threading
 import time
 
 import app_server_context
@@ -49,6 +51,7 @@ import config
 from error.responses import json_error, json_exception
 
 _SSE_DATA_PREFIX = "data: "
+_SSE_HEARTBEAT_SECONDS = 15
 _BUDGET_SECONDS_PER_SONG = 180.0
 _BUDGET_TOLERANCE = 1.05
 
@@ -84,6 +87,7 @@ def chat_home():
         active='chat',
         instant_playlist_n_results_default=config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS,
         instant_playlist_max_n_results=config.INSTANT_PLAYLIST_MAX_N_RESULTS,
+        instant_playlist_selection_mode=config.INSTANT_PLAYLIST_SELECTION_MODE,
     )
 
 
@@ -156,6 +160,7 @@ def chat_config_defaults_api():
             "default_mistral_model_name": cfg.MISTRAL_MODEL_NAME,
             "instant_playlist_default_n_results": cfg.INSTANT_PLAYLIST_DEFAULT_N_RESULTS,
             "instant_playlist_max_n_results": cfg.INSTANT_PLAYLIST_MAX_N_RESULTS,
+            "instant_playlist_selection_mode": cfg.INSTANT_PLAYLIST_SELECTION_MODE,
         }
     ), 200
 
@@ -378,11 +383,9 @@ def chat_playlist_stream_api():
     then a final ``done`` event with the full response payload, so the frontend can
     show real, live progress with real per-step timing.
 
-    Threadless: ``_run_chat_pipeline`` is a generator that ``yield``s a tick after
-    each blocking step (LLM calls, the re-rank, DB queries). ``generate()`` runs it
-    inline on the request thread and, after every tick, flushes any new
-    ``log_messages`` lines as SSE ``log`` events; the generator's final ``return``
-    value (the response object) is delivered as the ``done`` event.
+    A background driver advances ``_run_chat_pipeline`` while this response
+    emits SSE heartbeats. This keeps reverse proxies from timing out during long
+    synchronous model calls; pipeline progress is still flushed as log events.
     """
     data = request.get_json()
     err = _reject_missing_user_input(data)
@@ -416,17 +419,51 @@ def chat_playlist_stream_api():
         yield ": stream-open\n\n"
 
         pipeline = _run_chat_pipeline(data, log_messages)
+        events = queue.Queue()
+
+        @copy_current_request_context
+        def drive_pipeline():
+            try:
+                while True:
+                    try:
+                        next(pipeline)
+                    except StopIteration as stop:
+                        events.put(("done", stop.value))
+                        return
+                    events.put(("tick", None))
+            except Exception as exc:  # propagate into the response thread for normal error handling
+                events.put(("error", exc))
+
+        threading.Thread(
+            target=drive_pipeline,
+            name="chat-playlist-pipeline",
+            daemon=True,
+        ).start()
+
         resp_obj = None
         try:
             while True:
                 try:
-                    next(pipeline)
-                except StopIteration as stop:
-                    resp_obj = (stop.value or ({}, 200))[0]
+                    event_type, value = events.get(timeout=_SSE_HEARTBEAT_SECONDS)
+                except queue.Empty:
+                    chunk = _flush()
+                    if chunk:
+                        yield chunk
+                    # SSE comments keep the connection alive without changing the
+                    # event stream consumed by the browser.
+                    yield ": keep-alive\n\n"
+                    continue
+
+                if event_type == "tick":
+                    chunk = _flush()
+                    if chunk:
+                        yield chunk
+                    continue
+                if event_type == "error":
+                    raise value
+                if event_type == "done":
+                    resp_obj = (value or ({}, 200))[0]
                     break
-                chunk = _flush()
-                if chunk:
-                    yield chunk
         except Exception as exc:  # noqa: BLE001 - keep broad catch to protect streaming endpoint
             logger.exception("Streaming chat pipeline failed")
             failure = error_manager.build(error_manager.classify(exc, UNKNOWN_ERROR_CODE))
@@ -510,7 +547,9 @@ def _run_chat_pipeline(data, log_messages):
     logger.debug("chat_playlist_api called. Raw request data: %s", data_for_log)
 
     from tasks.ai.tools import get_mcp_tools
-    from tasks.ai.planner import plan_and_execute_once, requested_playlist_shape
+    from tasks.ai.planner import (
+        extract_named_song_seed_details, plan_and_execute_once, requested_playlist_shape,
+    )
 
     original_user_input = data.get('userInput')
     # Detect if user's request mentions ratings (guard against AI hallucinating rating filters)
@@ -618,18 +657,96 @@ def _run_chat_pipeline(data, log_messages):
     log_messages.append("\nUsing MCP Agentic Workflow for playlist generation")
     target_song_count = _resolve_target_song_count(data)
     shape = requested_playlist_shape(original_user_input)
+    duration_only = bool(shape.get('total_seconds')) and not shape.get('song_count')
     if shape.get('song_count'):
         target_song_count = shape['song_count']
-        log_messages.append(f"The request asks for {target_song_count} songs")
+        log_messages.append(f"The request asks for exactly {target_song_count} songs")
     elif shape.get('total_seconds'):
         target_song_count = min(
             config.INSTANT_PLAYLIST_MAX_N_RESULTS,
-            max(1, math.ceil(shape['total_seconds'] / _BUDGET_SECONDS_PER_SONG)),
+            max(100, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
         )
-        log_messages.append(
-            f"The request asks for about {int(shape['total_seconds'] // 60)} minutes of music"
-        )
-    log_messages.append(f"Target: {target_song_count} songs")
+        log_messages.append("Duration constraint detected")
+        log_messages.append(f"Target duration: {int(shape['total_seconds'])} s")
+        log_messages.append("Tolerance: 15 s")
+        log_messages.append(f"Duration candidate target: {target_song_count}; final count is selected from actual durations")
+    if not shape.get('total_seconds'):
+        log_messages.append(f"Target: {target_song_count} songs")
+    log_messages.append(f"Candidate target: {target_song_count} songs")
+
+    mandatory_seed = None
+    seed_details = extract_named_song_seed_details(original_user_input)
+    seed_text = seed_details.get('title') if seed_details else None
+    seed_artist_hint = seed_details.get('artist', '') if seed_details else ''
+    if seed_text:
+        log_messages.append(f"Seed text requested: {seed_text}")
+        if seed_artist_hint:
+            log_messages.append(f"Seed artist hint: {seed_artist_hint}")
+        try:
+            from tasks.ai.tool_impl import resolve_song_by_title
+            seed_row = resolve_song_by_title(seed_text, seed_artist_hint)
+        except Exception:
+            logger.exception("Could not resolve requested seed title")
+            seed_row = None
+        if seed_row:
+            mandatory_seed = {
+                'item_id': seed_row.get('item_id'),
+                'title': seed_row.get('title') or seed_text,
+                'artist': seed_row.get('author') or seed_row.get('artist') or '',
+                'album': seed_row.get('album') or '',
+            }
+            log_messages.append(f"Seed normalized: {mandatory_seed['title']}")
+            log_messages.append("Seed resolved: true")
+            log_messages.append(
+                f"Seed resolved: {mandatory_seed['title']} by {mandatory_seed['artist']}"
+            )
+            if seed_row.get('_match_count', 1) > 1:
+                log_messages.append(
+                    f"Seed title was ambiguous ({seed_row['_match_count']} library matches); "
+                    f"selected {mandatory_seed['title']} by {mandatory_seed['artist']}"
+                )
+            log_messages.append(f"Seed ID: {mandatory_seed['item_id']}")
+            log_messages.append(f"Seed title: {mandatory_seed['title']}")
+            log_messages.append(f"Seed artist: {mandatory_seed['artist']}")
+            log_messages.append(f"Seed album: {mandatory_seed['album']}")
+            available_seed = app_server_context.scope_results(
+                [mandatory_seed], None, id_key='item_id', translate=False
+            )
+            if not available_seed:
+                log_messages.append(
+                    "Seed unavailable on the selected music server; playlist generation stopped "
+                    "so the required seed is not silently omitted"
+                )
+                return (
+                    {
+                        "message": "\n".join(log_messages),
+                        "original_request": original_user_input,
+                        "ai_provider_used": ai_provider,
+                        "ai_model_selected": ai_config.get(f'{ai_provider.lower()}_model'),
+                        "executed_query": None,
+                        "query_results": None,
+                        "target_duration_seconds": shape.get('total_seconds'),
+                        "actual_duration_seconds": None,
+                    },
+                    200,
+                )
+            mandatory_seed = available_seed[0]
+        else:
+            log_messages.append("Seed resolved: false; title was not found in the library")
+            log_messages.append("Candidate retrieval stopped because the requested seed is required")
+            return (
+                {
+                    "message": "\n".join(log_messages),
+                    "original_request": original_user_input,
+                    "ai_provider_used": ai_provider,
+                    "ai_model_selected": ai_config.get(f'{ai_provider.lower()}_model'),
+                    "executed_query": None,
+                    "query_results": None,
+                    "target_duration_seconds": shape.get('total_seconds'),
+                    "actual_duration_seconds": None,
+                },
+                200,
+            )
 
     # Get MCP tools and library context
     mcp_tools = get_mcp_tools()
@@ -650,8 +767,13 @@ def _run_chat_pipeline(data, log_messages):
 
     collection_cap = max(1000, target_song_count * 10)
 
+    planner_request = (
+        f'Build a playlist for: "{original_user_input}"'
+        if duration_only else
+        f'Build a {target_song_count}-song playlist for: "{original_user_input}"'
+    )
     plan_result = yield from plan_and_execute_once(
-        user_message=f'Build a {target_song_count}-song playlist for: "{original_user_input}"',
+        user_message=planner_request,
         tools=mcp_tools,
         ai_config=ai_config_with_secrets,
         log_messages=log_messages,
@@ -660,6 +782,7 @@ def _run_chat_pipeline(data, log_messages):
         collection_cap=collection_cap,
         target_song_count=target_song_count,
         raw_user_request=original_user_input,
+        resolved_seed=mandatory_seed,
     )
 
     if 'error' in plan_result:
@@ -698,7 +821,112 @@ def _run_chat_pipeline(data, log_messages):
             "unavailable songs before playlist selection"
         )
     all_songs = scoped_pool
+    mandatory_seed_ids = []
+    if mandatory_seed and mandatory_seed.get('item_id') is not None:
+        seed_scoped = app_server_context.scope_results(
+            [mandatory_seed], None, id_key='item_id', translate=False
+        )
+        if seed_scoped:
+            mandatory_seed = seed_scoped[0]
+            mandatory_seed_ids = [mandatory_seed['item_id']]
+            existing = {str(song.get('item_id')) for song in all_songs}
+            if str(mandatory_seed['item_id']) not in existing:
+                all_songs = [mandatory_seed] + all_songs
+            else:
+                all_songs = [mandatory_seed] + [
+                    song for song in all_songs
+                    if str(song.get('item_id')) != str(mandatory_seed['item_id'])
+                ]
+            log_messages.append("Mandatory seed added to candidate pool")
+        else:
+            log_messages.append("Seed resolved in library but unavailable on the selected music server")
 
+    selection_mode = str(data.get('selection_mode') or config.INSTANT_PLAYLIST_SELECTION_MODE).upper()
+    if selection_mode not in {'NATIVE', 'LLM_RERANK', 'LLM_CURATE'}:
+        selection_mode = 'NATIVE'
+    log_messages.append(f"\nSelection mode: {selection_mode}")
+    log_messages.append(f"Candidates retrieved: {len(all_songs)}")
+    from tasks.playlist_curation import suppress_duplicate_title_artist
+    all_songs, title_artist_duplicates = suppress_duplicate_title_artist(all_songs)
+    if title_artist_duplicates:
+        log_messages.append(
+            f"Playlist duplicate-content suppression: removed {title_artist_duplicates} "
+            "same-title/same-artist duplicate(s)"
+        )
+    native_candidate_pool = list(all_songs)
+    log_messages.append(f"Curator input limit: {min(max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)), max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES)))}")
+    selection_source = 'native'
+    candidates_sent = 0
+    if selection_mode != 'NATIVE' and all_songs:
+        log_messages.append("Curating candidate songs...")
+        yield
+        pool_limit = max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL))
+        candidates_sent = min(len(all_songs), pool_limit, max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_PROMPT_CANDIDATES)))
+        log_messages.append(f"Native shortlist for curator: {candidates_sent}")
+        log_messages.append(f"Shortlisted for LLM: {candidates_sent}")
+        try:
+            from tasks.playlist_curation import curate_candidates_with_llm, rank_candidates_by_ids
+            valid_ids, candidates_sent = curate_candidates_with_llm(
+                original_user_input, all_songs, selection_mode, ai_config_with_secrets,
+                limit=candidates_sent,
+                include_audio=config.INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES,
+                log_messages=log_messages,
+            )
+        except Exception as exc:
+            logger.exception("Playlist curator failed")
+            valid_ids = []
+            log_messages.append(f"LLM curator failed: {type(exc).__name__}")
+        log_messages.append(f"Candidates sent to LLM: {candidates_sent}")
+        log_messages.append("Validating curated tracks; only exact candidate IDs are accepted")
+        log_messages.append(f"Valid aliases after validation: {len(valid_ids)}")
+        curator_action = "LLM ranked" if selection_mode == 'LLM_RERANK' else "LLM selected"
+        log_messages.append(f"{curator_action}: {len(valid_ids)}")
+        if not valid_ids:
+            if selection_mode == 'LLM_RERANK':
+                log_messages.append("LLM rerank unusable: zero valid aliases")
+            log_messages.append("LLM curator failed: no exact valid candidate IDs; falling back to native ranking")
+            selection_mode = 'NATIVE'
+            selection_source = 'native fallback'
+        else:
+            all_songs = rank_candidates_by_ids(
+                all_songs, valid_ids, mandatory_ids=mandatory_seed_ids,
+                # A successful rerank defines the complete candidate pool. Curate
+                # keeps its existing count-only supplementation behavior.
+                include_unselected=(
+                    selection_mode != 'LLM_RERANK'
+                    and shape.get('total_seconds') is None
+                ),
+            )
+            curated_ids = {str(item_id) for item_id in valid_ids}
+            mandatory_ids_set = {str(item_id) for item_id in mandatory_seed_ids}
+            supplemented = sum(
+                1 for song in all_songs
+                if str(song.get('item_id')) not in curated_ids
+                and str(song.get('item_id')) not in mandatory_ids_set
+            )
+            if selection_mode == 'LLM_RERANK':
+                selection_source = 'LLM rerank only'
+                log_messages.append("Native supplementation: disabled")
+                log_messages.append(f"LLM reranked candidates: {len(valid_ids)}")
+                log_messages.append(f"Candidate pool after LLM rerank: {len(all_songs)}")
+                if mandatory_seed_ids and not any(
+                    str(item_id) in {str(candidate_id) for candidate_id in valid_ids}
+                    for item_id in mandatory_seed_ids
+                ):
+                    log_messages.append("Mandatory seed added outside reranked list: true")
+            else:
+                selection_source = 'LLM curate + native supplementation' if supplemented else 'LLM curate'
+                log_messages.append(f"Curator selected: {len(valid_ids)} tracks")
+            if supplemented:
+                log_messages.append(f"Supplemented with {supplemented} native candidates")
+            log_messages.append(f"Selection strategy: {selection_source}")
+            song_sources = {s['item_id']: 0 for s in all_songs}
+    elif selection_mode != 'NATIVE':
+        log_messages.append(f"Selection mode: {selection_mode}; no candidates available")
+
+    log_messages.append(f"Selection source: {selection_source}")
+    if selection_source == 'native fallback':
+        log_messages.append("Selection strategy: native fallback")
     log_messages.append(
         f"\nCollected {len(all_songs)} songs (target {target_song_count}, cap {collection_cap})"
     )
@@ -706,6 +934,7 @@ def _run_chat_pipeline(data, log_messages):
     yield
 
     # Prepare final results
+    actual_duration_seconds = None
     if all_songs:
         # NOTE: rating is NOT hard-filtered here. Like every other filter dim it
         # is applied as a SOFT re-rank inside tasks.ai.rerank (rating/5
@@ -731,15 +960,193 @@ def _run_chat_pipeline(data, log_messages):
                 f"\nArtist diversity: removed {diversity_removed} excess songs from pool (max {max_per_artist}/artist)"
             )
 
+        # An explicit song-count request is a hard constraint. If successful
+        # reranking leaves too few tracks after the artist cap, abandon that
+        # pool and use the complete native candidate pool for final selection.
+        if (
+            selection_source == 'LLM rerank only'
+            and shape.get('song_count')
+            and len(diversified_pool) < target_song_count
+        ):
+            log_messages.append("LLM rerank candidate pool insufficient for requested song count")
+            log_messages.append(f"Required target: {target_song_count} songs")
+            log_messages.append(f"Available reranked candidates after artist limit: {len(diversified_pool)}")
+            log_messages.append("Fallback reason: insufficient reranked pool")
+            log_messages.append("LLM rerank unusable: insufficient candidates for hard song-count constraint")
+            selection_mode = 'NATIVE'
+            selection_source = 'native fallback'
+            all_songs = list(native_candidate_pool)
+            artist_song_counts = {}
+            diversified_pool = []
+            diversity_overflow = []
+            for song in all_songs:
+                artist = song.get('artist', 'Unknown')
+                artist_song_counts[artist] = artist_song_counts.get(artist, 0) + 1
+                if artist_song_counts[artist] <= max_per_artist:
+                    diversified_pool.append(song)
+                else:
+                    diversity_overflow.append(song)
+            log_messages.append(f"Selection strategy: {selection_source}")
+            log_messages.append(f"Selection source: {selection_source}")
+            log_messages.append(f"Collected native fallback pool: {len(all_songs)} songs")
+
+        optimized_duration = False
+        duration_target_seconds = shape.get('total_seconds')
+        if duration_target_seconds is not None and duration_target_seconds > 0:
+            log_messages.append("Duration optimizer:")
+            try:
+                from tasks.ai.tool_impl import _fetch_pool_features
+                from tasks.playlist_curation import optimize_playlist_duration
+                optimizer_limit = min(100, max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)))
+                optimizer_pool = diversified_pool[:optimizer_limit]
+                # Keep mandatory seeds inside the bounded optimization pool.
+                if mandatory_seed_ids:
+                    mandatory_set = {str(i) for i in mandatory_seed_ids}
+                    optimizer_pool = [s for s in diversified_pool if str(s['item_id']) in mandatory_set] + [
+                        s for s in optimizer_pool if str(s['item_id']) not in mandatory_set
+                    ]
+                duration_features = _fetch_pool_features([s['item_id'] for s in optimizer_pool])
+                durations = {key: row.get('duration') for key, row in duration_features.items()}
+                duration_diagnostics = {}
+                duration_tolerance_seconds = 15
+
+                # A successful rerank stays isolated unless it cannot possibly
+                # reach the requested duration, even using every ranked track.
+                # In that case restart selection from the native pool as a unit.
+                known_durations = [durations.get(song['item_id']) for song in optimizer_pool]
+                if (
+                    selection_source == 'LLM rerank only'
+                    and known_durations
+                    and all(value is not None and float(value) > 0 for value in known_durations)
+                    and sum(int(float(value)) for value in known_durations)
+                    < int(duration_target_seconds) - duration_tolerance_seconds
+                ):
+                    available_seconds = sum(int(float(value)) for value in known_durations)
+                    log_messages.append("LLM rerank candidate pool insufficient for requested duration")
+                    log_messages.append(f"Required target: {int(duration_target_seconds)} s")
+                    log_messages.append(f"Available reranked duration: {available_seconds} s")
+                    log_messages.append("Fallback reason: insufficient reranked pool")
+                    log_messages.append("LLM rerank unusable: insufficient duration for hard constraint")
+                    selection_mode = 'NATIVE'
+                    selection_source = 'native fallback'
+                    all_songs = list(native_candidate_pool)
+                    artist_song_counts = {}
+                    diversified_pool = []
+                    diversity_overflow = []
+                    for song in all_songs:
+                        artist = song.get('artist', 'Unknown')
+                        artist_song_counts[artist] = artist_song_counts.get(artist, 0) + 1
+                        if artist_song_counts[artist] <= max_per_artist:
+                            diversified_pool.append(song)
+                        else:
+                            diversity_overflow.append(song)
+                    optimizer_pool = diversified_pool[:optimizer_limit]
+                    if mandatory_seed_ids:
+                        mandatory_set = {str(i) for i in mandatory_seed_ids}
+                        optimizer_pool = [s for s in diversified_pool if str(s['item_id']) in mandatory_set] + [
+                            s for s in optimizer_pool if str(s['item_id']) not in mandatory_set
+                        ]
+                    duration_features = _fetch_pool_features([s['item_id'] for s in optimizer_pool])
+                    durations = {key: row.get('duration') for key, row in duration_features.items()}
+                    log_messages.append("Native supplementation: disabled; full native fallback selected")
+                    log_messages.append(f"Selection strategy: {selection_source}")
+                    log_messages.append(f"Selection source: {selection_source}")
+                    log_messages.append(f"Duration optimizer input after native fallback: {len(optimizer_pool)} candidates")
+                if mandatory_seed:
+                    seed_duration = durations.get(mandatory_seed['item_id'])
+                    log_messages.append(f"Mandatory seed: {mandatory_seed['title']} ({mandatory_seed['item_id']})")
+                    log_messages.append(f"Seed duration: {int(float(seed_duration)) if seed_duration else 'unknown'} s")
+                    if seed_duration:
+                        log_messages.append(f"Remaining budget: {int(shape['total_seconds']) - int(float(seed_duration))} s")
+                log_messages.append(f"Duration optimizer input: {len(optimizer_pool)} candidates")
+                optimizer_ranked_ids = [s.get('item_id') for s in optimizer_pool]
+                final_query_results_list = optimize_playlist_duration(
+                    optimizer_pool, durations, duration_target_seconds, target_song_count,
+                    max_per_artist, exact_count=bool(shape.get('song_count')),
+                    mandatory_ids=mandatory_seed_ids, ranked_ids=optimizer_ranked_ids,
+                    tolerance_seconds=duration_tolerance_seconds,
+                    diagnostics=duration_diagnostics,
+                )
+                missing_duration = [s for s in final_query_results_list if not durations.get(s['item_id'])]
+                actual_seconds = sum(int(float(durations.get(s['item_id']) or 0)) for s in final_query_results_list)
+                actual_duration_seconds = None if missing_duration else actual_seconds
+                log_messages.append(f"Final songs: {len(final_query_results_list)}")
+                log_messages.append(f"Selected for duration target: {len(final_query_results_list)} songs")
+                log_messages.append(
+                    f"Solutions inside tolerance: {duration_diagnostics.get('solutions_in_tolerance', 0)}"
+                )
+                log_messages.append(
+                    f"Ranking cost: {duration_diagnostics.get('ranking_cost', 0)}"
+                )
+                average_rank = duration_diagnostics.get('average_rank')
+                if average_rank is not None:
+                    log_messages.append(f"Average candidate rank: {average_rank:.1f}")
+                    log_messages.append(f"Worst candidate rank: {duration_diagnostics.get('worst_rank')}")
+                if mandatory_seed_ids:
+                    retained = any(
+                        str(song.get('item_id')) == str(mandatory_seed_ids[0])
+                        for song in final_query_results_list
+                    )
+                    log_messages.append(f"Mandatory seed retained: {str(retained).lower()}")
+                if missing_duration:
+                    log_messages.append("Final duration unavailable: one or more selected tracks lack duration metadata")
+                else:
+                    log_messages.append(f"Final duration: {actual_seconds} s")
+                    log_messages.append(f"Duration error: {actual_seconds - int(duration_target_seconds):+d} s")
+                best_exact_cost = duration_diagnostics.get('best_exact_ranking_cost')
+                if best_exact_cost is not None:
+                    log_messages.append(
+                        f"Best exact-duration solution: {int(duration_target_seconds)} s; ranking cost {best_exact_cost}"
+                    )
+                if duration_diagnostics.get('solutions_in_tolerance', 0):
+                    if (
+                        best_exact_cost is not None
+                        and duration_diagnostics.get('ranking_cost', 0) < best_exact_cost
+                        and actual_seconds != int(duration_target_seconds)
+                    ):
+                        log_messages.append(
+                            "Reason: selected the stronger-ranked playlist within tolerance instead of a weaker exact-duration combination"
+                        )
+                    else:
+                        log_messages.append(
+                            "Reason: selected the strongest-ranked playlist inside the duration tolerance"
+                        )
+                else:
+                    log_messages.append(
+                        "Reason: no playlist fit the duration tolerance; minimized duration error first"
+                    )
+                rank_by_id = {
+                    str(item_id): rank
+                    for rank, item_id in enumerate(
+                        [i for i in optimizer_ranked_ids if str(i) not in {str(sid) for sid in mandatory_seed_ids}],
+                        start=1,
+                    )
+                }
+                for song in final_query_results_list:
+                    if str(song.get('item_id')) in {str(sid) for sid in mandatory_seed_ids}:
+                        log_messages.append(
+                            f"Duration optimizer selected: {song.get('title', 'Unknown')} - mandatory seed"
+                        )
+                    else:
+                        log_messages.append(
+                            f"Duration optimizer selected: {song.get('title', 'Unknown')} - "
+                            f"{selection_source} rank {rank_by_id.get(str(song.get('item_id')), '?')}"
+                        )
+                optimized_duration = True
+            except Exception:
+                logger.exception("Duration optimization failed")
+                final_query_results_list = [s for s in diversified_pool if str(s.get('item_id')) in {str(i) for i in mandatory_seed_ids}]
         # --- Phase 2: Proportional sampling from diversified pool ---
-        if len(diversified_pool) <= target_song_count:
+        if optimized_duration:
+            pass
+        elif len(diversified_pool) <= target_song_count:
             # Not enough songs after diversity cap - use all, then backfill from overflow
             final_query_results_list = list(diversified_pool)
             if requested_cap and diversity_overflow:
                 log_messages.append(
                     f"   The request allows at most {requested_cap} song(s) per artist; the cap was kept"
                 )
-            elif len(final_query_results_list) < target_song_count and diversity_overflow:
+            elif len(final_query_results_list) < target_song_count and diversity_overflow and selection_mode == 'NATIVE':
                 # Progressive cap relaxation: raise per-artist cap until we hit target or exhaust overflow
                 current_cap = max_per_artist
                 while len(final_query_results_list) < target_song_count and diversity_overflow:
@@ -770,6 +1177,10 @@ def _run_chat_pipeline(data, log_messages):
                     log_messages.append(
                         f"   Progressive cap relaxation: {max_per_artist} -> {current_cap}/artist to reach {len(final_query_results_list)} songs"
                     )
+            elif selection_mode != 'NATIVE' and diversity_overflow:
+                log_messages.append(
+                    f"   Artist cap retained at {max_per_artist}/artist; returned {len(final_query_results_list)} songs"
+                )
         else:
             # More diversified songs than target - sample proportionally by tool call
             songs_by_call = {}
@@ -797,7 +1208,7 @@ def _run_chat_pipeline(data, log_messages):
 
             final_query_results_list = final_query_results_list[:target_song_count]
 
-        if shape.get('total_seconds') and not shape.get('song_count'):
+        if shape.get('total_seconds') is not None and not shape.get('song_count') and not optimized_duration:
             final_query_results_list = _trim_to_duration(
                 final_query_results_list, shape['total_seconds'], log_messages
             )
@@ -820,20 +1231,27 @@ def _run_chat_pipeline(data, log_messages):
             log_messages.append(
                 "\nPlaylist kept in journey order (from the first seed to the second)"
             )
+        elif shape.get('total_seconds') is None:
+            log_messages.append(
+                "\nPlaylist kept in native/curator rank order (no explicit duration constraint)"
+            )
         else:
             try:
                 from tasks.playlist_ordering import order_playlist
                 from config import PLAYLIST_ENERGY_ARC
 
-                song_id_list = [s['item_id'] for s in final_query_results_list]
+                original_playlist = list(final_query_results_list)
+                song_id_list = [s['item_id'] for s in original_playlist]
                 ordered_ids = order_playlist(song_id_list, energy_arc=PLAYLIST_ENERGY_ARC)
-
-                # Rebuild list in new order
-                id_to_song = {s['item_id']: s for s in final_query_results_list}
-                final_query_results_list = [
-                    id_to_song[sid] for sid in ordered_ids if sid in id_to_song
-                ]
-                log_messages.append("\nPlaylist ordered for smooth transitions (tempo/energy/key)")
+                from tasks.playlist_curation import reorder_preserving_membership
+                before_ids = {str(s['item_id']) for s in original_playlist}
+                final_query_results_list = reorder_preserving_membership(original_playlist, ordered_ids)
+                after_ids = {str(s['item_id']) for s in final_query_results_list}
+                if before_ids != after_ids:
+                    logger.error("Playlist ordering changed membership; restoring original member set")
+                    log_messages.append("Ordering membership mismatch detected; omitted tracks were restored")
+                    final_query_results_list = original_playlist
+                log_messages.append("\nPlaylist ordered for smooth transitions (membership preserved)")
             except Exception:
                 logger.warning("Playlist ordering failed (non-fatal)", exc_info=True)
                 log_messages.append(
@@ -954,6 +1372,8 @@ def _run_chat_pipeline(data, log_messages):
             "ai_model_selected": actual_model_used,
             "executed_query": final_executed_query_str,
             "query_results": final_query_results_list,
+            "target_duration_seconds": shape.get('total_seconds'),
+            "actual_duration_seconds": actual_duration_seconds,
         },
         200,
     )

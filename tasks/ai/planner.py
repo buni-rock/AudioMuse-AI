@@ -248,7 +248,7 @@ _LONG_TRACKS_RE = re.compile(
 _TOTAL_LENGTH_RE = re.compile(
     r"\b(\d{1,3}(?:[.,]\d+)?|an?|one|two|three|four|five|half\s+an?)[\s-]*"
     r"(hours?|hrs?|minutes?|mins?)(?:\s+(?:of|long|worth)\b|"
-    r"(?:[\s-]+[a-z]+)?\s+(?:playlist|mix|set|session)\b)",
+    r"(?:[\s-]+[a-z]+)?\s+(?:playlist|mix|set|session)\b|(?=\s*[.!?,;]|$))",
     re.IGNORECASE,
 )
 _MAX_PER_ARTIST_RE = re.compile(
@@ -1181,6 +1181,103 @@ def requested_playlist_shape(text: str) -> Dict:
     return {k: hints[k] for k in ('song_count', 'total_seconds', 'max_per_artist') if hints.get(k)}
 
 
+_NAMED_SEED_CUES = (
+    re.compile(r"\bstarting\s+from\s+", re.IGNORECASE),
+    re.compile(r"\bstart(?:ing)?\s+with\s+", re.IGNORECASE),
+    re.compile(r"\bsimilar(?:\s+songs?)?\s+to\s+", re.IGNORECASE),
+    re.compile(r"\bsongs?\s+like\s+", re.IGNORECASE),
+    re.compile(r"\btracks?\s+like\s+", re.IGNORECASE),
+    re.compile(r"\bbased\s+on\s+", re.IGNORECASE),
+)
+_SEED_HARD_BOUNDARY_RE = re.compile(r"[,!?;\n]|\.(?=\s|$)|\s+(?:songs?|tracks?|and|with|that|which)\b", re.IGNORECASE)
+_SEED_CONTEXT_BOUNDARY_RE = re.compile(r"\s+(?:the\s+)?playlist\b", re.IGNORECASE)
+_SEED_FOR_BOUNDARY_RE = re.compile(r"\s+for\s+(?:(?:me|the|my|a|this)\b)", re.IGNORECASE)
+_SEED_BY_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
+_SEED_QUOTED_RE = re.compile(r"[\"'`]([^\"'`]{2,200})[\"'`]")
+_SEED_AS_BOUNDARY_RE = re.compile(r"\s+as\s+(?:a\s+)?seed\b", re.IGNORECASE)
+
+
+def _trim_seed_text(value: str, *, artist: bool = False) -> str:
+    value = value.strip().strip(" \t\r\n\"'`.,:;!?()[]{}")
+    boundaries = [
+        _SEED_HARD_BOUNDARY_RE,
+        _SEED_CONTEXT_BOUNDARY_RE,
+        _SEED_FOR_BOUNDARY_RE,
+        _SEED_AS_BOUNDARY_RE,
+    ]
+    matches = [m for pattern in boundaries if (m := pattern.search(value))]
+    if artist and (m := _SEED_BY_RE.search(value)):
+        matches.append(m)
+    if matches:
+        value = value[:min(m.start() for m in matches)]
+    return value.strip().strip(" \t\r\n\"'`.,:;!?()[]{}")
+
+
+def extract_named_song_seed_details(text: str) -> Optional[Dict[str, str]]:
+    """Extract a named song from explicit wording, avoiding generic "like" matches."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    # Prefer an explicitly named seed over later generic wording such as
+    # "similar to the seed" in the same request.
+    used_song = re.search(
+        r"\b(?:use|uses|using)\s+.*?\bsong\s+(.+?)\s+as\s+(?:a\s+)?seed\b",
+        text,
+        re.IGNORECASE,
+    )
+    if used_song:
+        title = _trim_seed_text(used_song.group(1))
+        if title:
+            return {"title": title}
+
+    capture = None
+    for cue in _NAMED_SEED_CUES:
+        match = cue.search(text)
+        if match:
+            capture = text[match.end():].strip()
+            break
+
+    if capture is None:
+        # Quoted titles are a safe final explicit form; don't infer from prose like
+        # "I would like you to build...".
+        quoted = _SEED_QUOTED_RE.search(text)
+        if not quoted:
+            return None
+        capture = quoted.group(1).strip()
+        title = _trim_seed_text(capture)
+        return {"title": title} if title else None
+
+    # A quoted title immediately after a cue takes precedence over delimiters in
+    # the title itself. Parse a trailing "by Artist" when it follows the quote.
+    quoted = _SEED_QUOTED_RE.match(capture)
+    if quoted:
+        title = quoted.group(1).strip()
+        remainder = capture[quoted.end():]
+        leading_by = re.match(r"\s+by\s+", remainder, re.IGNORECASE)
+        if leading_by:
+            remainder = remainder[leading_by.end():]
+    else:
+        by_match = _SEED_BY_RE.search(capture)
+        title_source = capture[:by_match.start()] if by_match else capture
+        title = _trim_seed_text(title_source)
+        remainder = capture[by_match.end():] if by_match else ""
+
+    if not title:
+        return None
+    details = {"title": title}
+    if remainder:
+        artist = _trim_seed_text(remainder, artist=True)
+        if artist:
+            details["artist"] = artist
+    return details
+
+
+def extract_named_song_seed(text: str) -> Optional[str]:
+    """Return the title extracted from explicit named-song wording."""
+    details = extract_named_song_seed_details(text)
+    return details.get("title") if details else None
+
+
 def _synthesize_rescue_plan(
     raw_request: str,
     hints: Dict,
@@ -1193,8 +1290,15 @@ def _synthesize_rescue_plan(
 
     query = (raw_request or '').strip()
     year_only = bool(query) and bool(_YEAR_ONLY_RE.match(query))
+    seed_title = extract_named_song_seed(query)
 
-    if query and not year_only:
+    if seed_title:
+        plan.primaries.append({
+            'name': 'seed_search',
+            'arguments': {'seeds': [{'type': 'song', 'title': seed_title}]},
+        })
+        log_messages.append(f"   rescue: extracted named song seed '{seed_title}'; using seed_search")
+    elif query and not year_only:
         if config.CLAP_ENABLED:
             plan.primaries.append(
                 {'name': 'text_match', 'arguments': {'query': query, 'mode': 'audio'}}
@@ -1210,8 +1314,46 @@ def _synthesize_rescue_plan(
 
     if plan.primaries or plan.filter is not None:
         kinds = ', '.join(p.get('name', '') for p in plan.primaries) or 'filter only'
-        log_messages.append(f"   rescue: matching your words directly ({kinds})")
+        if not seed_title:
+            log_messages.append(f"   rescue: matching your words directly ({kinds})")
     return plan
+
+
+_SIMILAR_SEED_INTENT_RE = re.compile(
+    r"\b(?:similar(?:\s+songs?)?\s+to|songs?\s+like|tracks?\s+like|"
+    r"starting\s+from|start(?:ing)?\s+with|based\s+on)\b",
+    re.IGNORECASE,
+)
+
+
+def _lock_resolved_seed(plan: 'ToolPlan', resolved_seed, raw_request: str, log_messages):
+    """Make a library-resolved song seed authoritative over planner output."""
+    if not resolved_seed or not _SIMILAR_SEED_INTENT_RE.search(raw_request or ''):
+        return
+    title = str(resolved_seed.get('title') or '').strip()
+    artist = str(resolved_seed.get('artist') or '').strip()
+    if not title or not artist:
+        return
+    locked = {'type': 'song', 'title': title, 'artist': artist}
+    fallback_track = {
+        key: resolved_seed.get(key)
+        for key in ('item_id', 'title', 'artist', 'album')
+        if resolved_seed.get(key) is not None
+    }
+    replaced = sum(1 for p in plan.primaries if p.get('name') == 'seed_search')
+    plan.primaries = [
+        {'name': 'seed_search', 'arguments': {
+            'seeds': [locked], 'blend_mode': 'union', '_resolved_track': fallback_track,
+        }},
+        *[p for p in plan.primaries if p.get('name') != 'seed_search'],
+    ]
+    log_messages.append('Authoritative seed locked: true')
+    log_messages.append('Mandatory retrieval: seed_search')
+    log_messages.append('Planner may add optional tools; planner seed entities are overridden')
+    if replaced:
+        log_messages.append(
+            f'   replaced {replaced} planner seed_search call(s) with the resolved song seed'
+        )
 
 
 def _has_filter_content(args: Dict) -> bool:
@@ -1673,6 +1815,73 @@ def _prepare_journey(plan: 'ToolPlan', target_song_count: Optional[int], log_mes
     plan.filter = None
 
 
+def _normalize_seed_object(seed, log_messages: List[str], *, source: str = "seed") -> Optional[Dict]:
+    """Normalize common LLM seed aliases into the seed_search internal shape."""
+    logger.debug("Raw %s object: %r", source, seed)
+    if not isinstance(seed, dict):
+        reason = "seed must be an object"
+        logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+        log_messages.append(f"   seed normalization failed: {reason}")
+        return None
+
+    raw_kind = seed.get("type") or seed.get("kind") or seed.get("seed_type") or seed.get("seed_kind")
+    kind = str(raw_kind or "").strip().lower()
+    if kind in {"track", "song_seed"}:
+        kind = "song"
+    elif kind in {"performer", "musician", "artist_seed"}:
+        kind = "artist"
+    if not kind:
+        if any(seed.get(key) for key in ("title", "song_title", "song")):
+            kind = "song"
+        elif any(seed.get(key) for key in ("artist_name", "name", "artist")):
+            kind = "artist"
+
+    if kind == "song":
+        title = next((seed.get(key) for key in ("title", "song_title", "song", "name")
+                      if isinstance(seed.get(key), str) and seed.get(key).strip()), "").strip()
+        artist = next((seed.get(key) for key in ("artist", "song_artist", "artist_name")
+                       if isinstance(seed.get(key), str) and seed.get(key).strip()), "").strip()
+        if not title:
+            reason = "song seed has no title (accepted aliases: title, song_title, song, name)"
+            logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+            log_messages.append(f"   seed normalization failed: {reason}")
+            return None
+        if not artist:
+            try:
+                from tasks.ai.tool_impl import resolve_song_by_title
+                resolved = resolve_song_by_title(title)
+            except Exception:
+                logger.exception("Seed title resolution failed during normalization: %s", title)
+                resolved = None
+            if resolved:
+                title = str(resolved.get("title") or title).strip()
+                artist = str(resolved.get("author") or resolved.get("artist") or "").strip()
+        if not artist:
+            reason = f"song title could not be resolved to a library artist: {title}"
+            logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+            log_messages.append(f"   seed normalization failed: {reason}")
+            return None
+        normalized = {"type": "song", "title": title, "artist": artist}
+    elif kind == "artist":
+        name = next((seed.get(key) for key in ("name", "artist", "artist_name", "id")
+                     if isinstance(seed.get(key), str) and seed.get(key).strip()), "").strip()
+        if not name:
+            reason = "artist seed has no name (accepted aliases: name, artist, artist_name, id)"
+            logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+            log_messages.append(f"   seed normalization failed: {reason}")
+            return None
+        normalized = {"type": "artist", "name": name}
+    else:
+        reason = f"unknown seed type {kind!r}"
+        logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+        log_messages.append(f"   seed normalization failed: {reason}")
+        return None
+
+    logger.debug("Normalized %s object: %r", source, normalized)
+    log_messages.append(f"   seed normalized: {normalized}")
+    return normalized
+
+
 def validate_plan_args(
     tool_calls: List[Dict],
     *,
@@ -1694,24 +1903,9 @@ def validate_plan_args(
             seeds_raw = args.get('seeds') or []
             cleaned_seeds: List[Dict] = []
             for s in seeds_raw:
-                if not isinstance(s, dict):
-                    continue
-                stype = (s.get('type') or '').lower()
-                if stype == 'song':
-                    title = (s.get('title') or s.get('song_title') or '').strip()
-                    artist = (s.get('artist') or s.get('song_artist') or '').strip()
-                    if not title or not artist:
-                        log_messages.append(f"   skip malformed song seed {s}")
-                        continue
-                    cleaned_seeds.append({'type': 'song', 'title': title, 'artist': artist})
-                elif stype == 'artist':
-                    nm = (s.get('name') or s.get('artist') or s.get('id') or '').strip()
-                    if not nm:
-                        log_messages.append(f"   skip malformed artist seed {s}")
-                        continue
-                    cleaned_seeds.append({'type': 'artist', 'name': nm})
-                else:
-                    log_messages.append(f"   skip unknown seed type '{stype}'")
+                normalized = _normalize_seed_object(s, log_messages)
+                if normalized:
+                    cleaned_seeds.append(normalized)
             if not cleaned_seeds:
                 log_messages.append(f"   skip {name}: no usable seeds")
                 continue
@@ -1735,18 +1929,9 @@ def validate_plan_args(
                 sub_raw = args.get('subtract') or []
                 cleaned_sub: List[Dict] = []
                 for s in sub_raw:
-                    if not isinstance(s, dict):
-                        continue
-                    stype = (s.get('type') or '').lower()
-                    if stype == 'artist':
-                        nm = (s.get('name') or s.get('artist') or s.get('id') or '').strip()
-                        if nm:
-                            cleaned_sub.append({'type': 'artist', 'name': nm})
-                    elif stype == 'song':
-                        title = (s.get('title') or '').strip()
-                        artist = (s.get('artist') or '').strip()
-                        if title and artist:
-                            cleaned_sub.append({'type': 'song', 'title': title, 'artist': artist})
+                    normalized = _normalize_seed_object(s, log_messages, source="subtract seed")
+                    if normalized:
+                        cleaned_sub.append(normalized)
                 seed_keys = {_seed_identity(s) for s in cleaned_seeds}
                 self_subtracted = [
                     s for s in cleaned_sub if _seed_identity(s) in seed_keys
@@ -2139,6 +2324,7 @@ def plan_and_execute_once(
     target_song_count: Optional[int] = None,
     replan_feedback: Optional[str] = None,
     raw_user_request: Optional[str] = None,
+    resolved_seed: Optional[Dict] = None,
 ):
     log_messages.append("\n--- AI Decision ---")
 
@@ -2158,15 +2344,36 @@ def plan_and_execute_once(
         user_message = f"{user_message}\n\n{hints_block}"
     if replan_feedback:
         user_message = f"{user_message}\n\n{replan_feedback}"
+    if resolved_seed and _SIMILAR_SEED_INTENT_RE.search(raw_request or ''):
+        user_message += (
+            "\n\nResolved seed song (authoritative library entity):\n"
+            f"Title: {resolved_seed.get('title', '')}\n"
+            f"Artist: {resolved_seed.get('artist', '')}\n"
+            "Type: song\n"
+            f"ID: {resolved_seed.get('item_id', '')}\n"
+            "This entity has already been resolved against the user's library. "
+            "Do not reinterpret it as an artist or a different entity. "
+            "The system will run its mandatory seed_search; you may add optional tools.\n"
+            "Locked constraints: "
+            f"seed_song={resolved_seed.get('title', '')} by {resolved_seed.get('artist', '')}; "
+            f"target_duration_seconds={hints.get('total_seconds', 'unspecified')}; "
+            f"exclude_artists={hints.get('exclude_artists', [])}; "
+            f"exclude_genres={hints.get('exclude_genres', [])}. "
+            "Preserve every explicit artist/title name in the original request."
+        )
 
     yield
 
     raw = call_ai_for_plan(user_message, tools, ai_config, log_messages, library_context)
     if 'error' in raw:
+        rejection_reason = str(raw.get('error') or 'provider returned no usable plan')
+        logger.warning("AI planner returned no usable plan: %s", rejection_reason)
+        log_messages.append(f"   AI planner response rejected: {rejection_reason}")
         log_messages.append(
-            "   the AI planner did not answer; matching your words directly instead"
+            "   the AI planner did not answer; applying deterministic request-aware rescue instead"
         )
         plan = _synthesize_rescue_plan(raw_request, hints, log_messages)
+        _lock_resolved_seed(plan, resolved_seed, raw_request, log_messages)
         plan.notes.append(
             "the AI planner was unreachable, so this playlist comes from a direct "
             "match of your request instead of a tool plan"
@@ -2201,6 +2408,7 @@ def plan_and_execute_once(
     )
 
     plan = validate_and_normalize_plan(raw_calls)
+    _lock_resolved_seed(plan, resolved_seed, raw_request, log_messages)
     for note in plan.notes:
         log_messages.append(f"   plan: {note}")
 
@@ -2218,6 +2426,7 @@ def plan_and_execute_once(
                 target_song_count=target_song_count,
                 replan_feedback=_EMPTY_PLAN_FEEDBACK,
                 raw_user_request=raw_request,
+                resolved_seed=resolved_seed,
             )
             if isinstance(replan, dict) and replan.get('songs'):
                 return replan
@@ -2225,6 +2434,7 @@ def plan_and_execute_once(
                 "   replan produced no usable plan either; matching your words directly"
             )
         plan = _synthesize_rescue_plan(raw_request, hints, log_messages)
+        _lock_resolved_seed(plan, resolved_seed, raw_request, log_messages)
         return (
             yield from _finish_plan(
                 plan, hints, ai_config, log_messages,
@@ -2294,6 +2504,21 @@ def plan_and_execute_once(
     tools_used_history = exec_result['tools_used_history']
     tool_execution_summary = exec_result['tool_execution_summary']
 
+    if (
+        not all_songs and resolved_seed and
+        _SIMILAR_SEED_INTENT_RE.search(raw_request or '') and resolved_seed.get('item_id')
+    ):
+        all_songs = [{
+            'item_id': resolved_seed.get('item_id'),
+            'title': resolved_seed.get('title'),
+            'artist': resolved_seed.get('artist'),
+            'album': resolved_seed.get('album'),
+        }]
+        exec_result['song_sources'][resolved_seed['item_id']] = 0
+        log_messages.append(
+            'Mandatory seed_search retrieved 0 songs; deterministic resolved-track fallback used'
+        )
+
     if not all_songs and replan_feedback is None:
         detail_lines: List[str] = []
         for h in tools_used_history[-4:]:
@@ -2321,6 +2546,7 @@ def plan_and_execute_once(
             target_song_count=target_song_count,
             replan_feedback=feedback,
             raw_user_request=raw_request,
+            resolved_seed=resolved_seed,
         )
         if isinstance(replan, dict) and replan.get('songs'):
             return replan
@@ -2621,6 +2847,7 @@ def _execute_plan(
             ta['get_songs'] = pool_target
             if tn == 'text_match' and ta.get('mode', 'audio') == 'audio' and plan.filter.get('instruments'):
                 ta['steering'] = _steering_for(plan.filter, INSTRUMENT_STEER_WEIGHT)
+            resolved_track = ta.pop('_resolved_track', None)
             pretty = {k: v for k, v in ta.items() if k != 'get_songs'}
             log_messages.append(f"\nPRIMARY: {tn}")
             try:
@@ -2633,6 +2860,13 @@ def _execute_plan(
                 primary_logs.append((tn, ta, 0, True, res.get('error', '')))
                 continue
             songs = res.get('songs', [])
+            if tn == 'seed_search':
+                log_messages.append(f"seed_search retrieved: {len(songs)}")
+                if not songs and resolved_track and resolved_track.get('item_id'):
+                    songs = [resolved_track]
+                    log_messages.append(
+                        'Mandatory seed_search returned 0; deterministic resolved title/artist fallback used'
+                    )
             if res.get('message'):
                 for line in res['message'].split('\n'):
                     if line.strip():
@@ -2723,6 +2957,7 @@ def _execute_plan(
             ta = dict(tc.get('arguments', {}) or {})
             if 'get_songs' not in ta:
                 ta['get_songs'] = max(200, target_song_count * 2)
+            resolved_track = ta.pop('_resolved_track', None)
             pretty = {k: v for k, v in ta.items() if k != 'get_songs'}
             log_messages.append(f"\nTOOL: {tn}")
             try:
@@ -2758,6 +2993,13 @@ def _execute_plan(
                 tool_call_counter += 1
                 continue
             songs = res.get('songs', [])
+            if tn == 'seed_search':
+                log_messages.append(f"seed_search retrieved: {len(songs)}")
+                if not songs and resolved_track and resolved_track.get('item_id'):
+                    songs = [resolved_track]
+                    log_messages.append(
+                        'Mandatory seed_search returned 0; deterministic resolved title/artist fallback used'
+                    )
             if res.get('message'):
                 for line in res['message'].split('\n'):
                     if line.strip():
