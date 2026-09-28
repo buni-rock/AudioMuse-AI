@@ -273,7 +273,7 @@
                     Number of songs:
                     <span class="info-tooltip">
                         <span class="info-icon"></span>
-                        <span class="tooltip-text" id="numResultsHelp">For LLM modes, this is the maximum playlist size. Smaller counts in your request are respected; larger counts are capped here, with a server-side safety maximum. Native mode keeps its existing request behavior.</span>
+                        <span class="tooltip-text" id="numResultsHelp">How many songs the generated playlist should contain. Higher numbers give a longer playlist but may include songs that match your request less closely. Try 50 for a normal playlist, or 20-30 for a quick mix. For LLM modes, this value is the maximum playlist size: smaller counts in your request are respected, larger counts are capped here, and a server-side safety maximum also applies. Native mode keeps its existing request behavior.</span>
                     </span>
                 </label>
                 <input id="numResults" name="numResults" type="number" aria-describedby="numResultsHelp" value="{{ instant_playlist_n_results_default }}" min="{{ instant_playlist_n_results_default|min_bound(1) }}" max="{{ instant_playlist_n_results_default|max_bound(instant_playlist_max_n_results) }}" />
