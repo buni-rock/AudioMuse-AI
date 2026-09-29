@@ -14,6 +14,11 @@ from tasks.playlist_curation import (
 )
 
 
+def _rerank_aliases(prompt):
+    records = json.loads(prompt.rsplit("Candidates: ", 1)[1])
+    return [record["id"] for record in records]
+
+
 def test_llm_selection_rejects_unknown_and_duplicate_ids():
     raw = json.dumps({"selected_ids": ["a", "invented", "a", "b"]})
     assert validate_llm_candidate_selection(raw, ["a", "b"], "LLM_CURATE") == ["a", "b"]
@@ -149,7 +154,10 @@ def test_valid_curator_ranking_changes_native_order(monkeypatch):
     def fake_generate(prompt, config, **kwargs):
         captured["prompt"] = prompt
         captured["format"] = kwargs.get("structured_format")
-        return '{"ranked_ids":["C003","C002","C001"]}'
+        captured["think"] = kwargs.get("think")
+        records = json.loads(prompt.rsplit("Candidates: ", 1)[1])
+        by_title = {row.get("title"): row["id"] for row in records}
+        return json.dumps({"ranked_ids": [by_title["A song"], by_title["B song"], by_title["Z song"]]})
 
     monkeypatch.setattr(api, "generate_text", fake_generate)
     ids, sent = curate_candidates_with_llm(
@@ -160,27 +168,28 @@ def test_valid_curator_ranking_changes_native_order(monkeypatch):
     assert sent == 3
     assert [s["item_id"] for s in ranked] == ["opaque-a", "opaque-b", "opaque-z"]
     assert [s["item_id"] for s in ranked] != [s["item_id"] for s in songs]
-    assert "Use only candidate IDs" in captured["prompt"]
+    assert "Return only candidate IDs" in captured["prompt"]
     assert captured["format"]["required"] == ["ranked_ids"]
     assert captured["format"]["additionalProperties"] is False
+    assert captured["think"] is False
     assert captured["format"]["properties"]["ranked_ids"]["minItems"] == 3
-    assert "rank the candidates" in captured["prompt"].lower()
+    assert "rank them from most appropriate to least appropriate" in captured["prompt"].lower()
+    assert "native rank" not in captured["prompt"].lower()
 
 
 def test_target_aware_rerank_retries_then_accepts_target_plus_margin(monkeypatch):
     import tasks.ai.api as api
 
     songs = [{'item_id': f'track-{i:03d}', 'title': f'Song {i:03d}'} for i in range(50)]
-    responses = [
-        json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(1, 11)]}),
-        json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(50, 20, -1)]}),
-    ]
+    response_counts = [10, 30]
     prompts, schemas = [], []
 
     def fake_generate(prompt, _config, **kwargs):
         prompts.append(prompt)
         schemas.append(kwargs['structured_format'])
-        return responses.pop(0)
+        aliases = _rerank_aliases(prompt)
+        count = response_counts.pop(0)
+        return json.dumps({'ranked_ids': aliases[-count:][::-1]})
 
     monkeypatch.setattr(api, 'generate_text', fake_generate)
     logs = []
@@ -207,8 +216,8 @@ def test_target_aware_rerank_accepts_30_of_50_without_retry(monkeypatch):
     calls = []
     monkeypatch.setattr(
         api, 'generate_text',
-        lambda *args, **kwargs: calls.append(1)
-        or json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(50, 20, -1)]}),
+        lambda prompt, *args, **kwargs: calls.append(1)
+        or json.dumps({'ranked_ids': _rerank_aliases(prompt)[-30:][::-1]}),
     )
     logs = []
     ids, _ = curate_candidates_with_llm(
@@ -258,8 +267,9 @@ def test_incomplete_rerank_after_retry_is_rejected_for_native_fallback(monkeypat
     calls = []
     def fake_generate(*_args, **_kwargs):
         calls.append(1)
+        aliases = _rerank_aliases(_args[0])
         count = 10 if len(calls) == 1 else 20
-        return json.dumps({'ranked_ids': [f'C{i:03d}' for i in range(1, count + 1)]})
+        return json.dumps({'ranked_ids': aliases[:count]})
     monkeypatch.setattr(api, 'generate_text', fake_generate)
     logs = []
     ids, _ = curate_candidates_with_llm(
@@ -286,15 +296,70 @@ def test_curator_uses_short_aliases_and_maps_them_back_to_authoritative_tracks(m
 
     def fake_generate(prompt, config, **kwargs):
         captured["prompt"] = prompt
-        return '{"ranked_ids":["C002","C001"]}'
+        return json.dumps({"ranked_ids": _rerank_aliases(prompt)[::-1]})
 
     monkeypatch.setattr(api, "generate_text", fake_generate)
     ids, sent = curate_candidates_with_llm("request", songs, "LLM_RERANK", {}, include_audio=False)
     assert sent == 2
     assert ids == [songs[1]["item_id"], songs[0]["item_id"]]
-    assert '"id":"C001"' in captured["prompt"] and '"id":"C002"' in captured["prompt"]
+    records = json.loads(captured["prompt"].rsplit("Candidates: ", 1)[1])
+    aliases = [record["id"] for record in records]
+    assert len(aliases) == 2 and all(len(alias) >= 5 for alias in aliases)
+    assert not any(alias.startswith("C00") for alias in aliases)
     assert "fp_aaaaaaaa" not in captured["prompt"]
     assert "fp_bbbbbbbb" not in captured["prompt"]
+
+
+def test_rerank_payload_is_order_independent_opaque_and_excludes_audiomuse_signals(monkeypatch):
+    import tasks.ai.api as api
+
+    songs = [
+        {
+            "item_id": f"track-{i}", "title": title, "artist": artist,
+            "album": f"Album {i}", "duration_seconds": 200 + i,
+            "native_rank": i, "musicnn_similarity": 0.99 - i / 100,
+            "dclap_distance": 0.01 + i / 100, "similarity": 0.8,
+        }
+        for i, (title, artist) in enumerate([
+            ("Harvest", "Nightwish"), ("Angels", "Within Temptation"),
+            ("Inis Mona", "Eluveitie"), ("Path", "Apocalyptica"),
+            ("Justin Song", "Justin Bieber"), ("Black", "Metal Artist"),
+        ])
+    ]
+    prompts = []
+
+    def fake_generate(prompt, *_args, **_kwargs):
+        prompts.append(prompt)
+        aliases = _rerank_aliases(prompt)
+        return json.dumps({"ranked_ids": aliases})
+
+    monkeypatch.setattr(api, "generate_text", fake_generate)
+    logs = []
+    seed = {"item_id": "seed", "title": "Harvest", "artist": "Nightwish", "album": "Human Nature"}
+    first_ids, _ = curate_candidates_with_llm(
+        "Use Harvest by Nightwish as a seed", songs, "LLM_RERANK", {},
+        limit=6, include_audio=True, log_messages=logs, target_count=1, resolved_seed=seed,
+    )
+    second_ids, _ = curate_candidates_with_llm(
+        "Use Harvest by Nightwish as a seed", list(reversed(songs)), "LLM_RERANK", {},
+        limit=6, include_audio=False, target_count=1, resolved_seed=seed,
+    )
+
+    first_records = json.loads(prompts[0].rsplit("Candidates: ", 1)[1])
+    second_records = json.loads(prompts[1].rsplit("Candidates: ", 1)[1])
+    assert first_records == second_records
+    assert first_ids == second_ids
+    assert [row["title"] for row in first_records] != [song["title"] for song in songs]
+    assert {key for row in first_records for key in row} <= {"id", "title", "artist", "album"}
+    assert not any(
+        token in prompts[0].casefold()
+        for token in ("native_rank", "musicnn", "dclap", "similarity", "duration_seconds", "score")
+    )
+    assert "Candidate presentation order has no significance" in prompts[0]
+    assert "Candidate presentation shuffled: yes" in logs
+    assert "AudioMuse scores sent to LLM: no" in logs
+    assert "AudioMuse native ranks sent to LLM: no" in logs
+    assert all(len(row["id"]) >= 5 and not row["id"].startswith("C00") for row in first_records)
 
 
 def test_curator_alias_validation_rejects_unknown_and_deduplicates(monkeypatch):
@@ -303,7 +368,9 @@ def test_curator_alias_validation_rejects_unknown_and_deduplicates(monkeypatch):
              {"item_id": "fp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
     monkeypatch.setattr(
         api, "generate_text",
-        lambda *a, **k: '{"ranked_ids":["C002","C999","C002","C001"]}',
+        lambda prompt, *a, **k: json.dumps({
+            "ranked_ids": [_rerank_aliases(prompt)[1], "ZZZZZ", _rerank_aliases(prompt)[1], _rerank_aliases(prompt)[0]],
+        }),
     )
     ids, _ = curate_candidates_with_llm("request", songs, "LLM_RERANK", {}, include_audio=False)
     assert ids == [songs[1]["item_id"], songs[0]["item_id"]]
@@ -681,15 +748,16 @@ def test_seed_search_to_curated_duration_pipeline_keeps_named_seed(monkeypatch):
 
     def fake_generate_text(prompt, *args, **kwargs):
         prompt_seen['text'] = prompt
-        return json.dumps({'ranked_ids': ['C003', 'C002', 'C001', 'C004', 'C005', 'C006', 'C007']})
+        return json.dumps({'ranked_ids': _rerank_aliases(prompt)})
 
     monkeypatch.setattr(api, 'generate_text', fake_generate_text)
     ranked_ids, sent = curate_candidates_with_llm(
         request, candidate_pool, 'LLM_RERANK', {}, limit=100,
     )
     assert sent > 0
-    assert '"id":"C001"' in prompt_seen['text']
-    assert '"id":"C007"' in prompt_seen['text']
+    records = json.loads(prompt_seen['text'].rsplit('Candidates: ', 1)[1])
+    assert len(records) == 7
+    assert all(len(record['id']) >= 5 for record in records)
     assert all(song['item_id'] not in prompt_seen['text'] for song in candidate_pool)
     curated = rank_candidates_by_ids(
         candidate_pool, ranked_ids, mandatory_ids=['seed-opaque'], include_unselected=True,
@@ -720,7 +788,8 @@ def test_planner_and_curator_share_ollama_chat_adapter_and_curator_validates_ali
         calls.append((operation, url, model, payload, timeout))
         if operation == "planner":
             return {"message": {"tool_calls": [{"function": {"name": "lookup", "arguments": {}}}]}}
-        return {"message": {"content": '{"ranked_ids":["C002","C001"]}'}}
+        user_prompt = payload["messages"][-1]["content"]
+        return {"message": {"content": json.dumps({"ranked_ids": _rerank_aliases(user_prompt)[::-1]})}}
 
     monkeypatch.setattr(openai, "_ollama_chat_request", fake_chat)
     config = {"provider": "OLLAMA", "ollama_url": "http://ollama:11434", "ollama_model": "qwen3.5:9b"}
@@ -736,7 +805,7 @@ def test_planner_and_curator_share_ollama_chat_adapter_and_curator_validates_ali
         "LLM_RERANK", config, include_audio=False, log_messages=logs,
     )
     assert sent == 2
-    assert ids == ["track-b", "track-a"]
+    assert set(ids) == {"track-a", "track-b"}
     assert [call[0] for call in calls] == ["planner", "text"]
     assert calls[0][1] == calls[1][1] == "http://ollama:11434/api/chat"
     assert calls[0][2] == calls[1][2] == "qwen3.5:9b"
@@ -764,6 +833,133 @@ def test_direct_curator_provider_probe_uses_curator_adapter(monkeypatch):
     assert [m["role"] for m in seen["payload"]["messages"]] == ["system", "user"]
     assert seen["payload"]["format"]["required"] == ["ranked_ids"]
     assert seen["payload"]["format"]["additionalProperties"] is False
+
+
+def test_ollama_text_response_retries_thinking_modes_without_exposing_reasoning(monkeypatch, caplog):
+    from tasks.ai.providers import openai
+
+    requests = []
+    envelopes = [
+        {
+            "model": "gpt-oss:120b-64k", "done": True, "done_reason": "stop",
+            "message": {"role": "assistant", "content": "", "thinking": "private reasoning text"},
+        },
+        {
+            "model": "gpt-oss:120b-64k", "done": True, "done_reason": "stop",
+            "message": {"role": "assistant", "content": '{"ranked_ids":["A1"]}'},
+        },
+        {
+            "model": "gpt-oss:120b-64k", "done": True, "done_reason": "stop",
+            "message": {"role": "assistant", "content": '{"ranked_ids":["A1"]}'},
+        },
+    ]
+
+    def fake_request(_url, model, payload, **kwargs):
+        requests.append((model, dict(payload), kwargs))
+        return envelopes.pop(0)
+
+    monkeypatch.setattr(openai, "_ollama_chat_request", fake_request)
+    monkeypatch.setattr(openai, "_OLLAMA_TEXT_THINK_SETTINGS", {})
+    schema = {
+        "type": "object", "properties": {"ranked_ids": {
+            "type": "array", "items": {"type": "string"},
+        }}, "required": ["ranked_ids"],
+    }
+    result = openai.generate_text_ollama_chat(
+        "http://ollama.local:11434", "gpt-oss:120b-64k", "Rank A1",
+        think=False, structured_format=schema,
+    )
+
+    assert result == '{"ranked_ids":["A1"]}'
+    assert requests[0][1]["think"] is False
+    assert requests[1][1]["think"] == "low"
+    assert requests[0][1]["stream"] is False
+    assert requests[0][1]["format"] == schema
+    assert "private reasoning text" not in caplog.text
+
+    second_result = openai.generate_text_ollama_chat(
+        "http://ollama.local:11434", "gpt-oss:120b-64k", "Rank A1",
+        think=False, structured_format=schema,
+    )
+    assert second_result == result
+    assert len(requests) == 3
+    assert requests[2][1]["think"] == "low"
+
+
+def test_ollama_response_shape_reports_metadata_without_content_or_thinking():
+    from tasks.ai.json_response import ollama_response_shape
+
+    shape = ollama_response_shape({
+        "model": "gemma4:26b", "done": True, "done_reason": "stop",
+        "prompt_eval_count": 22, "eval_count": 41,
+        "message": {
+            "role": "assistant", "content": "{\"ranked_ids\":[]}",
+            "thinking": "private reasoning text", "tool_calls": [],
+        },
+    })
+    assert shape["top_level_keys"] == [
+        "done", "done_reason", "eval_count", "message", "model", "prompt_eval_count",
+    ]
+    assert shape["message_keys"] == ["content", "role", "thinking", "tool_calls"]
+    assert shape["content_length"] == len('{"ranked_ids":[]}')
+    assert shape["thinking_length"] == len("private reasoning text")
+    assert shape["tool_calls"] == 0
+    assert "private reasoning text" not in repr(shape)
+
+
+def test_ollama_request_logging_reports_shape_without_logging_playlist_prompt(monkeypatch, caplog):
+    import logging
+    from tasks.ai.providers import openai
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "model": "gemma4:26b", "done": True, "done_reason": "stop",
+                "message": {"role": "assistant", "content": '{"ranked_ids":["A1"]}'},
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def post(self, url, json):
+            captured.update(url=url, payload=json)
+            return FakeResponse()
+
+    monkeypatch.setattr(openai.httpx, "Client", FakeClient)
+    prompt = "PRIVATE PLAYLIST PROMPT TEXT"
+    with caplog.at_level(logging.INFO):
+        result = openai.generate_text_ollama_chat(
+            "http://ollama.local:11434", "gemma4:26b", prompt,
+            think=False, structured_format={
+                "type": "object", "properties": {"ranked_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "minItems": 1, "uniqueItems": True,
+                }}, "required": ["ranked_ids"],
+            },
+        )
+
+    assert result == '{"ranked_ids":["A1"]}'
+    assert captured["payload"]["stream"] is False
+    assert captured["payload"]["think"] is False
+    assert captured["payload"]["options"]["num_predict"] == 8000
+    assert "fields=['format', 'messages', 'model', 'options', 'stream', 'think']" in caplog.text
+    assert "think=False" in caplog.text
+    assert "minItems" in caplog.text
+    assert "PRIVATE PLAYLIST PROMPT TEXT" not in caplog.text
 
 
 def test_curator_provider_failure_logs_reason_and_returns_empty_for_native_fallback(monkeypatch, caplog):

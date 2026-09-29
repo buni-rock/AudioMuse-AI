@@ -4,6 +4,44 @@ import json
 import re
 
 
+def ollama_response_shape(value):
+    """Describe Ollama response fields without exposing content or reasoning text."""
+    envelope = value if isinstance(value, dict) else {}
+    message = envelope.get("message") if isinstance(envelope.get("message"), dict) else {}
+    content = message.get("content")
+    response_content = message.get("response")
+    thinking = (
+        message.get("thinking") or message.get("reasoning")
+        or envelope.get("thinking") or envelope.get("reasoning") or ""
+    )
+    tool_calls = message.get("tool_calls") or envelope.get("tool_calls")
+    return {
+        "top_level_keys": sorted(str(key) for key in envelope),
+        "message_keys": sorted(str(key) for key in message),
+        "content_type": type(content).__name__ if content is not None else "NoneType",
+        "content_length": len(content) if isinstance(content, str) else None,
+        "response_type": type(response_content).__name__ if response_content is not None else "NoneType",
+        "response_length": len(response_content) if isinstance(response_content, str) else None,
+        "thinking_type": type(thinking).__name__ if thinking is not None else "NoneType",
+        "thinking_length": len(thinking) if isinstance(thinking, str) else None,
+        "tool_calls": len(tool_calls) if isinstance(tool_calls, list) else 0,
+        "done": envelope.get("done"),
+        "done_reason": envelope.get("done_reason"),
+        "model": envelope.get("model"),
+        "prompt_eval_count": envelope.get("prompt_eval_count"),
+        "eval_count": envelope.get("eval_count"),
+        "error": envelope.get("error"),
+        "additional_top_level_keys": sorted(
+            str(key) for key in envelope
+            if key not in {
+                "created_at", "done", "done_reason", "eval_count", "eval_duration",
+                "load_duration", "message", "model", "prompt_eval_count",
+                "prompt_eval_duration", "total_duration", "error",
+            }
+        ),
+    }
+
+
 def response_text_and_thinking(value):
     """Unwrap common Ollama/OpenAI response shapes into content and thinking."""
     thinking = ""

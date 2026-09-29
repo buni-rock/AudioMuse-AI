@@ -32,7 +32,9 @@ import httpx
 import requests
 
 import config
-from tasks.ai.json_response import parse_json_response, response_text_and_thinking
+from tasks.ai.json_response import (
+    ollama_response_shape, parse_json_response, response_text_and_thinking,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ _OLLAMA_CHAT_PATH = "/api/chat"
 _ZEROABLE_ARGS = ("tempo_min", "tempo_max", "energy_min", "min_rating")
 
 _MODELS_REJECTING_REASONING = set()
+_OLLAMA_TEXT_THINK_SETTINGS = {}
 
 
 def _tool_function_specs(tools: List[Dict]) -> List[Dict]:
@@ -240,9 +243,10 @@ def generate_text(
                     extracted_text = extracted_text.split(end_tag, 1)[-1].strip()
 
             if is_ollama_format:
-                logger.debug("Ollama raw response chunks=%r", raw_sse_lines)
-                logger.debug("Ollama extracted response text=%r", extracted_text)
-                logger.debug("Ollama separate thinking content=%r", full_thinking_content)
+                logger.debug(
+                    "Ollama streamed response shape: chunks=%d content_length=%d thinking_length=%d",
+                    len(raw_sse_lines), len(extracted_text), len(full_thinking_content),
+                )
             if extracted_text:
                 logger.info(
                     "%s API returned non-empty content (length=%d chars).",
@@ -342,6 +346,7 @@ def generate_text_ollama_chat(
     server_url: str, model_name: str, full_prompt: str, *,
     temperature: Optional[float] = None, max_tokens: Optional[int] = None,
     structured_format: Optional[Dict | str] = None, system_prompt: Optional[str] = None,
+    think: Optional[bool | str] = None,
 ) -> str:
     """Generate Ollama text through the shared native /api/chat transport."""
     chat_url, _ = _ollama_endpoints(server_url)
@@ -351,7 +356,11 @@ def generate_text_ollama_chat(
         "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else [])
         + [{"role": "user", "content": full_prompt}],
         "stream": False,
-        "think": False if "qwen" in (model_name or "").lower() else None,
+        "think": (
+            bool(think) if think is not None
+            else False if "qwen" in (model_name or "").lower()
+            else None
+        ),
         "options": {
             "temperature": 0.7 if temperature is None else float(temperature),
             "num_predict": 8000 if max_tokens is None else int(max_tokens),
@@ -363,17 +372,59 @@ def generate_text_ollama_chat(
     endpoint = _safe_endpoint(chat_url)
     logger.info("Ollama text call started: provider=OLLAMA model=%s endpoint=%s timeout=%ss", model_name, endpoint, timeout)
     try:
-        envelope = _ollama_chat_request(
-            chat_url, model_name, payload, timeout=timeout, operation="text",
+        cache_key = (chat_url, model_name)
+        cached_setting = _OLLAMA_TEXT_THINK_SETTINGS.get(cache_key) if think is not None else None
+        initial_setting = cached_setting if cached_setting is not None else payload.get("think", "omitted")
+        think_settings = [initial_setting]
+        # Some reasoning-capable models return an empty final channel when
+        # thinking is disabled; others spend the output budget in reasoning
+        # when thinking is enabled. Retry empty responses with supported
+        # Ollama modes, while never treating reasoning text as the answer.
+        if think is not None:
+            think_settings.extend(["low", "omitted", "medium"])
+        seen_settings = set()
+        last_details = None
+        for setting in think_settings:
+            marker = repr(setting)
+            if marker in seen_settings:
+                continue
+            seen_settings.add(marker)
+            request_payload = dict(payload)
+            if setting == "omitted":
+                request_payload.pop("think", None)
+            else:
+                request_payload["think"] = setting
+            envelope = _ollama_chat_request(
+                chat_url, model_name, request_payload, timeout=timeout, operation="text",
+            )
+            content, thinking = response_text_and_thinking(envelope)
+            shape = ollama_response_shape(envelope)
+            if isinstance(content, str) and content.strip():
+                if think is not None:
+                    _OLLAMA_TEXT_THINK_SETTINGS[cache_key] = setting
+                if setting != initial_setting:
+                    logger.info("Ollama text response recovered with think=%s", setting)
+                return content.strip()
+            think_setting = request_payload.get("think", "omitted")
+            last_details = (
+                thinking, shape, think_setting,
+            )
+            logger.warning(
+                "Ollama returned empty assistant content: model=%s thinking_present=%s "
+                "thinking_length=%s tool_calls=%s done_reason=%s structured_format_requested=%s "
+                "think_setting=%s",
+                model_name, "yes" if thinking else "no", len(thinking),
+                shape.get("tool_calls", 0), shape.get("done_reason") or "unknown",
+                "yes" if structured_format is not None else "no", think_setting,
+            )
+        thinking, shape, think_setting = last_details
+        return (
+            "Error: Ollama returned empty assistant content. "
+            f"Model: {model_name}; thinking_present: {'yes' if thinking else 'no'}; "
+            f"thinking_length: {len(thinking)}; tool_calls: {shape.get('tool_calls', 0)}; "
+            f"done_reason: {shape.get('done_reason') or 'unknown'}; structured_format_requested: "
+            f"{'yes' if structured_format is not None else 'no'}; think_setting: {think_setting}."
         )
-        message = envelope.get("message") if isinstance(envelope, dict) else None
-        content = message.get("content", "") if isinstance(message, dict) else ""
-        logger.info("Ollama text response envelope: type=%s keys=%s message_type=%s", type(envelope).__name__, sorted(envelope) if isinstance(envelope, dict) else [], type(message).__name__)
-        logger.info("Ollama text extracted content=%r", content)
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        logger.error("Ollama text response had no message.content (provider=OLLAMA model=%s endpoint=%s)", model_name, endpoint)
-        return "Error: AI returned empty content."
     except Exception as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         exception_message = str(exc)
@@ -396,11 +447,35 @@ def _ollama_chat_request(
     chat_url, _ = _ollama_endpoints(server_url)
     endpoint = _safe_endpoint(chat_url)
     message_roles = [m.get("role") for m in payload.get("messages", []) if isinstance(m, dict)]
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    format_value = payload.get("format")
+    if isinstance(format_value, dict):
+        format_shape = {
+            "type": "schema",
+            "top_level_keys": sorted(format_value),
+            "properties": sorted((format_value.get("properties") or {}).keys()),
+            "required": format_value.get("required", []),
+            "property_shapes": {
+                key: {
+                    field: value.get(field)
+                    for field in ("type", "items", "minItems", "maxItems", "uniqueItems")
+                    if field in value
+                }
+                for key, value in (format_value.get("properties") or {}).items()
+                if isinstance(value, dict)
+            },
+        }
+    else:
+        format_shape = {"type": "json" if format_value == "json" else "none"}
     logger.info(
-        "Ollama %s request: provider=OLLAMA model=%s endpoint=%s method=POST timeout=%ss roles=%s tools=%d format=%s",
-        operation, model_name, endpoint, timeout, message_roles,
+        "Ollama %s request: provider=OLLAMA model=%s endpoint=%s method=POST timeout=%ss "
+        "fields=%s roles=%s message_content_lengths=%s stream=%s think=%s tools=%d "
+        "format_shape=%s options=%s num_ctx=%s",
+        operation, model_name, endpoint, timeout, sorted(payload), message_roles,
+        [len(m.get("content", "")) for m in payload.get("messages", []) if isinstance(m, dict) and isinstance(m.get("content", ""), str)],
+        payload.get("stream"), payload.get("think", "omitted"),
         len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else 0,
-        "json" if payload.get("format") == "json" else ("schema" if isinstance(payload.get("format"), dict) else "none"),
+        format_shape, options, options.get("num_ctx", "omitted"),
     )
     with httpx.Client(timeout=timeout) as client:
         response = client.post(chat_url, json=payload)
@@ -419,6 +494,10 @@ def _ollama_chat_request(
     logger.info(
         "Ollama %s response envelope: type=%s keys=%s",
         operation, type(envelope).__name__, sorted(envelope) if isinstance(envelope, dict) else [],
+    )
+    logger.info(
+        "Ollama %s response diagnostics: %s",
+        operation, json.dumps(ollama_response_shape(envelope), sort_keys=True),
     )
     return envelope
 
@@ -650,11 +729,11 @@ def _tool_calls_from_parsed(parsed, log_messages: List[str]):
 def _parse_ollama_tool_response(response_text, log_messages: List[str], tools: List[Dict]) -> Dict:
     """Parse wrappers/prose/fenced JSON and validate Ollama planner tool calls."""
     known_names = {t.get("name") for t in tools if t.get("name")}
-    logger.debug("Ollama planner raw response=%r", response_text)
+    logger.debug("Ollama planner final response text length=%d", len(response_text or ""))
     parsed, extracted, thinking, parse_error = parse_json_response(response_text)
     logger.debug(
-        "Ollama planner extracted content=%r thinking_present=%s thinking=%r",
-        extracted, bool(thinking.strip()), thinking,
+        "Ollama planner parsed response: content_length=%d thinking_present=%s thinking_length=%d",
+        len(extracted), bool(thinking.strip()), len(thinking),
     )
     log_messages.append(
         f"Ollama planner response parsed: thinking={'present' if thinking.strip() else 'absent'}"
@@ -673,7 +752,10 @@ def _parse_ollama_tool_response(response_text, log_messages: List[str], tools: L
             log_messages.append(f"Ollama planner response rejected: {reason}")
             return {"error": reason}
 
-    logger.debug("Ollama planner parsed JSON=%r", parsed)
+    logger.debug(
+        "Ollama planner parsed JSON shape: type=%s keys=%s",
+        type(parsed).__name__, sorted(parsed) if isinstance(parsed, dict) else None,
+    )
     if isinstance(parsed, dict):
         reasoning = parsed.get("reasoning") or parsed.get("thinking")
     else:
@@ -757,27 +839,25 @@ def _try_native_ollama_tool_call(
         chat_url, model_name, payload, timeout=timeout, operation="planner",
     )
 
-    logger.debug("Ollama planner native raw response wrapper=%r", result)
+    logger.debug("Ollama planner native response shape=%s", json.dumps(ollama_response_shape(result), sort_keys=True))
     message = result.get("message", {})
     if not isinstance(message, dict):
         message = {}
     thinking = message.get("thinking") or result.get("thinking") or result.get("reasoning") or ""
     if thinking:
-        logger.debug("Ollama planner native separate thinking/reasoning=%r", thinking)
+        logger.debug("Ollama planner native separate thinking present; length=%d", len(thinking))
         log_messages.append("Ollama native response included separate thinking/reasoning content")
     raw_tool_calls = message.get("tool_calls") or []
 
     if not raw_tool_calls:
         content = message.get("content", "")
-        logger.debug("Ollama planner native extracted response/content=%r", content)
+        logger.debug("Ollama planner native final content length=%d", len(content) if isinstance(content, str) else 0)
         log_messages.append(
             f"Native tool-calling returned 0 tool calls; response content length={len(content)}"
         )
         if content:
             parsed_content = _parse_ollama_tool_response(content, log_messages, tools)
             if "tool_calls" in parsed_content:
-                if thinking and not parsed_content.get("reasoning"):
-                    parsed_content["reasoning"] = thinking
                 return parsed_content
         return None
 
@@ -839,16 +919,17 @@ def _try_structured_ollama_call(
         response.raise_for_status()
         result = response.json()
 
-    logger.debug("Ollama planner structured raw response wrapper=%r", result)
+    logger.debug("Ollama planner structured response shape=%s", json.dumps(ollama_response_shape(result), sort_keys=True))
     response_text, thinking = response_text_and_thinking(result)
     if not response_text:
         reason = f"Ollama response had no response/content field; wrapper keys={sorted(result) if isinstance(result, dict) else type(result).__name__}"
         log_messages.append(f"Ollama planner response rejected: {reason}")
         return {"error": reason}
-    logger.debug("Ollama planner extracted response/content=%r separate_thinking=%r", response_text, thinking)
+    logger.debug(
+        "Ollama planner extracted final content: length=%d thinking_present=%s thinking_length=%d",
+        len(response_text), bool(thinking), len(thinking),
+    )
     parsed_result = _parse_ollama_tool_response(response_text, log_messages, tools)
-    if thinking and "tool_calls" in parsed_result and not parsed_result.get("reasoning"):
-        parsed_result["reasoning"] = thinking
     return parsed_result
 
 

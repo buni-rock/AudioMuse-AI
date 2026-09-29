@@ -52,6 +52,10 @@ TRUTHY_SEARCH_FILTERS = {
 }
 
 
+def _rerank_aliases(prompt):
+    return json.loads(prompt.rsplit('Candidates: ', 1)[1])
+
+
 def _song(item_id, artist):
     return {'item_id': item_id, 'artist': artist, 'title': f'{artist} {item_id}'}
 
@@ -376,13 +380,14 @@ class TestPlaylistLength:
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES', False)
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
-        monkeypatch.setattr(
-            ai_api,
-            'generate_text',
-            lambda *args, **kwargs: json.dumps({
-                'ranked_ids': [f'C{i:03d}' for i in range(50, 20, -1)]
-            }),
-        )
+        def rank_requested_tracks(prompt, *_args, **_kwargs):
+            records = _rerank_aliases(prompt)
+            aliases_by_title = {row.get('title'): row['id'] for row in records}
+            return json.dumps({'ranked_ids': [
+                aliases_by_title[f'Track {i:03d}'] for i in range(49, 19, -1)
+            ]})
+
+        monkeypatch.setattr(ai_api, 'generate_text', rank_requested_tracks)
         songs = [
             {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
             for i in range(80)
@@ -487,10 +492,9 @@ class TestPlaylistLength:
             item_id: {'duration': 60} for item_id in ids
         })
         monkeypatch.setattr(
-            ai_api,
-            'generate_text',
-            lambda *args, **kwargs: json.dumps({
-                'ranked_ids': [f'C{i:03d}' for i in range(50, 0, -1)]
+            ai_api, 'generate_text',
+            lambda prompt, *args, **kwargs: json.dumps({
+                'ranked_ids': [row['id'] for row in _rerank_aliases(prompt)]
             }),
         )
         optimizer_calls = []
@@ -620,3 +624,58 @@ class TestStreamingErrorEvent:
         assert event['error_code'] == 9999
         assert event['error'] == 'An internal error has occurred.'
         assert 'secret detail' not in json.dumps(event)
+
+
+def test_ollama_model_api_lists_models_from_selected_server(monkeypatch):
+    from flask import Flask
+    import requests
+    import ssrf_guard
+
+    requested = {}
+    monkeypatch.setattr(ssrf_guard, 'validate_outbound_url', lambda _url: (True, None))
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'models': [
+                {'name': 'qwen3.5:9b'}, {'model': 'llama3.2:latest'}, {'name': 'qwen3.5:9b'},
+            ]}
+
+    def fake_get(url, **kwargs):
+        requested.update(url=url, **kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, 'get', fake_get)
+    flask_app = Flask(__name__)
+    flask_app.register_blueprint(app_chat.chat_bp, url_prefix='/chat')
+    response = flask_app.test_client().post(
+        '/chat/api/ollama_models',
+        json={'server_url': 'http://ollama.local:11434/api/generate'},
+    )
+
+    assert response.status_code == 200
+    assert response.json['models'] == ['llama3.2:latest', 'qwen3.5:9b']
+    assert requested['url'] == 'http://ollama.local:11434/api/tags'
+    assert requested['timeout'] <= 8
+
+
+def test_ollama_model_api_rejects_invalid_url_and_handles_unavailable_server(monkeypatch):
+    from flask import Flask
+    import requests
+    import ssrf_guard
+
+    flask_app = Flask(__name__)
+    flask_app.register_blueprint(app_chat.chat_bp, url_prefix='/chat')
+    client = flask_app.test_client()
+    invalid = client.post('/chat/api/ollama_models', json={'server_url': 'file:///etc/passwd'})
+    assert invalid.status_code == 400
+
+    monkeypatch.setattr(ssrf_guard, 'validate_outbound_url', lambda _url: (True, None))
+    monkeypatch.setattr(requests, 'get', lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()))
+    unavailable = client.post(
+        '/chat/api/ollama_models', json={'server_url': 'http://ollama.local:11434'}
+    )
+    assert unavailable.status_code == 502
+    assert unavailable.json['models'] == []

@@ -215,6 +215,8 @@ class TestShapeHints:
             ('make me songs similar to Dark Chest Of Wonders', 'Dark Chest Of Wonders', None),
             ('start with Dark Chest Of Wonders by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
             ('based on "Dark Chest Of Wonders" by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
+            ("Create a playlist using Nightwish's Harvest as a seed.", 'Harvest', 'Nightwish'),
+            ("Use Metallica's Nothing Else Matters as the seed.", 'Nothing Else Matters', 'Metallica'),
         ],
     )
     def test_named_seed_parser_uses_explicit_cues(

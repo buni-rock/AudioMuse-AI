@@ -216,6 +216,7 @@ def generate_text(
     max_tokens: Optional[int] = None,
     structured_format: Optional[Dict | str] = None,
     system_prompt: Optional[str] = None,
+    think: Optional[bool | str] = None,
 ) -> str:
     valid, err = validate_ai_config(ai_config)
     if not valid:
@@ -237,6 +238,7 @@ def generate_text(
             max_tokens=max_tokens,
             structured_format=structured_format,
             system_prompt=system_prompt,
+            think=think,
         )
     if provider == "OPENAI":
         return ai_api_openai.generate_text(

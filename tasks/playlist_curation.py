@@ -1,5 +1,7 @@
 """Grounded optional curation helpers for Instant Playlist."""
 
+import base64
+import hashlib
 import json
 import logging
 import math
@@ -239,6 +241,67 @@ def build_llm_candidate_payload(songs, features=None, aliases=None):
     return records
 
 
+def _rerank_context_key(user_request, resolved_seed):
+    seed = resolved_seed or {}
+    stable_seed = {
+        "title": str(seed.get("title") or ""),
+        "artist": str(seed.get("artist") or seed.get("author") or ""),
+        "item_id": str(seed.get("item_id") or ""),
+    }
+    return json.dumps([str(user_request or ""), stable_seed], ensure_ascii=False, sort_keys=True)
+
+
+def _opaque_rerank_aliases(songs, context):
+    """Create stable aliases that reveal neither item identity nor candidate order."""
+    aliases, used = {}, set()
+    for song in songs:
+        item_id = str(song.get("item_id"))
+        digest = hashlib.sha256(f"alias\0{context}\0{item_id}".encode("utf-8")).digest()
+        # A base32 alphabet makes short, opaque aliases that are easy to return.
+        token = base64.b32encode(digest).decode("ascii").rstrip("=")
+        length = 5
+        alias = token[:length]
+        while alias in used:
+            length += 1
+            alias = token[:length]
+        aliases[item_id] = alias
+        used.add(alias)
+    return aliases
+
+
+def _build_rerank_payload(songs, aliases):
+    """Send only readable catalog metadata for independent musical judgment."""
+    records = []
+    for song in songs:
+        item_id = song.get("item_id")
+        if item_id is None or str(item_id) not in aliases:
+            continue
+        row = {"id": aliases[str(item_id)]}
+        for key in ("title", "artist", "album"):
+            value = song.get(key)
+            if value is None and key == "artist":
+                value = song.get("author")
+            if value is not None and value != "":
+                row[key] = str(value)
+        records.append(row)
+    return records
+
+
+def _rerank_candidate_order(songs, context):
+    """Deterministically shuffle independent of AudioMuse's incoming order."""
+    unique = {}
+    for song in songs:
+        item_id = song.get("item_id")
+        if item_id is not None:
+            unique.setdefault(str(item_id), song)
+    return sorted(
+        unique.values(),
+        key=lambda song: hashlib.sha256(
+            f"shuffle\0{context}\0{song.get('item_id')}".encode("utf-8")
+        ).digest(),
+    )
+
+
 def _normalized_content_text(value):
     value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
@@ -278,8 +341,11 @@ def curate_candidates_with_llm(
 
     mode = str(mode or "").upper()
     pool = list(songs[:limit])
+    rerank_context = _rerank_context_key(user_request, resolved_seed)
+    if mode == "LLM_RERANK":
+        pool = _rerank_candidate_order(pool, rerank_context)
     features = {}
-    if include_audio:
+    if include_audio and mode != "LLM_RERANK":
         try:
             from tasks.ai.tool_impl import _fetch_pool_features
             features = _fetch_pool_features([s["item_id"] for s in pool])
@@ -289,13 +355,22 @@ def curate_candidates_with_llm(
     # AudioMuse objects and IDs remain server-side and are recovered below.
     alias_to_song = {}
     seen_item_ids = set()
-    for song in pool:
-        item_id = song.get("item_id")
-        if item_id is not None and str(item_id) not in seen_item_ids:
-            alias_to_song[f"C{len(alias_to_song) + 1:03d}"] = song
-            seen_item_ids.add(str(item_id))
-    item_id_to_alias = {str(song["item_id"]): alias for alias, song in alias_to_song.items()}
-    records = build_llm_candidate_payload(pool, features, item_id_to_alias)
+    if mode == "LLM_RERANK":
+        item_id_to_alias = _opaque_rerank_aliases(pool, rerank_context)
+        for song in pool:
+            item_id = song.get("item_id")
+            if item_id is not None and str(item_id) not in seen_item_ids:
+                alias_to_song[item_id_to_alias[str(item_id)]] = song
+                seen_item_ids.add(str(item_id))
+        records = _build_rerank_payload(pool, item_id_to_alias)
+    else:
+        for song in pool:
+            item_id = song.get("item_id")
+            if item_id is not None and str(item_id) not in seen_item_ids:
+                alias_to_song[f"C{len(alias_to_song) + 1:03d}"] = song
+                seen_item_ids.add(str(item_id))
+        item_id_to_alias = {str(song["item_id"]): alias for alias, song in alias_to_song.items()}
+        records = build_llm_candidate_payload(pool, features, item_id_to_alias)
     if len(records) < 1:
         logger.warning("Curator skipped: no usable candidates (mode=%s)", mode)
         return [], len(records)
@@ -307,10 +382,16 @@ def curate_candidates_with_llm(
     max_curated = min(requested_curated, len(records))
     effective_target = requested_curated
     rerank_required_count = min(len(records), effective_target + _RERANK_SAFETY_MARGIN)
-    logger.info(
-        "Selection mode: %s; candidates available: %d; candidates sent to curator: %d; alias range: %s",
-        mode, len(songs), len(records), alias_range,
-    )
+    if mode == "LLM_RERANK":
+        logger.info(
+            "Selection mode: %s; candidates available: %d; candidates sent to curator: %d",
+            mode, len(songs), len(records),
+        )
+    else:
+        logger.info(
+            "Selection mode: %s; candidates available: %d; candidates sent to curator: %d; alias range: %s",
+            mode, len(songs), len(records), alias_range,
+        )
     context_setting = (
         ai_config.get("ollama_num_ctx")
         or getattr(config, "OLLAMA_NUM_CTX", None)
@@ -337,9 +418,13 @@ def curate_candidates_with_llm(
             logger.warning("Could not resolve sanitized curator endpoint (%s)", type(exc).__name__)
     if mode == "LLM_RERANK":
         task_contract = (
-            "RERANK means rank the candidates you can confidently evaluate, ordered from most to least relevant. "
-            "Return unique candidate IDs only; prioritize enough high-quality candidates to cover the final target. "
-            f"Input candidate count: {len(records)}. Return at least {rerank_required_count} IDs when possible. "
+            "Rank every candidate you can evaluate from most to least appropriate for this playlist. "
+            "Use your musical knowledge of artists, songs, albums, genres, style, and scene/subgenre relationships. "
+            "Judge suitability for this request; broad genre overlap alone is not enough. "
+            "Every candidate is real and belongs to the user's library. Do not invent songs. "
+            "Return only supplied candidate IDs, each at most once, in ranked_ids. "
+            "Candidate presentation order has no significance. "
+            f"Return at least {rerank_required_count} unique IDs when possible. "
             "Return one JSON object with only ranked_ids.\n"
         )
     else:
@@ -360,31 +445,66 @@ def curate_candidates_with_llm(
         if seed_alias:
             seed_record = next((record for record in records if record["id"] == seed_alias), None)
         else:
-            try:
-                from tasks.ai.tool_impl import _fetch_pool_features
-                seed_features = _fetch_pool_features([resolved_seed["item_id"]]) if include_audio else {}
-            except Exception:
-                seed_features = {}
-            seed_record = build_llm_candidate_payload(
-                [resolved_seed], seed_features, {seed_key: "SEED"}
-            )
-            seed_record = seed_record[0] if seed_record else None
+            if mode == "LLM_RERANK":
+                seed_record = _build_rerank_payload([resolved_seed], {seed_key: "SEED"})
+                seed_record = seed_record[0] if seed_record else None
+            else:
+                try:
+                    from tasks.ai.tool_impl import _fetch_pool_features
+                    seed_features = _fetch_pool_features([resolved_seed["item_id"]]) if include_audio else {}
+                except Exception:
+                    seed_features = {}
+                seed_record = build_llm_candidate_payload(
+                    [resolved_seed], seed_features, {seed_key: "SEED"}
+                )
+                seed_record = seed_record[0] if seed_record else None
         if seed_record:
             seed_record = {key: value for key, value in seed_record.items() if key != "id"}
-    prompt = (
-        "Use only candidate IDs from this list. Output one JSON object and nothing else. "
-        "AudioMuse has already retrieved these tracks using audio similarity. The native rank and similarity scores are meaningful evidence. "
-        "Use them as a strong prior. Your job is to refine AudioMuse retrieval, not replace acoustic similarity with artist/title reasoning. "
-        "Do not ignore highly ranked candidates without a concrete reason. Do not prefer a well-known artist because you recognize the artist. "
-        "Judge similarity to the seed track, not similarity to the seed artist.\n"
-        f"Request: {user_request}\n{task_contract}"
-        + (f"Resolved seed audio profile: {json.dumps(seed_record, ensure_ascii=False, separators=(',', ':'))}\n" if seed_record else "")
-        + f"Candidates: {serialized_records}"
-    )
+    if mode == "LLM_RERANK":
+        seed_text = "Unknown"
+        if seed_record:
+            seed_text = f"{seed_record.get('title', 'Unknown')} by {seed_record.get('artist', 'Unknown')}"
+            if seed_record.get("album"):
+                seed_text += f"\nAlbum: {seed_record['album']}"
+        prompt = (
+            "You are choosing music for a playlist from the user's own music library.\n\n"
+            f"User request:\n{user_request}\n\n"
+            f"Resolved seed:\n{seed_text}\n\n"
+            "Below are real candidate songs from the user's library. Rank them from most appropriate to least appropriate "
+            "for the user's request. Use your knowledge of artists, songs, albums, musical genres, musical style, and "
+            "scene/subgenre relationships. Do not treat two songs as close merely because both are broadly classified "
+            "as rock or metal. Judge how suitable each candidate is for THIS playlist. Every candidate is real and already "
+            "exists in the user's library. Do not invent songs. Return only candidate IDs in ranked_ids. Prefer candidates "
+            "that best fit the user's actual musical intent. Candidate presentation order has no significance.\n\n"
+            f"{task_contract}Candidates: {serialized_records}"
+        )
+    else:
+        prompt = (
+            "Use only candidate IDs from this list. Output one JSON object and nothing else. "
+            "AudioMuse has already retrieved these tracks using audio similarity. The native rank and similarity scores are meaningful evidence. "
+            "Use them as a strong prior. Your job is to refine AudioMuse retrieval, not replace acoustic similarity with artist/title reasoning. "
+            "Do not ignore highly ranked candidates without a concrete reason. Do not prefer a well-known artist because you recognize the artist. "
+            "Judge similarity to the seed track, not similarity to the seed artist.\n"
+            f"Request: {user_request}\n{task_contract}"
+            + (f"Resolved seed audio profile: {json.dumps(seed_record, ensure_ascii=False, separators=(',', ':'))}\n" if seed_record else "")
+            + f"Candidates: {serialized_records}"
+        )
     serialized_chars = len(serialized_records)
     approximate_prompt_tokens = (len(prompt) + 3) // 4
     if log_messages is not None:
-        log_messages.append(f"Native shortlist for curator: {len(records)}")
+        if mode == "LLM_RERANK":
+            log_messages.append("LLM candidate payload: metadata only")
+            log_messages.append(f"LLM shortlist size: {len(records)}")
+            log_messages.append("AudioMuse scores sent to LLM: no")
+            log_messages.append("AudioMuse native ranks sent to LLM: no")
+            log_messages.append("Candidate presentation shuffled: yes")
+            for alias, song in list(alias_to_song.items())[:5]:
+                log_messages.append(
+                    f"Rerank alias mapping: {alias} -> "
+                    f"{song.get('artist') or song.get('author') or 'Unknown'} - {song.get('title') or 'Unknown'}"
+                )
+        else:
+            log_messages.append(f"Native shortlist for curator: {len(records)}")
         log_messages.append(f"Serialized candidate payload chars: {serialized_chars}")
         log_messages.append(f"Approximate prompt tokens: {approximate_prompt_tokens}")
         if provider == "OLLAMA":
@@ -409,18 +529,25 @@ def curate_candidates_with_llm(
         "additionalProperties": False,
     }
     def _request_and_inspect(current_prompt):
+        provider_options = {}
+        if provider == "OLLAMA" and mode == "LLM_RERANK":
+            provider_options["think"] = False
         raw_response = generate_text(
             current_prompt, ai_config, skip_delay=True, temperature=0.1,
             max_tokens=1200 if mode == "LLM_CURATE" else 1800,
             structured_format=structured_schema if provider == "OLLAMA" else None,
             system_prompt="You curate playlist tracks. Return only the required JSON object.",
+            **provider_options,
         )
         safe_response = str(raw_response or "")
         safe_response = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", safe_response)
         safe_response = re.sub(r"(?i)(api[\s_-]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", safe_response)
-        logger.info("Raw curator content (log preview): %s", safe_response[:4000])
+        logger.info(
+            "Curator raw response metadata: type=%s length=%d",
+            type(raw_response).__name__, len(safe_response),
+        )
         if log_messages is not None:
-            log_messages.append(f"Raw curator content: {safe_response[:4000]}")
+            log_messages.append(f"Curator raw response length: {len(safe_response)} chars")
         if safe_response.strip().startswith("Error:"):
             return raw_response, [], None, safe_response
         ids, diagnostics = inspect_llm_candidate_selection(
@@ -441,6 +568,7 @@ def curate_candidates_with_llm(
             log_messages.append(f"Rerank candidates sent: {len(records)}")
             log_messages.append(f"Rerank required usable aliases: {rerank_required_count}")
             log_messages.append(f"Valid reranked aliases: {len(ids)}")
+            log_messages.append(f"LLM returned valid ranked candidates: {len(ids)}")
             log_messages.append(f"Rerank returned aliases: {len(ids)}")
             log_messages.append(f"Rerank coverage: {percent}%")
             log_messages.append(f"Rerank status: {status}")
@@ -487,16 +615,15 @@ def curate_candidates_with_llm(
         status = "PARSE_ERROR" if diag["parsed_json"] is None else "SUCCESS" if ids else "VALIDATION_ERROR"
         logger.info("Curator status: %s", status)
         logger.info(
-            "Curator extracted content=%r parsed_json=%r thinking_present=%s",
-            diag["extracted_content"], diag["parsed_json"], diag["thinking_present"],
+            "Curator extracted response metadata: content_length=%s parsed_type=%s thinking_present=%s",
+            len(diag["extracted_content"] or ""), diag["json_top_level_type"],
+            diag["thinking_present"],
         )
         logger.info("Curator JSON parsing: %s", "success" if diag["parsed_json"] is not None else "failure")
         logger.info("Curator HTTP extracted content type: %s", diag["http_extracted_content_type"])
         logger.info("Curator JSON top-level type: %s", diag["json_top_level_type"])
         logger.info("Curator normalization input type: %s", diag["normalization_input_type"])
         logger.info("Curator normalization output aliases: %s", diag["normalization_output_aliases"])
-        parsed_preview = json.dumps(diag["parsed_json"], ensure_ascii=False, separators=(",", ":")) if diag["parsed_json"] is not None else "null"
-        logger.info("Curator parsed JSON (log preview): %s", parsed_preview[:4000])
         logger.info("Curator raw response shape: %s", diag["raw_response_shape"])
         logger.info("Curator returned keys: %s", diag["returned_keys"])
         logger.info("Curator response normalization: %s", diag["normalization_note"])

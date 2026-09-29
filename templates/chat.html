@@ -2,6 +2,24 @@
 
 {% block content %}
 <style>
+    #ollamaConfig #refreshOllamaModels {
+        width: auto;
+        min-width: 10rem;
+        flex-grow: 0;
+        margin: 0.45rem 0 0;
+        padding: 0.5rem 0.9rem;
+        color: var(--text-main);
+        background: var(--bg-input);
+        border: 1px solid var(--border-color-darker);
+    }
+    #ollamaConfig #refreshOllamaModels:hover {
+        background: var(--bg-table-hover);
+        border-color: var(--color-primary);
+    }
+    #ollamaConfig #refreshOllamaModels:focus-visible {
+        outline: 2px solid var(--color-primary);
+        outline-offset: 2px;
+    }
     .suggestion-btn {
         padding: 0.15rem 0.25rem !important;
         font-size: 0.88rem !important;
@@ -192,7 +210,15 @@
                             <span class="tooltip-text">The specific AI model running on your Ollama server. Popular choices: mistral:7b, llama2, phi. Larger models give better results but need more RAM.</span>
                         </span>
                     </label>
-                    <input type="text" id="ollamaModel" placeholder="e.g., mistral:7b">
+                    <select id="ollamaModel" aria-describedby="ollamaModelStatus">
+                        <option value="">Load models from server…</option>
+                    </select>
+                    <button type="button" id="refreshOllamaModels" class="btn btn-ghost btn-sm">Refresh models</button>
+                    <p id="ollamaModelStatus" class="form-text" role="status" aria-live="polite"></p>
+                    <div id="ollamaManualModelGroup" class="hidden" style="margin-top: .5rem;">
+                        <label for="ollamaManualModel">Model name</label>
+                        <input type="text" id="ollamaManualModel" placeholder="e.g., qwen3.5:9b">
+                    </div>
                     <div style="margin-top: 1.5rem;">
                         <label for="ollamaServerUrl" class="label-with-tooltip">
                             Ollama Server URL
@@ -339,6 +365,10 @@
             const mistralConfigDiv = document.getElementById('mistralConfig');
             const ollamaModelSelect = document.getElementById('ollamaModel');
             const ollamaServerUrlInput = document.getElementById('ollamaServerUrl'); // Added Ollama Server URL input
+            const ollamaModelStatus = document.getElementById('ollamaModelStatus');
+            const ollamaManualModelGroup = document.getElementById('ollamaManualModelGroup');
+            const ollamaManualModelInput = document.getElementById('ollamaManualModel');
+            const refreshOllamaModelsButton = document.getElementById('refreshOllamaModels');
             const openaiModelSelect = document.getElementById('openaiModel');
             const openaiServerUrlInput = document.getElementById('openaiServerUrl');
             const geminiModelSelect = document.getElementById('geminiModel');
@@ -383,8 +413,7 @@
                     aiProviderSelect.value = globalConfig.default_ai_provider.toUpperCase();
                 }
 
-                // ollamaModelSelect.innerHTML = ''; // Not needed for input field
-                ollamaModelSelect.value = globalConfig.default_ollama_model_name || ""; // Set default value for input
+                ollamaManualModelInput.value = globalConfig.default_ollama_model_name || "";
                 ollamaServerUrlInput.value = globalConfig.ollama_server_url || "http://localhost:11434/api/generate"; // Pre-fill Ollama Server URL
 
                 openaiModelSelect.value = globalConfig.default_openai_model_name || ""; // Set default value for OpenAI
@@ -411,6 +440,7 @@
                     openaiConfigDiv.classList.add('hidden');
                     geminiConfigDiv.classList.add('hidden');
                     mistralConfigDiv.classList.add('hidden');
+                    if (globalConfig) loadOllamaModels();
                 } else if (provider === 'OPENAI') {
                     ollamaConfigDiv.classList.add('hidden');
                     openaiConfigDiv.classList.remove('hidden');
@@ -432,6 +462,65 @@
                     geminiConfigDiv.classList.add('hidden');
                     mistralConfigDiv.classList.add('hidden');
                 }
+            }
+
+            function currentOllamaModel() {
+                return ollamaModelSelect.value === '__manual__'
+                    ? ollamaManualModelInput.value.trim()
+                    : ollamaModelSelect.value;
+            }
+
+            async function loadOllamaModels() {
+                const selectedBeforeLoad = currentOllamaModel() || ollamaManualModelInput.value.trim();
+                ollamaModelStatus.textContent = 'Loading models from Ollama…';
+                refreshOllamaModelsButton.disabled = true;
+                ollamaModelSelect.disabled = true;
+                try {
+                    const response = await fetch("{{ url_for('chat_bp.ollama_models_api') }}", {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ server_url: ollamaServerUrlInput.value.trim() })
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+                    const models = Array.isArray(data.models) ? data.models : [];
+                    ollamaModelSelect.innerHTML = '';
+                    models.forEach(name => {
+                        const option = document.createElement('option');
+                        option.value = name;
+                        option.textContent = name;
+                        ollamaModelSelect.appendChild(option);
+                    });
+                    const manualOption = document.createElement('option');
+                    manualOption.value = '__manual__';
+                    manualOption.textContent = 'Enter model name manually…';
+                    ollamaModelSelect.appendChild(manualOption);
+
+                    if (selectedBeforeLoad && models.includes(selectedBeforeLoad)) {
+                        ollamaModelSelect.value = selectedBeforeLoad;
+                        ollamaManualModelGroup.classList.add('hidden');
+                    } else {
+                        ollamaModelSelect.value = '__manual__';
+                        if (selectedBeforeLoad) ollamaManualModelInput.value = selectedBeforeLoad;
+                        ollamaManualModelGroup.classList.remove('hidden');
+                    }
+                    ollamaModelStatus.textContent = models.length
+                        ? `Loaded ${models.length} model${models.length === 1 ? '' : 's'} from this server.`
+                        : 'No models were listed. Enter a model name manually.';
+                } catch (error) {
+                    ollamaModelSelect.innerHTML = '<option value="__manual__">Enter model name manually…</option>';
+                    ollamaModelSelect.value = '__manual__';
+                    if (selectedBeforeLoad) ollamaManualModelInput.value = selectedBeforeLoad;
+                    ollamaManualModelGroup.classList.remove('hidden');
+                    ollamaModelStatus.textContent = `Could not load models: ${error.message}. Enter a model name manually.`;
+                } finally {
+                    ollamaModelSelect.disabled = false;
+                    refreshOllamaModelsButton.disabled = false;
+                }
+            }
+
+            function updateOllamaManualModelVisibility() {
+                ollamaManualModelGroup.classList.toggle('hidden', ollamaModelSelect.value !== '__manual__');
             }
 
             /**
@@ -458,7 +547,7 @@
                 };
 
                 if (payload.ai_provider === 'OLLAMA') {
-                    payload.ai_model = ollamaModelSelect.value;
+                    payload.ai_model = currentOllamaModel();
                     payload.ollama_server_url = ollamaServerUrlInput.value; // Include Ollama Server URL
                 } else if (payload.ai_provider === 'OPENAI') {
                     payload.ai_model = openaiModelSelect.value;
@@ -1248,6 +1337,11 @@
             // --- Event Listeners ---
             document.addEventListener('DOMContentLoaded', fetchConfig);
             aiProviderSelect.addEventListener('change', updateAIProviderVisibility);
+            ollamaServerUrlInput.addEventListener('change', () => {
+                if (aiProviderSelect.value === 'OLLAMA') loadOllamaModels();
+            });
+            ollamaModelSelect.addEventListener('change', updateOllamaManualModelVisibility);
+            refreshOllamaModelsButton.addEventListener('click', loadOllamaModels);
             playlistForm.addEventListener('submit', handleChatSubmit);
             createPlaylistForm.addEventListener('submit', handleCreateMediaServerPlaylist);
             

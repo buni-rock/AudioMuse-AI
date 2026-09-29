@@ -33,6 +33,7 @@ import queue
 import re
 import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import app_server_context
 from error import error_manager
@@ -162,6 +163,70 @@ def chat_config_defaults_api():
             "instant_playlist_selection_mode": cfg.INSTANT_PLAYLIST_SELECTION_MODE,
         }
     ), 200
+
+
+def _ollama_tags_url(server_url):
+    """Derive the Ollama model-list endpoint from a configured generate/chat URL."""
+    raw = str(server_url or "").strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Enter a valid HTTP or HTTPS Ollama server URL.")
+    path = re.sub(r"/api/(?:generate|chat|tags)/?$", "", parsed.path, flags=re.IGNORECASE)
+    path = re.sub(r"/api/?$", "", path, flags=re.IGNORECASE).rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/api/tags", parsed.query, ""))
+
+
+@chat_bp.route('/api/ollama_models', methods=['POST'])
+@swag_from(
+    {
+        'tags': ['Chat Configuration'],
+        'summary': 'List models available on the selected Ollama server.',
+        'responses': {
+            '200': {'description': 'Available Ollama model names.'},
+            '400': {'description': 'Invalid Ollama server URL.'},
+            '502': {'description': 'Ollama server could not provide its model list.'},
+        },
+    }
+)
+def ollama_models_api():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({'models': [], 'error': 'A JSON object with server_url is required.'}), 400
+    server_url = data.get('server_url') or config.OLLAMA_SERVER_URL
+    try:
+        tags_url = _ollama_tags_url(server_url)
+    except (TypeError, ValueError) as exc:
+        return jsonify({'models': [], 'error': str(exc)}), 400
+
+    from ssrf_guard import validate_outbound_url
+    is_safe, reason = validate_outbound_url(tags_url)
+    if not is_safe:
+        return jsonify({'models': [], 'error': reason or 'The Ollama server URL is not allowed.'}), 400
+
+    try:
+        import requests
+        response = requests.get(
+            tags_url,
+            headers={'Accept': 'application/json'},
+            timeout=min(8, max(1, int(config.AI_REQUEST_TIMEOUT_SECONDS))),
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get('models') if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return jsonify({'models': [], 'error': 'Ollama returned an invalid model list.'}), 502
+        names = set()
+        for model in models:
+            if isinstance(model, dict):
+                name = str(model.get('name') or model.get('model') or '').strip()
+                if name:
+                    names.add(name)
+        names = sorted(names, key=str.casefold)
+        return jsonify({'models': names}), 200
+    except Exception as exc:
+        logger.info("Ollama model listing failed (%s)", type(exc).__name__)
+        return jsonify({'models': [], 'error': 'Could not load models from this Ollama server.'}), 502
 
 
 def _reject_missing_user_input(data):
@@ -694,6 +759,8 @@ def _run_chat_pipeline(data, log_messages):
         log_messages.append(f"UI song cap: {ui_song_cap}")
         log_messages.append(f"LLM hard maximum: {llm_hard_max}")
         log_messages.append(f"Effective song target: {target_song_count}")
+        if selection_mode == 'LLM_RERANK':
+            log_messages.append(f"Effective final target: {target_song_count}")
         llm_candidate_limit = _resolve_llm_candidate_limit(target_song_count)
         log_messages.append(f"LLM candidate limit: {llm_candidate_limit}")
     else:
@@ -884,6 +951,8 @@ def _run_chat_pipeline(data, log_messages):
 
     log_messages.append(f"\nSelection mode: {selection_mode}")
     log_messages.append(f"Candidates retrieved: {len(all_songs)}")
+    if selection_mode == 'LLM_RERANK':
+        log_messages.append(f"AudioMuse candidates retrieved: {len(all_songs)}")
     from tasks.playlist_curation import suppress_duplicate_title_artist
     all_songs, title_artist_duplicates = suppress_duplicate_title_artist(all_songs)
     if title_artist_duplicates:

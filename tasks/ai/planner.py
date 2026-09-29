@@ -1218,6 +1218,17 @@ def extract_named_song_seed_details(text: str) -> Optional[Dict[str, str]]:
     if not isinstance(text, str) or not text.strip():
         return None
 
+    possessive_seed = re.search(
+        r"\b(?:use|uses|using)\s+(.+?)['’]s\s+(?:(?:song|track)\s+)?(.+?)\s+as\s+(?:(?:a|the)\s+)?seed\b",
+        text,
+        re.IGNORECASE,
+    )
+    if possessive_seed:
+        artist = _trim_seed_text(possessive_seed.group(1), artist=True)
+        title = _trim_seed_text(possessive_seed.group(2))
+        if artist and title:
+            return {"title": title, "artist": artist}
+
     # Prefer an explicitly named seed over later generic wording such as
     # "similar to the seed" in the same request.
     used_song = re.search(
@@ -1321,9 +1332,46 @@ def _synthesize_rescue_plan(
 
 _SIMILAR_SEED_INTENT_RE = re.compile(
     r"\b(?:similar(?:\s+songs?)?\s+to|songs?\s+like|tracks?\s+like|"
-    r"starting\s+from|start(?:ing)?\s+with|based\s+on)\b",
+    r"starting\s+from|start(?:ing)?\s+with|based\s+on)\b|"
+    r"\b(?:use|uses|using)\b.{0,160}\bas\s+(?:(?:a|the)\s+)?seed\b",
     re.IGNORECASE,
 )
+
+
+def _has_explicit_artist_constraint(request: str, artist: str) -> bool:
+    """Whether the request uses an artist name as a separate playlist constraint."""
+    name = rf"(?<![\w]){re.escape(artist.strip())}(?![\w])"
+    clauses = (
+        rf"\b(?:only|mostly|include|including|exclusively|restrict(?:ed)?\s+to|"
+        rf"stick\s+to|keep\s+to)\b[^.!?;\n]{{0,100}}{name}",
+        rf"\b(?:songs?|tracks?|music)\s+(?:exclusively\s+)?by\s+{name}",
+        rf"{name}\s+(?:only|exclusively)\b",
+        rf"\bonly\s+artists?\s+similar\s+to\s+{name}",
+    )
+    return any(re.search(pattern, request or "", re.IGNORECASE) for pattern in clauses)
+
+
+def _strip_seed_artist_filter(plan: 'ToolPlan', resolved_seed, request: str, log_messages) -> None:
+    """Drop artist-as-seed identity when it was not separately requested as a filter."""
+    if not resolved_seed or not isinstance(plan.filter, dict):
+        return
+    seed_artist = str(resolved_seed.get('artist') or '').strip()
+    filter_artist = plan.filter.get('artist')
+    if not seed_artist or not isinstance(filter_artist, str) or not filter_artist.strip():
+        return
+    from tasks.ai.tool_impl import _normalize_for_match
+    if _normalize_for_match(filter_artist) != _normalize_for_match(seed_artist):
+        return
+    if _has_explicit_artist_constraint(request, seed_artist):
+        return
+
+    plan.filter.pop('artist', None)
+    log_messages.append(
+        f'Planner artist filter ignored: artist "{seed_artist}" is already part of resolved song seed '
+        'and was not an explicit user constraint.'
+    )
+    if not _has_filter_content(plan.filter):
+        plan.filter = None
 
 
 def _lock_resolved_seed(plan: 'ToolPlan', resolved_seed, raw_request: str, log_messages):
@@ -2352,10 +2400,13 @@ def plan_and_execute_once(
             "Type: song\n"
             f"ID: {resolved_seed.get('item_id', '')}\n"
             "This entity has already been resolved against the user's library. "
-            "Do not reinterpret it as an artist or a different entity. "
+            "Treat both its title and artist as consumed seed-identity entities. "
+            "Do not reinterpret the seed artist as a positive artist filter unless the user separately "
+            "requests songs by/only/mostly that artist. "
             "The system will run its mandatory seed_search; you may add optional tools.\n"
             "Locked constraints: "
             f"seed_song={resolved_seed.get('title', '')} by {resolved_seed.get('artist', '')}; "
+            f"consumed_seed_artist={resolved_seed.get('artist', '')} (identity only unless separately constrained); "
             f"target_duration_seconds={hints.get('total_seconds', 'unspecified')}; "
             f"exclude_artists={hints.get('exclude_artists', [])}; "
             f"exclude_genres={hints.get('exclude_genres', [])}. "
@@ -2374,6 +2425,7 @@ def plan_and_execute_once(
         )
         plan = _synthesize_rescue_plan(raw_request, hints, log_messages)
         _lock_resolved_seed(plan, resolved_seed, raw_request, log_messages)
+        _strip_seed_artist_filter(plan, resolved_seed, raw_request, log_messages)
         plan.notes.append(
             "the AI planner was unreachable, so this playlist comes from a direct "
             "match of your request instead of a tool plan"
@@ -2409,6 +2461,7 @@ def plan_and_execute_once(
 
     plan = validate_and_normalize_plan(raw_calls)
     _lock_resolved_seed(plan, resolved_seed, raw_request, log_messages)
+    _strip_seed_artist_filter(plan, resolved_seed, raw_request, log_messages)
     for note in plan.notes:
         log_messages.append(f"   plan: {note}")
 
@@ -2435,6 +2488,7 @@ def plan_and_execute_once(
             )
         plan = _synthesize_rescue_plan(raw_request, hints, log_messages)
         _lock_resolved_seed(plan, resolved_seed, raw_request, log_messages)
+        _strip_seed_artist_filter(plan, resolved_seed, raw_request, log_messages)
         return (
             yield from _finish_plan(
                 plan, hints, ai_config, log_messages,

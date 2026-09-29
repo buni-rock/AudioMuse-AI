@@ -1121,7 +1121,7 @@ def _example_calls(example_text):
     return json.loads(example_text.split('\n', 1)[1])['tool_calls']
 
 
-def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None):
+def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None, resolved_seed=None):
     import tasks.ai.tools as tools_mod
     import tasks.ai.tool_impl as impl_mod
 
@@ -1145,8 +1145,56 @@ def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None):
     logs = []
     result = _drive(p.plan_and_execute_once(
         request, [], {'provider': 'NONE'}, logs, raw_user_request=raw_request,
+        resolved_seed=resolved_seed,
     ))
     return result, seen, logs
+
+
+class TestSeedArtistDoesNotBecomeFilter:
+    @staticmethod
+    def _seed():
+        return {
+            'item_id': 'harvest-id', 'title': 'Harvest',
+            'artist': 'Nightwish', 'album': 'Human. :II: Nature.',
+        }
+
+    def test_seed_artist_filter_is_removed_without_an_independent_constraint(self):
+        p = _plan()
+        request = "Create a playlist using Nightwish's Harvest as a seed."
+        plan = p.validate_and_normalize_plan([
+            {'name': 'seed_search', 'arguments': {'seeds': [
+                {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+            ]}},
+            {'name': 'search_database', 'arguments': {'artist': 'Nightwish'}},
+        ])
+        logs = []
+        p._lock_resolved_seed(plan, self._seed(), request, logs)
+        p._strip_seed_artist_filter(plan, self._seed(), request, logs)
+
+        assert [call['name'] for call in plan.primaries] == ['seed_search']
+        assert plan.filter is None
+        assert any(
+            'Planner artist filter ignored: artist "Nightwish" is already part of resolved song seed '
+            'and was not an explicit user constraint.' == line
+            for line in logs
+        )
+
+    def test_explicit_only_same_artist_constraint_is_preserved(self):
+        p = _plan()
+        request = "Create a playlist using Nightwish's Harvest as a seed, but only use Nightwish songs."
+        plan = p.validate_and_normalize_plan([
+            {'name': 'seed_search', 'arguments': {'seeds': [
+                {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+            ]}},
+            {'name': 'search_database', 'arguments': {'artist': 'Nightwish'}},
+        ])
+        logs = []
+        p._lock_resolved_seed(plan, self._seed(), request, logs)
+        p._strip_seed_artist_filter(plan, self._seed(), request, logs)
+
+        assert [call['name'] for call in plan.primaries] == ['seed_search']
+        assert plan.filter['artist'] == 'Nightwish'
+        assert not any('Planner artist filter ignored:' in line for line in logs)
 
 
 class TestListArgDedupe:
