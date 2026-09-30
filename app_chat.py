@@ -969,7 +969,6 @@ def _run_chat_pipeline(data, log_messages):
         log_messages.append("Curating candidate songs...")
         yield
         candidates_sent = min(len(all_songs), llm_candidate_limit)
-        log_messages.append(f"Native shortlist for curator: {candidates_sent}")
         log_messages.append(f"Shortlisted for LLM: {candidates_sent}")
         try:
             from tasks.playlist_curation import curate_candidates_with_llm, rank_candidates_by_ids

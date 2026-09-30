@@ -504,12 +504,16 @@ class TestPlaylistLength:
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_SELECTION_MODE', 'LLM_CURATE')
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
+        def select_expected_tracks(prompt, *_args, **_kwargs):
+            records = _rerank_aliases(prompt)
+            aliases_by_title = {row.get('title'): row['id'] for row in records}
+            return json.dumps({
+                'selected_ids': [aliases_by_title[f'Track {i:03d}'] for i in range(17)]
+            })
         monkeypatch.setattr(
             ai_api,
             'generate_text',
-            lambda *args, **kwargs: json.dumps({
-                'selected_ids': [f'C{i:03d}' for i in range(1, 26)]
-            }),
+            select_expected_tracks,
         )
         songs = [
             {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
@@ -522,19 +526,21 @@ class TestPlaylistLength:
             },
             filter_applied=False,
         )
-        assert len(response['query_results']) == 25
+        assert len(response['query_results']) == 17
         assert [song['item_id'] for song in response['query_results']] == [
-            f'track-{i:03d}' for i in range(25)
+            f'track-{i:03d}' for i in range(17)
         ]
         assert 'Effective song target: 25' in response['message']
         assert 'Candidates sent to LLM: 50' in response['message']
-        assert 'LLM selected: 25' in response['message']
+        assert 'LLM selected: 17' in response['message']
         assert 'Native supplementation: disabled' in response['message']
         assert 'Selection source: LLM curate only' in response['message']
-        assert 'Curator prefix overlap: 100%' in response['message']
-        assert 'Potential retrieval-order copy detected' in response['message']
+        assert 'Candidate presentation shuffled: yes' in response['message']
+        assert 'AudioMuse scores sent to LLM: no' in response['message']
+        assert 'AudioMuse native ranks sent to LLM: no' in response['message']
         assert 'Final requested target: 25' in response['message']
-        assert 'Final playlist: 25' in response['message']
+        assert 'Reason: curator returned fewer high-confidence candidates than target' in response['message']
+        assert 'Final playlist: 17' in response['message']
         assert 'Supplemented with' not in response['message']
         assert 'Playlist kept in native/curator rank order (no explicit duration constraint)' in response['message']
 
