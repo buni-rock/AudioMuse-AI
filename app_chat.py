@@ -636,7 +636,8 @@ def _run_chat_pipeline(data, log_messages):
 
     from tasks.ai.tools import get_mcp_tools
     from tasks.ai.planner import (
-        extract_named_song_seed_details, plan_and_execute_once, requested_playlist_shape,
+        extract_explicit_song_mentions, extract_named_song_seed_details,
+        plan_and_execute_once, requested_playlist_shape,
     )
 
     original_user_input = data.get('userInput')
@@ -783,78 +784,84 @@ def _run_chat_pipeline(data, log_messages):
     log_messages.append(f"Candidate target: {target_song_count} songs")
 
     mandatory_seed = None
+    mandatory_tracks = []
     seed_details = extract_named_song_seed_details(original_user_input)
     seed_text = seed_details.get('title') if seed_details else None
     seed_artist_hint = seed_details.get('artist', '') if seed_details else ''
-    if seed_text:
-        log_messages.append(f"Seed text requested: {seed_text}")
-        if seed_artist_hint:
-            log_messages.append(f"Seed artist hint: {seed_artist_hint}")
+    explicit_mentions = extract_explicit_song_mentions(original_user_input)
+    log_messages.append(f"Explicit song mentions detected: {len(explicit_mentions)}")
+    if seed_text and not any(m['title'].casefold() == seed_text.casefold() for m in explicit_mentions):
+        explicit_mentions.insert(0, {
+            'title': seed_text, 'artist': seed_artist_hint, 'excluded': False,
+        })
+    if explicit_mentions:
         try:
             from tasks.ai.tool_impl import resolve_song_by_title
-            seed_row = resolve_song_by_title(seed_text, seed_artist_hint)
         except Exception:
-            logger.exception("Could not resolve requested seed title")
-            seed_row = None
-        if seed_row:
-            mandatory_seed = {
-                'item_id': seed_row.get('item_id'),
-                'title': seed_row.get('title') or seed_text,
-                'artist': seed_row.get('author') or seed_row.get('artist') or '',
-                'album': seed_row.get('album') or '',
+            resolve_song_by_title = None
+        resolved_rows = []
+        for mention in explicit_mentions:
+            title = mention['title']
+            artist_hint = mention.get('artist') or ''
+            if seed_text and title.casefold() == seed_text.casefold() and seed_artist_hint:
+                artist_hint = seed_artist_hint
+            log_messages.append(f"Explicit song requested: {title}" + (f" by {artist_hint}" if artist_hint else ""))
+            try:
+                row = resolve_song_by_title(title, artist_hint) if resolve_song_by_title else None
+            except Exception:
+                logger.exception("Could not resolve explicit song mention")
+                row = None
+            if not row:
+                continue
+            track = {
+                'item_id': row.get('item_id'),
+                'title': row.get('title') or title,
+                'artist': row.get('author') or row.get('artist') or artist_hint,
+                'album': row.get('album') or '',
             }
-            log_messages.append(f"Seed normalized: {mandatory_seed['title']}")
-            log_messages.append("Seed resolved: true")
-            log_messages.append(
-                f"Seed resolved: {mandatory_seed['title']} by {mandatory_seed['artist']}"
+            if not track['item_id']:
+                continue
+            resolved_rows.append((mention, track))
+            if seed_text and title.casefold() == seed_text.casefold():
+                mandatory_seed = track
+            if not mention.get('excluded'):
+                mandatory_tracks.append({**track, 'reason': 'explicit_song_mention'})
+        # De-duplicate repeated mentions by canonical library track ID.
+        unique_tracks = []
+        seen_track_ids = set()
+        for track in mandatory_tracks:
+            key = str(track['item_id'])
+            if key not in seen_track_ids:
+                seen_track_ids.add(key)
+                unique_tracks.append(track)
+        mandatory_tracks = unique_tracks
+        log_messages.append(f"Resolved explicit tracks: {len(resolved_rows)}")
+        log_messages.append(f"Mandatory tracks: {len(mandatory_tracks)}")
+        if seed_text:
+            seed_match = next((r for m, r in resolved_rows if m['title'].casefold() == seed_text.casefold()), None)
+            if seed_match:
+                log_messages.append(f"Seed resolved: {seed_match['title']} by {seed_match['artist']}")
+            else:
+                log_messages.append("Seed resolved: false; title was not found in the library")
+        if mandatory_tracks:
+            scoped_mandatory = app_server_context.scope_results(
+                mandatory_tracks, None, id_key='item_id', translate=False
             )
-            if seed_row.get('_match_count', 1) > 1:
-                log_messages.append(
-                    f"Seed title was ambiguous ({seed_row['_match_count']} library matches); "
-                    f"selected {mandatory_seed['title']} by {mandatory_seed['artist']}"
-                )
-            log_messages.append(f"Seed ID: {mandatory_seed['item_id']}")
-            log_messages.append(f"Seed title: {mandatory_seed['title']}")
-            log_messages.append(f"Seed artist: {mandatory_seed['artist']}")
-            log_messages.append(f"Seed album: {mandatory_seed['album']}")
-            available_seed = app_server_context.scope_results(
+            scoped_ids = {str(t['item_id']) for t in scoped_mandatory}
+            mandatory_tracks = [t for t in mandatory_tracks if str(t['item_id']) in scoped_ids]
+        if mandatory_seed:
+            scoped_seed = app_server_context.scope_results(
                 [mandatory_seed], None, id_key='item_id', translate=False
             )
-            if not available_seed:
-                log_messages.append(
-                    "Seed unavailable on the selected music server; playlist generation stopped "
-                    "so the required seed is not silently omitted"
-                )
-                return (
-                    {
-                        "message": "\n".join(log_messages),
-                        "original_request": original_user_input,
-                        "ai_provider_used": ai_provider,
-                        "ai_model_selected": ai_config.get(f'{ai_provider.lower()}_model'),
-                        "executed_query": None,
-                        "query_results": None,
-                        "target_duration_seconds": shape.get('total_seconds'),
-                        "actual_duration_seconds": None,
-                    },
-                    200,
-                )
-            mandatory_seed = available_seed[0]
-        else:
-            log_messages.append("Seed resolved: false; title was not found in the library")
-            log_messages.append("Candidate retrieval stopped because the requested seed is required")
-            return (
-                {
-                    "message": "\n".join(log_messages),
-                    "original_request": original_user_input,
-                    "ai_provider_used": ai_provider,
-                    "ai_model_selected": ai_config.get(f'{ai_provider.lower()}_model'),
-                    "executed_query": None,
-                    "query_results": None,
-                    "target_duration_seconds": shape.get('total_seconds'),
-                    "actual_duration_seconds": None,
-                },
-                200,
+            if scoped_seed:
+                mandatory_seed = scoped_seed[0]
+        if len(mandatory_tracks) > target_song_count:
+            log_messages.append(
+                f"Effective target increased from {target_song_count} to {len(mandatory_tracks)} "
+                f"because {len(mandatory_tracks)} explicit mandatory tracks were requested"
             )
+            target_song_count = len(mandatory_tracks)
+        log_messages.append(f"Mandatory tracks available on selected server: {len(mandatory_tracks)}")
 
     # Get MCP tools and library context
     mcp_tools = get_mcp_tools()
@@ -929,25 +936,18 @@ def _run_chat_pipeline(data, log_messages):
             "unavailable songs before playlist selection"
         )
     all_songs = scoped_pool
-    mandatory_seed_ids = []
-    if mandatory_seed and mandatory_seed.get('item_id') is not None:
-        seed_scoped = app_server_context.scope_results(
-            [mandatory_seed], None, id_key='item_id', translate=False
-        )
-        if seed_scoped:
-            mandatory_seed = seed_scoped[0]
-            mandatory_seed_ids = [mandatory_seed['item_id']]
-            existing = {str(song.get('item_id')) for song in all_songs}
-            if str(mandatory_seed['item_id']) not in existing:
-                all_songs = [mandatory_seed] + all_songs
+    mandatory_seed_ids = [t['item_id'] for t in mandatory_tracks]
+    if mandatory_tracks:
+        existing = {str(song.get('item_id')) for song in all_songs}
+        mandatory_ordered = []
+        for track in mandatory_tracks:
+            if str(track['item_id']) not in existing:
+                mandatory_ordered.append(track)
             else:
-                all_songs = [mandatory_seed] + [
-                    song for song in all_songs
-                    if str(song.get('item_id')) != str(mandatory_seed['item_id'])
-                ]
-            log_messages.append("Mandatory seed added to candidate pool")
-        else:
-            log_messages.append("Seed resolved in library but unavailable on the selected music server")
+                mandatory_ordered.append(track)
+                all_songs = [song for song in all_songs if str(song.get('item_id')) != str(track['item_id'])]
+        all_songs = mandatory_ordered + all_songs
+        log_messages.append(f"Mandatory tracks added to candidate pool: {len(mandatory_tracks)}")
 
     log_messages.append(f"\nSelection mode: {selection_mode}")
     log_messages.append(f"Candidates retrieved: {len(all_songs)}")
@@ -1021,6 +1021,36 @@ def _run_chat_pipeline(data, log_messages):
     elif selection_mode != 'NATIVE':
         log_messages.append(f"Selection mode: {selection_mode}; no candidates available")
 
+    from tasks.playlist_curation import song_family_key, suppress_song_families
+    allow_multiple_versions = bool(re.search(
+        r"\b(?:remixes|different versions|multiple versions|alternate mixes|live versions|include both versions|various versions)\b",
+        original_user_input or "", re.I,
+    ))
+    before_family_filter = list(all_songs)
+    family_groups = {}
+    for song in before_family_filter:
+        family_key = song_family_key(song)
+        if family_key:
+            family_groups.setdefault(family_key, []).append(song)
+    all_songs, family_suppressed = suppress_song_families(
+        all_songs, mandatory_ids=mandatory_seed_ids,
+        allow_multiple=allow_multiple_versions, min_spacing=5,
+    )
+    if family_suppressed:
+        retained_ids = {str(song.get('item_id')) for song in all_songs}
+        for family in family_groups.values():
+            if len(family) < 2:
+                continue
+            retained = [s for s in family if str(s.get('item_id')) in retained_ids]
+            if len(retained) < len(family):
+                log_messages.append(
+                    f"Song-family suppression: {family[0].get('title', 'Unknown')}; "
+                    f"candidates: {len(family)}; kept: {', '.join(s.get('title', 'Unknown') for s in retained)}; "
+                    f"suppressed variants: {len(family) - len(retained)}"
+                )
+        log_messages.append(f"Song-family duplicates suppressed: {family_suppressed}")
+    log_messages.append(f"Final unique song families: {len({song_family_key(s) for s in all_songs if song_family_key(s)})}")
+
     log_messages.append(f"Selection source: {selection_source}")
     if selection_source == 'native fallback':
         log_messages.append("Selection strategy: native fallback")
@@ -1054,10 +1084,11 @@ def _run_chat_pipeline(data, log_messages):
         artist_song_counts = {}
         diversified_pool = []
         diversity_overflow = []
+        mandatory_id_set = {str(value) for value in mandatory_seed_ids}
         for song in all_songs:
             artist = song.get('artist', 'Unknown')
             artist_song_counts[artist] = artist_song_counts.get(artist, 0) + 1
-            if artist_song_counts[artist] <= max_per_artist:
+            if str(song.get('item_id')) in mandatory_id_set or artist_song_counts[artist] <= max_per_artist:
                 diversified_pool.append(song)
             else:
                 diversity_overflow.append(song)
@@ -1111,6 +1142,10 @@ def _run_chat_pipeline(data, log_messages):
                     selection_mode = 'NATIVE'
                     selection_source = 'native fallback'
                     all_songs = list(native_candidate_pool)
+                    all_songs, _ = suppress_song_families(
+                        all_songs, mandatory_ids=mandatory_seed_ids,
+                        allow_multiple=allow_multiple_versions, min_spacing=5,
+                    )
                     artist_song_counts = {}
                     diversified_pool = []
                     diversity_overflow = []
@@ -1343,6 +1378,31 @@ def _run_chat_pipeline(data, log_messages):
                 log_messages.append(
                     "\nPlaylist ordering skipped due to an internal processing issue"
                 )
+
+        # Final integrity guard: explicit, resolved, non-excluded tracks are
+        # authoritative even if a selector, artist cap, or ordering step omitted one.
+        mandatory_by_id = {str(t['item_id']): t for t in mandatory_tracks}
+        final_by_id = {str(s.get('item_id')): s for s in final_query_results_list}
+        for track_id, track in mandatory_by_id.items():
+            if track_id not in final_by_id:
+                final_query_results_list.append(track)
+                final_by_id[track_id] = track
+        if mandatory_by_id:
+            mandatory_prefix = [final_by_id[str(t['item_id'])] for t in mandatory_tracks if str(t['item_id']) in final_by_id]
+            mandatory_set = set(mandatory_by_id)
+            optionals = [s for s in final_query_results_list if str(s.get('item_id')) not in mandatory_set]
+            final_query_results_list = mandatory_prefix + optionals
+            if len(final_query_results_list) > target_song_count:
+                final_query_results_list = mandatory_prefix + optionals[:max(0, target_song_count - len(mandatory_prefix))]
+        present_mandatory = sum(
+            1 for track_id in mandatory_by_id
+            if any(str(song.get('item_id')) == track_id for song in final_query_results_list)
+        )
+        log_messages.append(f"Mandatory tracks present in final playlist: {present_mandatory}/{len(mandatory_by_id)}")
+        if family_suppressed:
+            log_messages.append(
+                f"Final unique song families: {len({song_family_key(s) for s in final_query_results_list if song_family_key(s)})}"
+            )
 
         final_executed_query_str = executed_query_str
 

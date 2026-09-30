@@ -395,6 +395,52 @@ def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Di
                     "; unavailable on selected server",
                 )
             return resolved
+        # A title-only mention often omits library annotations such as
+        # “(feat. Eyelar)” or “(PMEDIA)”. Prefer a title-prefix match by the
+        # requested artist before the broad fuzzy search, whose bounded pool can
+        # otherwise be filled by unrelated rows for prolific artists.
+        if artist_hint:
+            normalized_title_prefix = title.casefold().replace('%', r'\%').replace('_', r'\_') + '%'
+            normalized_artist_contains = '%' + artist_hint.casefold().replace('%', r'\%').replace('_', r'\_') + '%'
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute(
+                    """SELECT item_id, title, author, album, COUNT(*) OVER() AS _match_count
+                       FROM public.score
+                       WHERE LOWER(title) LIKE %s ESCAPE '\\'
+                         AND LOWER(COALESCE(author, '')) LIKE %s ESCAPE '\\'
+                       ORDER BY CASE WHEN LOWER(COALESCE(author, '')) = LOWER(%s) THEN 0 ELSE 1 END,
+                                LENGTH(COALESCE(title, '')), item_id
+                       LIMIT 50""",
+                    (normalized_title_prefix, normalized_artist_contains, artist_hint),
+                )
+                prefix_rows = [dict(row) for row in cur.fetchall()]
+            if prefix_rows:
+                available_ids = set()
+                try:
+                    from app_server_context import resolve_request_server_id
+                    from tasks.mediaserver import registry
+
+                    try:
+                        server_id = resolve_request_server_id()
+                    except RuntimeError:
+                        server_id = None
+                    available_ids = set(registry.translate_ids(
+                        [row['item_id'] for row in prefix_rows], server_id, conn=db_conn
+                    ))
+                except Exception:
+                    logger.debug("Could not scope title-prefix song matches", exc_info=True)
+                prefix_rows.sort(key=lambda row: (
+                    0 if row.get('item_id') in available_ids else 1,
+                    0 if (row.get('author') or '').casefold() == artist_hint.casefold() else 1,
+                    len(row.get('title') or ''),
+                    str(row.get('item_id') or ''),
+                ))
+                resolved = prefix_rows[0]
+                logger.info(
+                    "Song title-prefix match: requested=%r by %r resolved=%r by %r",
+                    title, artist_hint, resolved.get('title'), resolved.get('author'),
+                )
+                return resolved
         match = _fuzzy_match_author_title(db_conn, artist_hint, title)
         if match:
             resolved = dict(match)

@@ -1595,3 +1595,31 @@ class TestRetrievalBudget:
 
     def test_budget_at_the_legacy_100_target_is_unchanged(self, monkeypatch):
         assert self._budget_for(monkeypatch, 100) == 200
+
+
+def test_explicit_song_mentions_capture_conversational_and_multi_seed_requests():
+    planner = _plan()
+    extract = planner.extract_explicit_song_mentions
+    mentions = extract(
+        "Make a playlist around Harvest by Nightwish, Mother Earth by Within Temptation, "
+        "and Nemo by Nightwish."
+    )
+    assert [(m['title'], m['artist']) for m in mentions] == [
+        ('Harvest', 'Nightwish'),
+        ('Mother Earth', 'Within Temptation'),
+        ('Nemo', 'Nightwish'),
+    ]
+    love = extract("I love Dopamine from Purple Disco Machine. Find similar songs.")
+    assert len(love) == 1
+    assert love[0]['title'] == 'Dopamine'
+    assert love[0]['artist'] == 'Purple Disco Machine'
+
+
+def test_explicit_song_mention_respects_exclusion_and_reference_only():
+    planner = _plan()
+    excluded = planner.extract_explicit_song_mentions("Songs like Harvest but don't include Harvest.")
+    assert excluded[0]['title'] == 'Harvest'
+    assert excluded[0]['excluded'] is True
+    reference = planner.extract_explicit_song_mentions('Use Harvest only as a reference.')
+    assert reference[0]['title'] == 'Harvest'
+    assert reference[0]['excluded'] is True

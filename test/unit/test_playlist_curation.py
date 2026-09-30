@@ -538,6 +538,50 @@ def test_playlist_suppresses_normalized_title_artist_duplicates():
     assert removed == 1
 
 
+def test_song_family_suppression_collapses_remixes_and_promotes_next_ranked_track():
+    from tasks.playlist_curation import song_family_key, suppress_song_families
+
+    songs = [
+        {'item_id': 'original', 'title': 'Take Me Home (A Girl Like Me)', 'artist': 'Sophie Ellis-Bextor'},
+        {'item_id': 'mix', 'title': 'Take Me Home (A Girl Like Me) (Jewels & Stone Mix)', 'artist': 'Sophie Ellis-Bextor'},
+        {'item_id': 'radio', 'title': 'Take Me Home (A Girl Like Me) (Radio Edit Remix By DJ Flex)', 'artist': 'Sophie Ellis-Bextor'},
+        {'item_id': 'next', 'title': 'Murder On The Dancefloor', 'artist': 'Sophie Ellis-Bextor'},
+    ]
+    assert song_family_key(songs[0]) == song_family_key(songs[1]) == song_family_key(songs[2])
+    kept, removed = suppress_song_families(songs)
+    assert [song['item_id'] for song in kept] == ['original', 'next']
+    assert removed == 2
+
+
+def test_mandatory_song_family_variant_wins_and_feature_title_is_preserved():
+    from tasks.playlist_curation import song_family_key, suppress_song_families
+
+    songs = [
+        {'item_id': 'original', 'title': 'Take Me Home (A Girl Like Me)', 'artist': 'Sophie Ellis-Bextor'},
+        {'item_id': 'mandatory-remix', 'title': 'Take Me Home (A Girl Like Me) (Jewels & Stone Mix)', 'artist': 'Sophie Ellis-Bextor'},
+        {'item_id': 'dopamine-a', 'title': 'Dopamine (Feat. Eyelar)', 'artist': 'Purple Disco Machine'},
+        {'item_id': 'dopamine-b', 'title': 'Dopamine', 'artist': 'Purple Disco Machine'},
+    ]
+    kept, removed = suppress_song_families(songs, mandatory_ids=['mandatory-remix'])
+    assert [song['item_id'] for song in kept] == ['mandatory-remix', 'dopamine-a', 'dopamine-b']
+    assert song_family_key(songs[2]) != song_family_key(songs[3])
+    assert removed == 1
+
+
+def test_intentionally_requested_versions_are_spaced_when_enough_tracks_exist():
+    from tasks.playlist_curation import suppress_song_families
+
+    songs = [
+        {'item_id': 'take-1', 'title': 'Take Me Home', 'artist': 'Artist A'},
+        *[{'item_id': f'other-{i}', 'title': f'Other {i}', 'artist': f'Artist {i}'} for i in range(6)],
+        {'item_id': 'take-2', 'title': 'Take Me Home (Radio Edit)', 'artist': 'Artist A'},
+    ]
+    kept, removed = suppress_song_families(songs, allow_multiple=True, min_spacing=5)
+    assert removed == 0
+    positions = [i for i, song in enumerate(kept) if song['item_id'].startswith('take-')]
+    assert positions[1] - positions[0] >= 6
+
+
 def test_curator_candidate_window_probe_checks_first_last_and_count(monkeypatch):
     import tasks.ai.api as api
     from tasks.playlist_curation import probe_curator_candidate_window

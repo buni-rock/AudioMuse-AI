@@ -1189,7 +1189,7 @@ _NAMED_SEED_CUES = (
     re.compile(r"\btracks?\s+like\s+", re.IGNORECASE),
     re.compile(r"\bbased\s+on\s+", re.IGNORECASE),
 )
-_SEED_HARD_BOUNDARY_RE = re.compile(r"[,!?;\n]|\.(?=\s|$)|\s+(?:songs?|tracks?|and|with|that|which)\b", re.IGNORECASE)
+_SEED_HARD_BOUNDARY_RE = re.compile(r"[,!?;\n]|\.(?=\s|$)|\s+(?:songs?|tracks?|and|with|that|which|but)\b", re.IGNORECASE)
 _SEED_CONTEXT_BOUNDARY_RE = re.compile(r"\s+(?:the\s+)?playlist\b", re.IGNORECASE)
 _SEED_FOR_BOUNDARY_RE = re.compile(r"\s+for\s+(?:(?:me|the|my|a|this)\b)", re.IGNORECASE)
 _SEED_BY_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
@@ -1287,6 +1287,99 @@ def extract_named_song_seed(text: str) -> Optional[str]:
     """Return the title extracted from explicit named-song wording."""
     details = extract_named_song_seed_details(text)
     return details.get("title") if details else None
+
+
+def extract_explicit_song_mentions(text: str) -> List[Dict[str, str]]:
+    """Extract explicit song references suitable for authoritative resolution.
+
+    This intentionally recognizes high-confidence conversational constructions
+    and reuses the seed parser. It does not try to identify every capitalized
+    phrase in arbitrary prose.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    mentions: List[Dict[str, str]] = []
+
+    def add(title: str, artist: str = "", start: int = -1):
+        title = _trim_seed_text(title)
+        artist = _trim_seed_text(artist, artist=True) if artist else ""
+        if not title or len(title) > 200:
+            return
+        key = (re.sub(r"\W+", "", title.casefold()), re.sub(r"\W+", "", artist.casefold()))
+        if not key[0] or any(m["_key"] == key for m in mentions):
+            return
+        mentions.append({"title": title, "artist": artist, "_key": key, "_start": start})
+
+    seed = extract_named_song_seed_details(text)
+    if seed:
+        add(seed.get("title", ""), seed.get("artist", ""), text.casefold().find(seed.get("title", "").casefold()))
+
+    patterns = (
+        re.compile(r"\b(?:i\s+)?(?:really\s+)?love\s+([^,.!?;\n]+?)\s+(?:from|by)\s+([^,.!?;\n]+)", re.I),
+        re.compile(r"\b(?:i\s+)?(?:really\s+)?love\s+([^,.!?;\n]+)", re.I),
+        re.compile(r"\b(?:songs?|tracks?)\s+(?:similar|like)\s+to\s+([^,.!?;\n]+?)\s+by\s+([^,.!?;\n]+)", re.I),
+        re.compile(r"\b(?:around|using|use|start(?:ing)?\s+from)\s+([^,.!?;\n]+?)\s+by\s+([^,.!?;\n]+)", re.I),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            if len(match.groups()) == 1 and re.search(r"\s+(?:from|by)\s+", match.group(1), re.I):
+                continue
+            add(match.group(1), match.group(2) if len(match.groups()) > 1 else "", match.start(1))
+
+    # Song lists commonly put an artist on every item. Split only on list
+    # separators so each title/artist pair remains independently resolvable.
+    for segment in re.split(r",\s*|\s+and\s+", text, flags=re.I):
+        segment = re.sub(r"^and\s+", "", segment.strip(), flags=re.I).rstrip(" .!?;")
+        match = re.search(r"\b(.+?)\s+by\s+([^,.!?;\n]+)$", segment, re.I)
+        if match:
+            title = match.group(1)
+            title = re.sub(r"^.*\b(?:around|use|using|include|mix|combine)\s+", "", title, flags=re.I)
+            add(title, match.group(2), text.find(match.group(1)))
+
+    use_list = re.search(r"\b(?:use|mix|combine|include)\s+(.+?)\s+as\s+(?:the\s+)?seeds?\b", text, re.I)
+    if use_list:
+        for part in re.split(r",\s*|\s+and\s+", use_list.group(1), flags=re.I):
+            possessive = re.match(r"(.+?)['’]s\s+(?:(?:song|track)\s+)?(.+)$", part.strip(), re.I)
+            if possessive:
+                add(possessive.group(2), possessive.group(1), use_list.start(1))
+            elif part.strip():
+                add(part, "", use_list.start(1) + use_list.group(1).find(part))
+
+    reference_only = re.search(
+        r"\b(?:use|using|take)\s+(.+?)\s+only\s+as\s+(?:a\s+)?reference\b", text, re.I
+    )
+    if reference_only:
+        add(reference_only.group(1), "", reference_only.start(1))
+
+    # Quoted title references are unambiguous; an optional trailing artist is
+    # captured when provided.
+    for match in re.finditer(r"[\"'`]([^\"'`]{2,200})[\"'`](?:\s+by\s+([^,.!?;\n]+))?", text, re.I):
+        add(match.group(1), match.group(2) or "", match.start(1))
+
+    # Requests such as “Mix Harvest and Mother Earth” explicitly name each
+    # title even without artist attribution.
+    mix = re.search(r"\b(?:mix|combine|include)\s+(.+?)(?:[.!?;\n]|$)", text, re.I)
+    if mix:
+        clause = mix.group(1)
+        for part in re.split(r"\s*,\s*|\s+and\s+", clause, flags=re.I):
+            part = re.sub(r"\s+(?:by|from)\s+.+$", "", part, flags=re.I).strip()
+            if part and len(part.split()) <= 8:
+                add(part, "", mix.start(1) + clause.find(part))
+
+    # A reference-only instruction and explicit omission both override the
+    # default anchor rule. Keep the reference available to the planner.
+    for mention in mentions:
+        title = mention["title"]
+        escaped = re.escape(title)
+        mention["excluded"] = bool(re.search(
+            rf"\b(?:do\s+not|don['’]?t|never)\s+(?:include|add|play)\s+(?:the\s+song\s+)?{escaped}\b"
+            rf"|\b{escaped}\b[^.!?\n]{{0,40}}\bonly\s+as\s+(?:a\s+)?reference\b",
+            text, re.I,
+        ))
+        mention.pop("_key", None)
+        mention.pop("_start", None)
+    return mentions
 
 
 def _synthesize_rescue_plan(

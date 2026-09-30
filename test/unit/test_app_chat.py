@@ -94,6 +94,64 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_appli
     return response
 
 
+def test_resolved_explicit_song_is_mandatory_and_first_in_native_playlist(monkeypatch):
+    import tasks.ai.tool_impl as tool_impl
+
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist='': {
+        'item_id': 'anchor', 'title': 'Harvest', 'author': 'Nightwish', 'album': 'HVMAN. :II: NATURE.'
+    })
+    songs = [
+        {'item_id': f'optional-{i}', 'title': f'Optional {i}', 'artist': f'Artist {i}'}
+        for i in range(5)
+    ]
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs,
+        {'n': 3, 'userInput': 'Songs similar to Harvest by Nightwish.'},
+        filter_applied=True,
+    )
+    assert len(response['query_results']) == 3
+    assert response['query_results'][0]['item_id'] == 'anchor'
+    assert 'Mandatory tracks present in final playlist: 1/1' in response['message']
+
+
+def test_explicitly_excluded_song_is_not_mandatory(monkeypatch):
+    import tasks.ai.tool_impl as tool_impl
+
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist='': {
+        'item_id': 'anchor', 'title': 'Harvest', 'author': 'Nightwish', 'album': 'Album'
+    })
+    songs = [
+        {'item_id': f'optional-{i}', 'title': f'Optional {i}', 'artist': f'Artist {i}'}
+        for i in range(5)
+    ]
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs,
+        {'n': 3, 'userInput': "Songs like Harvest but don't include Harvest."},
+        filter_applied=True,
+    )
+    assert all(song['item_id'] != 'anchor' for song in response['query_results'])
+    assert 'Mandatory tracks: 0' in response['message']
+
+
+def test_multiple_explicit_songs_raise_small_target_and_keep_mention_order(monkeypatch):
+    import tasks.ai.tool_impl as tool_impl
+
+    rows = {
+        'Harvest': {'item_id': 'harvest', 'title': 'Harvest', 'author': 'Nightwish'},
+        'Ghost Love Score': {'item_id': 'gls', 'title': 'Ghost Love Score', 'author': 'Nightwish'},
+    }
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist='': rows.get(title))
+    response = _run_pipeline_with_pool(
+        monkeypatch,
+        [{'item_id': 'other', 'title': 'Other Song', 'artist': 'Other Artist'}],
+        {'n': 1, 'userInput': 'Use Harvest and Ghost Love Score as seeds.'},
+        filter_applied=True,
+    )
+    assert [song['item_id'] for song in response['query_results']] == ['harvest', 'gls']
+    assert 'Effective target increased from 1 to 2' in response['message']
+    assert 'Mandatory tracks present in final playlist: 2/2' in response['message']
+
+
 class TestSeedSearchSongSeedValidation:
     @pytest.mark.parametrize(
         'title,artist',

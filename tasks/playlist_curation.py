@@ -332,6 +332,96 @@ def suppress_duplicate_title_artist(songs):
     return kept, len(songs) - len(kept)
 
 
+_VERSION_MARKER_RE = re.compile(
+    r"(?:remix|\b[a-z0-9 &'._-]*\bmix\b|radio\s+edit|single\s+edit|extended\s+edit|"
+    r"\bedit\b|instrumental|acoustic|demo|live(?:\s+version)?|remaster(?:ed)?|"
+    r"single\s+version|album\s+version|\bversion\b|mono\s+version|stereo\s+version)",
+    re.I,
+)
+_TRAILING_VERSION_RE = re.compile(
+    r"\s*(?:\(([^()]*)\)|\[([^\[\]]*)\]|\s[-–—]\s([^()\[\]]+))\s*$"
+)
+
+
+def song_family_key(song):
+    """Return artist plus conservative base-title identity for version grouping."""
+    artist = song.get("artist") or song.get("author") or ""
+    title = str(song.get("title") or "").strip()
+    while title:
+        match = _TRAILING_VERSION_RE.search(title)
+        if not match:
+            break
+        suffix = next((value for value in match.groups() if value is not None), "")
+        if not _VERSION_MARKER_RE.search(suffix):
+            break
+        title = title[:match.start()].strip()
+    # Recognize an unbracketed trailing edit/remix label too, without stripping
+    # collaboration annotations such as “(Feat. Eyelar)”.
+    title = re.sub(
+        r"\s+[-–—]\s+(?=[^ ]*(?:remix|mix|edit|live|instrumental|acoustic|remaster))[^()]+$",
+        "", title, flags=re.I,
+    ).strip()
+    artist_key = _normalized_content_text(artist)
+    title_key = _normalized_content_text(title)
+    return (artist_key, title_key) if artist_key and title_key else None
+
+
+def suppress_song_families(songs, mandatory_ids=(), allow_multiple=False, min_spacing=5):
+    """Suppress alternate versions before count selection, preserving ranked order.
+
+    Mandatory items take precedence over ranked optional variants. When a user
+    explicitly requests multiple versions, retain them and schedule each family
+    member with at least ``min_spacing`` intervening tracks when possible.
+    """
+    mandatory = {str(value) for value in mandatory_ids}
+    groups = {}
+    for song in songs:
+        key = song_family_key(song)
+        if key is not None:
+            groups.setdefault(key, []).append(song)
+    kept, suppressed = [], 0
+    for key, family in groups.items():
+        mandatory_family = [s for s in family if str(s.get("item_id")) in mandatory]
+        if mandatory_family:
+            chosen = mandatory_family if allow_multiple else mandatory_family[:1]
+        else:
+            chosen = family if allow_multiple else family[:1]
+        chosen_ids = {str(s.get("item_id")) for s in chosen}
+        suppressed += len(family) - len(chosen)
+    if not allow_multiple:
+        for song in songs:
+            key = song_family_key(song)
+            family = groups.get(key, []) if key is not None else [song]
+            mandatory_family = [s for s in family if str(s.get("item_id")) in mandatory]
+            winner_songs = mandatory_family or family[:1] or [song]
+            winners = {str(s.get("item_id")) for s in winner_songs}
+            if str(song.get("item_id")) in winners:
+                kept.append(song)
+        return kept, suppressed
+
+    # Stable greedy spacing: defer a repeated family member until enough other
+    # tracks have been placed, then append any unavoidable leftovers at the end.
+    pending = list(songs)
+    last_position = {}
+    while pending:
+        progress = False
+        deferred = []
+        for song in pending:
+            key = song_family_key(song)
+            if key is None or key not in last_position or len(kept) - last_position[key] > min_spacing:
+                kept.append(song)
+                if key is not None:
+                    last_position[key] = len(kept) - 1
+                progress = True
+            else:
+                deferred.append(song)
+        if not progress:
+            kept.extend(deferred)
+            break
+        pending = deferred
+    return kept, suppressed
+
+
 def curate_candidates_with_llm(
     user_request, songs, mode, ai_config, limit=100, include_audio=False,
     log_messages=None, target_count=None, resolved_seed=None,
