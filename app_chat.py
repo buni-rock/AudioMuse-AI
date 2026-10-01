@@ -250,7 +250,7 @@ def _resolve_target_song_count(data):
 
 
 def _resolve_llm_song_target(data, requested_count=None):
-    """Apply the UI count and server hard cap to LLM selection modes."""
+    """Return a request count without applying the retired 30-track LLM cap."""
     raw_ui_count = (data or {}).get('n')
     if raw_ui_count is None:
         ui_cap = int(config.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS)
@@ -259,18 +259,15 @@ def _resolve_llm_song_target(data, requested_count=None):
             ui_cap = max(1, int(raw_ui_count))
         except (TypeError, ValueError):
             ui_cap = int(config.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS)
-    hard_max = max(1, int(config.INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS))
-    request_cap = min(ui_cap, hard_max)
-    effective_target = min(int(requested_count), request_cap) if requested_count else request_cap
-    return effective_target, ui_cap, hard_max
+    maximum = max(1, int(config.INSTANT_PLAYLIST_MAX_N_RESULTS))
+    effective_target = min(maximum, max(1, int(requested_count))) if requested_count else min(ui_cap, maximum)
+    return effective_target, ui_cap, maximum
 
 
 def _resolve_llm_candidate_limit(effective_target):
-    return min(
-        max(1, int(config.INSTANT_PLAYLIST_LLM_MAX_CANDIDATES)),
-        max(30, int(effective_target) * 2),
-        max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
-    )
+    del effective_target
+    configured = max(0, int(config.INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES))
+    return configured or None
 
 
 _CLOUD_KEY_CHECKS = {
@@ -358,9 +355,14 @@ def _missing_cloud_api_key(ai_provider, ai_secrets):
                             },
                             'n': {
                                 'type': 'integer',
-                                'description': 'Number of songs the playlist should aim for. Defaults to INSTANT_PLAYLIST_DEFAULT_N_RESULTS. The API applies no upper bound (INSTANT_PLAYLIST_MAX_N_RESULTS only caps the chat page input).',
+                                'description': 'UI default song count for LLM Compose when the request does not specify a count; explicit natural-language counts are interpreted by LLM2. Final size is bounded by INSTANT_PLAYLIST_MAX_N_RESULTS.',
                                 'example': 50,
                                 'minimum': 1,
+                            },
+                            'selection_mode': {
+                                'type': 'string',
+                                'enum': ['NATIVE', 'LLM_COMPOSE'],
+                                'description': 'Final selection strategy. Legacy LLM_RERANK and LLM_CURATE values map to LLM_COMPOSE.',
                             },
                         },
                     }
@@ -635,20 +637,11 @@ def _run_chat_pipeline(data, log_messages):
     logger.debug("chat_playlist_api called. Raw request data: %s", data_for_log)
 
     from tasks.ai.tools import get_mcp_tools
-    from tasks.ai.planner import (
-        extract_explicit_song_mentions, extract_named_song_seed_details,
-        plan_and_execute_once, requested_playlist_shape,
-    )
+    from tasks.ai.planner import plan_and_execute_once
 
     original_user_input = data.get('userInput')
-    # Detect if user's request mentions ratings (guard against AI hallucinating rating filters)
-    _user_wants_rating = bool(
-        re.search(
-            r'\b(rat(ed|ing|ings)|stars?|⭐|favorit|best[\s-]?rated|top[\s-]?rated|highly[\s-]?rated)\b',
-            original_user_input,
-            re.IGNORECASE,
-        )
-    )
+    # Rating intent is supplied by the structured planner interpretation.
+    _user_wants_rating = False
     ai_provider = data.get('ai_provider', config.AI_MODEL_PROVIDER).upper()
     ai_model_from_request = data.get('ai_model')
 
@@ -745,123 +738,30 @@ def _run_chat_pipeline(data, log_messages):
 
     log_messages.append("\nUsing MCP Agentic Workflow for playlist generation")
     selection_mode = str(data.get('selection_mode') or config.INSTANT_PLAYLIST_SELECTION_MODE).upper()
-    if selection_mode not in {'NATIVE', 'LLM_RERANK', 'LLM_CURATE'}:
-        selection_mode = 'NATIVE'
-    target_song_count = _resolve_target_song_count(data)
-    shape = requested_playlist_shape(original_user_input)
-    duration_only = bool(shape.get('total_seconds')) and not shape.get('song_count')
     if selection_mode in {'LLM_RERANK', 'LLM_CURATE'}:
-        requested_song_count = shape.get('song_count')
-        target_song_count, ui_song_cap, llm_hard_max = _resolve_llm_song_target(
-            data, requested_song_count
-        )
-        if requested_song_count is not None:
-            log_messages.append(f"Requested song count: {requested_song_count}")
-        log_messages.append(f"UI song cap: {ui_song_cap}")
-        log_messages.append(f"LLM hard maximum: {llm_hard_max}")
-        log_messages.append(f"Effective song target: {target_song_count}")
-        if selection_mode == 'LLM_RERANK':
-            log_messages.append(f"Effective final target: {target_song_count}")
+        selection_mode = 'LLM_COMPOSE'
+    if selection_mode not in {'NATIVE', 'LLM_COMPOSE'}:
+        selection_mode = 'NATIVE'
+    is_llm_compose = selection_mode == 'LLM_COMPOSE'
+    target_song_count = _resolve_target_song_count(data)
+    # Native mode keeps its planner-owned request shape. LLM Compose only uses
+    # this count as a retrieval/default hint; LLM2 owns final playlist semantics.
+    shape = {}
+    duration_only = False
+    ui_song_cap = int(config.INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS)
+    if is_llm_compose:
+        target_song_count, ui_song_cap, _ = _resolve_llm_song_target(data, None)
+        log_messages.append(f"UI default song count: {ui_song_cap}")
+        log_messages.append(f"Retrieval sizing default: {target_song_count}")
         llm_candidate_limit = _resolve_llm_candidate_limit(target_song_count)
-        log_messages.append(f"LLM candidate limit: {llm_candidate_limit}")
+        log_messages.append(f"Configured composer capacity: {llm_candidate_limit or 'unlimited'}")
+        max_final_count = None
     else:
         llm_candidate_limit = None
-        if shape.get('song_count'):
-            target_song_count = shape['song_count']
-            log_messages.append(f"The request asks for exactly {target_song_count} songs")
-        elif shape.get('total_seconds'):
-            target_song_count = min(
-                config.INSTANT_PLAYLIST_MAX_N_RESULTS,
-                max(100, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
-            )
-    if shape.get('total_seconds'):
-        log_messages.append("Duration constraint detected")
-        log_messages.append(f"Target duration: {int(shape['total_seconds'])} s")
-        log_messages.append("Tolerance: 15 s")
-        log_messages.append(f"Duration candidate target: at most {target_song_count}; final count is selected from actual durations")
-    elif selection_mode == 'NATIVE':
-        log_messages.append(f"Target: {target_song_count} songs")
-    log_messages.append(f"Candidate target: {target_song_count} songs")
+        max_final_count = int(config.INSTANT_PLAYLIST_MAX_N_RESULTS)
 
     mandatory_seed = None
     mandatory_tracks = []
-    seed_details = extract_named_song_seed_details(original_user_input)
-    seed_text = seed_details.get('title') if seed_details else None
-    seed_artist_hint = seed_details.get('artist', '') if seed_details else ''
-    explicit_mentions = extract_explicit_song_mentions(original_user_input)
-    log_messages.append(f"Explicit song mentions detected: {len(explicit_mentions)}")
-    if seed_text and not any(m['title'].casefold() == seed_text.casefold() for m in explicit_mentions):
-        explicit_mentions.insert(0, {
-            'title': seed_text, 'artist': seed_artist_hint, 'excluded': False,
-        })
-    if explicit_mentions:
-        try:
-            from tasks.ai.tool_impl import resolve_song_by_title
-        except Exception:
-            resolve_song_by_title = None
-        resolved_rows = []
-        for mention in explicit_mentions:
-            title = mention['title']
-            artist_hint = mention.get('artist') or ''
-            if seed_text and title.casefold() == seed_text.casefold() and seed_artist_hint:
-                artist_hint = seed_artist_hint
-            log_messages.append(f"Explicit song requested: {title}" + (f" by {artist_hint}" if artist_hint else ""))
-            try:
-                row = resolve_song_by_title(title, artist_hint) if resolve_song_by_title else None
-            except Exception:
-                logger.exception("Could not resolve explicit song mention")
-                row = None
-            if not row:
-                continue
-            track = {
-                'item_id': row.get('item_id'),
-                'title': row.get('title') or title,
-                'artist': row.get('author') or row.get('artist') or artist_hint,
-                'album': row.get('album') or '',
-            }
-            if not track['item_id']:
-                continue
-            resolved_rows.append((mention, track))
-            if seed_text and title.casefold() == seed_text.casefold():
-                mandatory_seed = track
-            if not mention.get('excluded'):
-                mandatory_tracks.append({**track, 'reason': 'explicit_song_mention'})
-        # De-duplicate repeated mentions by canonical library track ID.
-        unique_tracks = []
-        seen_track_ids = set()
-        for track in mandatory_tracks:
-            key = str(track['item_id'])
-            if key not in seen_track_ids:
-                seen_track_ids.add(key)
-                unique_tracks.append(track)
-        mandatory_tracks = unique_tracks
-        log_messages.append(f"Resolved explicit tracks: {len(resolved_rows)}")
-        log_messages.append(f"Mandatory tracks: {len(mandatory_tracks)}")
-        if seed_text:
-            seed_match = next((r for m, r in resolved_rows if m['title'].casefold() == seed_text.casefold()), None)
-            if seed_match:
-                log_messages.append(f"Seed resolved: {seed_match['title']} by {seed_match['artist']}")
-            else:
-                log_messages.append("Seed resolved: false; title was not found in the library")
-        if mandatory_tracks:
-            scoped_mandatory = app_server_context.scope_results(
-                mandatory_tracks, None, id_key='item_id', translate=False
-            )
-            scoped_ids = {str(t['item_id']) for t in scoped_mandatory}
-            mandatory_tracks = [t for t in mandatory_tracks if str(t['item_id']) in scoped_ids]
-        if mandatory_seed:
-            scoped_seed = app_server_context.scope_results(
-                [mandatory_seed], None, id_key='item_id', translate=False
-            )
-            if scoped_seed:
-                mandatory_seed = scoped_seed[0]
-        if len(mandatory_tracks) > target_song_count:
-            log_messages.append(
-                f"Effective target increased from {target_song_count} to {len(mandatory_tracks)} "
-                f"because {len(mandatory_tracks)} explicit mandatory tracks were requested"
-            )
-            target_song_count = len(mandatory_tracks)
-        log_messages.append(f"Mandatory tracks available on selected server: {len(mandatory_tracks)}")
 
     # Get MCP tools and library context
     mcp_tools = get_mcp_tools()
@@ -880,12 +780,12 @@ def _run_chat_pipeline(data, log_messages):
 
     from config import MAX_SONGS_PER_ARTIST_PLAYLIST
 
-    collection_cap = max(1000, target_song_count * 10)
+    collection_cap = config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES
 
     planner_request = (
-        f'Build a playlist for: "{original_user_input}"'
-        if duration_only else
-        f'Build a {target_song_count}-song playlist for: "{original_user_input}"'
+        f"{original_user_input}\n\n"
+        f"UI Number of songs setting: {target_song_count}. This is a retrieval sizing default only; "
+        "if the request explicitly contains a numeric song count, use it as the retrieval size hint."
     )
     plan_result = yield from plan_and_execute_once(
         user_message=planner_request,
@@ -897,7 +797,8 @@ def _run_chat_pipeline(data, log_messages):
         collection_cap=collection_cap,
         target_song_count=target_song_count,
         raw_user_request=original_user_input,
-        resolved_seed=mandatory_seed,
+        max_final_count=max_final_count,
+        retrieval_only=is_llm_compose,
     )
 
     if 'error' in plan_result:
@@ -919,10 +820,84 @@ def _run_chat_pipeline(data, log_messages):
 
     all_songs = plan_result['songs']
     song_sources = plan_result['song_sources']
+    seed_provenance = plan_result.get('seed_provenance') or {}
     tools_used_history = plan_result['tools_used_history']
     plan_notes = plan_result.get('plan_notes', [])
     executed_query_str = plan_result['executed_query_str']
     filter_applied = plan_result.get('filter_applied', False)
+    semantic_intent = plan_result.get('intent') or {}
+    mandatory_tracks = list(plan_result.get('mandatory_tracks') or [])
+    resolved_anchors = list(plan_result.get('canonical_retrieval_anchors') or
+                            semantic_intent.get('canonical_retrieval_anchors') or [])
+    if is_llm_compose:
+        log_messages.append(f"Canonical anchors handed to Composer: {len(resolved_anchors)}")
+    excluded_tracks = list(plan_result.get('excluded_tracks') or [])
+    excluded_song_ids = {str(track['item_id']) for track in excluded_tracks if track.get('item_id') is not None}
+    if excluded_song_ids:
+        before_exclusions = len(all_songs)
+        if not is_llm_compose:
+            all_songs = [song for song in all_songs if str(song.get('item_id')) not in excluded_song_ids]
+        log_messages.append(f"Planner exclusions applied: {before_exclusions - len(all_songs)} excluded song(s) removed")
+    if is_llm_compose:
+        # LLM1 resolves retrieval references only. Give LLM2 the resolved track
+        # even when the planner described it as excluded/reference-only; LLM2
+        # decides whether it belongs in the final playlist.
+        mandatory_tracks = []
+        existing_ids = {str(song.get('item_id')) for song in all_songs}
+        for anchor in resolved_anchors:
+            track = anchor.get('resolved_track') if isinstance(anchor, dict) else None
+            if isinstance(track, dict) and track.get('item_id') is not None:
+                if str(track['item_id']) not in existing_ids:
+                    all_songs.append(track)
+                    existing_ids.add(str(track['item_id']))
+    for neighborhood, ids in seed_provenance.items():
+        log_messages.append(f"Per-seed candidate count: {neighborhood}: {len(ids)}")
+    if seed_provenance:
+        log_messages.append(f"Seed neighborhoods represented at retrieval: {len(seed_provenance)}")
+    if mandatory_tracks and not is_llm_compose:
+        scoped_mandatory = app_server_context.scope_results(
+            mandatory_tracks, None, id_key='item_id', translate=False
+        )
+        scoped_ids = {str(track['item_id']) for track in scoped_mandatory}
+        mandatory_tracks = [
+            track for track in mandatory_tracks if str(track['item_id']) in scoped_ids
+        ]
+        log_messages.append(f"Mandatory tracks available on selected server: {len(mandatory_tracks)}")
+    if not is_llm_compose:
+        log_messages.append(f"Mandatory tracks: {len(mandatory_tracks)}")
+    mandatory_seed = next(iter(mandatory_tracks), None)
+    shape = {
+        'total_seconds': plan_result.get('target_duration_seconds'),
+        'song_count': plan_result.get('requested_final_count'),
+        'max_per_artist': (semantic_intent.get('constraints') or {}).get('max_per_artist', plan_result.get('max_per_artist')),
+    }
+    semantic_target = None if is_llm_compose else plan_result.get('requested_final_count')
+    if semantic_target is not None:
+        log_messages.append(f"Requested final total: {semantic_target}")
+        if is_llm_compose:
+            target_song_count, ui_song_cap, _ = _resolve_llm_song_target(
+                data, semantic_target
+            )
+            target_song_count = max(len(mandatory_tracks), target_song_count)
+            llm_candidate_limit = _resolve_llm_candidate_limit(target_song_count)
+            log_messages.append(f"Effective final target: {target_song_count}")
+            log_messages.append(
+                f"Request was capped: {'yes' if target_song_count < semantic_target else 'no'}"
+            )
+        else:
+            target_song_count = max(len(mandatory_tracks), semantic_target)
+    elif shape.get('total_seconds') is None and not is_llm_compose:
+        log_messages.append(f"Target: {target_song_count} songs")
+    if len(mandatory_tracks) > target_song_count:
+        log_messages.append(
+            f"Effective target increased from {target_song_count} to {len(mandatory_tracks)} "
+            "to preserve every mandatory planner anchor"
+        )
+        target_song_count = len(mandatory_tracks)
+    if shape.get('total_seconds'):
+        log_messages.append("Duration constraint detected from planner intent")
+        log_messages.append(f"Target duration: {int(shape['total_seconds'])} s")
+        log_messages.append("Tolerance: 15 s")
 
     # Keep canonical ids here: this pool is filtered for availability but stays
     # internal - it feeds playlist selection and create_instant_playlist_for_server,
@@ -951,8 +926,6 @@ def _run_chat_pipeline(data, log_messages):
 
     log_messages.append(f"\nSelection mode: {selection_mode}")
     log_messages.append(f"Candidates retrieved: {len(all_songs)}")
-    if selection_mode == 'LLM_RERANK':
-        log_messages.append(f"AudioMuse candidates retrieved: {len(all_songs)}")
     from tasks.playlist_curation import suppress_duplicate_title_artist
     all_songs, title_artist_duplicates = suppress_duplicate_title_artist(all_songs)
     if title_artist_duplicates:
@@ -965,76 +938,164 @@ def _run_chat_pipeline(data, log_messages):
         log_messages.append(f"Candidates shortlisted for LLM: {min(len(all_songs), llm_candidate_limit)}")
     selection_source = 'native'
     candidates_sent = 0
-    if selection_mode != 'NATIVE' and all_songs:
-        log_messages.append("Curating candidate songs...")
+    candidates_retrieved_before_composer = len(all_songs)
+    llm_selection_started = None
+    playlist_rules_started = None
+    composition_result = None
+    composer_requested_target = None
+    composer_requested_output = None
+    composer_target_mode = None
+    composer_duration_diagnostics = None
+    composer_shortfall_reason = None
+    composer_failure_category = None
+    composer_failure_reason = None
+    if is_llm_compose and all_songs:
+        log_messages.append("Composing final playlist...")
         yield
-        candidates_sent = min(len(all_songs), llm_candidate_limit)
-        log_messages.append(f"Shortlisted for LLM: {candidates_sent}")
         try:
-            from tasks.playlist_curation import curate_candidates_with_llm, rank_candidates_by_ids
-            valid_ids, candidates_sent = curate_candidates_with_llm(
-                original_user_input, all_songs, selection_mode, ai_config_with_secrets,
-                limit=candidates_sent,
-                include_audio=config.INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES,
+            from tasks.playlist_curation import compose_playlist_with_llm
+            llm_selection_started = time.monotonic()
+            composition_result, candidates_sent = compose_playlist_with_llm(
+                original_user_input, all_songs, ai_config_with_secrets,
+                seed_provenance=seed_provenance,
+                resolved_anchors=resolved_anchors,
+                ui_default_count=ui_song_cap,
                 log_messages=log_messages,
-                target_count=target_song_count,
-                resolved_seed=mandatory_seed,
             )
+            if composition_result.get('error'):
+                failure = composition_result['error']
+                category = failure.get('category', 'SCHEMA_MISMATCH') if isinstance(failure, dict) else 'SCHEMA_MISMATCH'
+                reason = failure.get('reason', 'Composer response could not be validated.') if isinstance(failure, dict) else str(failure)
+                composer_failure_category = category
+                composer_failure_reason = reason
+                log_messages.append(f"Playlist composition failed: {category}")
+                if category == 'TIMEOUT':
+                    log_messages.append(
+                        f"{candidates_sent} candidate songs were retrieved, but the LLM composer timed out before it could build the final playlist."
+                    )
+                elif category == 'OUTPUT_LIMIT':
+                    log_messages.append(
+                        f"{candidates_sent} candidate songs were retrieved, but the LLM composer exhausted its output-token budget before returning a complete playlist."
+                    )
+                else:
+                    # Provider errors may contain the model's entire malformed
+                    # response. Keep technical logs useful without echoing it.
+                    log_messages.append(f"Composer failure detail: {str(reason)[:500]}")
+                selection_source = 'LLM compose failed'
+                all_songs = []
+                composer_shortfall_reason = f"{category}: {reason}"
+                raise ValueError(category)
+            all_songs = list(composition_result.get('playlist') or [])
+            output_shape = composition_result.get('requested_output') or {}
+            composer_requested_output = output_shape
+            composer_shortfall_reason = composition_result.get('shortfall_reason')
+            target_song_count = output_shape.get('target_count')
+            duration_target = output_shape.get('target_duration_seconds')
+            composer_target_mode = (
+                'COUNT_AND_DURATION' if target_song_count is not None and duration_target is not None else
+                'DURATION' if duration_target is not None else
+                'COUNT' if target_song_count is not None else 'OPEN'
+            )
+            log_messages.append(f"Composer semantic target_count: {target_song_count if target_song_count is not None else 'none'}")
+            log_messages.append(f"Composer semantic target_duration: {str(duration_target) + ' s' if duration_target is not None else 'none'}")
+            log_messages.append(f"Composer preferred tracks returned: {len(all_songs)}")
+            include_decisions = [
+                d for d in composition_result.get('anchor_decisions', [])
+                if isinstance(d, dict) and d.get('include') is True
+            ]
+            log_messages.append(
+                f"Composer anchors preserved: {len(include_decisions)}/{len(composition_result.get('anchor_decisions', []))}"
+            )
+            infra_max = max(1, int(config.INSTANT_PLAYLIST_MAX_N_RESULTS))
+            if (target_song_count is not None and target_song_count > infra_max) or len(all_songs) > infra_max:
+                raise ValueError(
+                    f"Composer target or result exceeds the configured {infra_max}-track infrastructure limit."
+                )
+            composer_requested_target = target_song_count
+            if duration_target is not None:
+                from tasks.ai.tool_impl import _fetch_pool_features
+                from tasks.playlist_curation import finalize_composer_duration
+                song_anchors = [a for a in resolved_anchors if isinstance(a, dict) and a.get('type') == 'song']
+                anchor_by_ref = {
+                    f'A{index:03d}': anchor for index, anchor in enumerate(song_anchors, 1)
+                }
+                required_ids = [
+                    anchor_by_ref[d['id']]['resolved_track']['item_id']
+                    for d in include_decisions if d.get('id') in anchor_by_ref
+                ]
+                preferred_count = len(all_songs)
+                duration_rows = _fetch_pool_features([song['item_id'] for song in all_songs])
+                tolerance = config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS
+                all_songs, actual_duration_seconds, composer_duration_diagnostics = finalize_composer_duration(
+                    all_songs, duration_rows, duration_target,
+                    target_count=target_song_count, required_ids=required_ids,
+                    tolerance_seconds=tolerance,
+                )
+                details = composer_duration_diagnostics
+                log_messages.extend([
+                    'Duration optimizer:',
+                    f"  candidates considered: {preferred_count}",
+                    f"  required anchors: {len(required_ids)}",
+                    f"  target: {int(duration_target)} s",
+                    f"  selected tracks: {len(all_songs)}",
+                    f"  actual: {actual_duration_seconds if actual_duration_seconds is not None else 'unknown'} s",
+                    f"  error: {details.get('error_seconds', 'unknown')} s",
+                    f"  within tolerance: {'yes' if details.get('within_tolerance') else 'no'}",
+                ])
+                if actual_duration_seconds is not None:
+                    actual_text = f"{actual_duration_seconds // 60}:{actual_duration_seconds % 60:02d}"
+                    target_text = f"{int(duration_target) // 60}:{int(duration_target) % 60:02d}"
+                    label = 'Validated playlist' if details.get('within_tolerance') and not details.get('reason') else 'Closest playlist'
+                    log_messages.append(f"{label}: {len(all_songs)} tracks · {actual_text} / {target_text}")
+            # Composer membership is final for count-only requests and the
+            # preference set for duration requests. Neither changes the
+            # semantic target_count returned by LLM2.
+            shape['total_seconds'] = output_shape.get('target_duration_seconds')
+            shape['song_count'] = output_shape.get('target_count')
+            semantic_intent = {}  # LLM1 semantics are not authoritative in compose mode.
+            selection_source = 'LLM compose only'
+            song_sources = {song['item_id']: 0 for song in all_songs}
+            if composer_requested_target is not None:
+                log_messages.append(f"Final count target interpreted by composer: {composer_requested_target}")
+            log_messages.append(f"Final playlist IDs returned: {len(all_songs)}")
+            if composition_result.get('shortfall_reason'):
+                log_messages.append(f"Composer reported shortfall: {composition_result['shortfall_reason']}")
         except Exception as exc:
-            logger.exception("Playlist curator failed")
-            valid_ids = []
-            log_messages.append(f"LLM curator failed: {type(exc).__name__}")
-        log_messages.append(f"Candidates sent to LLM: {candidates_sent}")
-        log_messages.append("Validating curated tracks; only exact candidate IDs are accepted")
-        log_messages.append(f"Valid aliases after validation: {len(valid_ids)}")
-        curator_action = "LLM ranked" if selection_mode == 'LLM_RERANK' else "LLM selected"
-        log_messages.append(f"{curator_action}: {len(valid_ids)}")
-        if not valid_ids:
-            if selection_mode == 'LLM_RERANK':
-                log_messages.append("LLM rerank unusable: zero valid aliases")
-            log_messages.append("LLM curator failed: no exact valid candidate IDs; falling back to native ranking")
-            selection_mode = 'NATIVE'
-            selection_source = 'native fallback'
-        else:
-            all_songs = rank_candidates_by_ids(
-                all_songs, valid_ids, mandatory_ids=mandatory_seed_ids,
-                # Successful LLM selection defines the complete candidate pool.
-                include_unselected=False,
-            )
-            log_messages.append("Native supplementation: disabled")
-            if selection_mode == 'LLM_RERANK':
-                selection_source = 'LLM rerank only'
-                log_messages.append(f"LLM reranked candidates: {len(valid_ids)}")
-                log_messages.append(f"Candidate pool after LLM rerank: {len(all_songs)}")
-                if mandatory_seed_ids and not any(
-                    str(item_id) in {str(candidate_id) for candidate_id in valid_ids}
-                    for item_id in mandatory_seed_ids
-                ):
-                    log_messages.append("Mandatory seed added outside reranked list: true")
-            else:
-                selection_source = 'LLM curate only'
-                log_messages.append(f"Curator selected: {len(valid_ids)} tracks")
-                log_messages.append(f"Candidate pool after LLM curate: {len(all_songs)}")
-            log_messages.append(f"Selection strategy: {selection_source}")
-            song_sources = {s['item_id']: 0 for s in all_songs}
-    elif selection_mode != 'NATIVE':
-        log_messages.append(f"Selection mode: {selection_mode}; no candidates available")
-
+            logger.exception("Playlist composition failed")
+            if selection_source != 'LLM compose failed':
+                composer_failure_category = 'SCHEMA_MISMATCH'
+                composer_failure_reason = str(exc)
+                log_messages.append("Playlist composition failed: SCHEMA_MISMATCH")
+            composition_result = None
+            all_songs = []
+            selection_source = 'LLM compose failed'
+        finally:
+            if llm_selection_started is not None:
+                log_messages.append(f"Playlist composition wall-clock: {time.monotonic() - llm_selection_started:.1f}s")
+        playlist_rules_started = time.monotonic()
+    elif is_llm_compose:
+        log_messages.append("Playlist composition skipped: no candidates are available")
+        selection_source = 'LLM compose failed'
+    else:
+        selection_source = 'native'
+    if playlist_rules_started is None:
+        playlist_rules_started = time.monotonic()
     from tasks.playlist_curation import song_family_key, suppress_song_families
-    allow_multiple_versions = bool(re.search(
-        r"\b(?:remixes|different versions|multiple versions|alternate mixes|live versions|include both versions|various versions)\b",
-        original_user_input or "", re.I,
-    ))
+    allow_multiple_versions = bool((semantic_intent.get('constraints') or {}).get('allow_multiple_versions'))
     before_family_filter = list(all_songs)
     family_groups = {}
     for song in before_family_filter:
         family_key = song_family_key(song)
         if family_key:
             family_groups.setdefault(family_key, []).append(song)
-    all_songs, family_suppressed = suppress_song_families(
-        all_songs, mandatory_ids=mandatory_seed_ids,
-        allow_multiple=allow_multiple_versions, min_spacing=5,
-    )
+    if is_llm_compose:
+        # LLM2 has already decided whether song-family variants belong.
+        family_suppressed = 0
+    else:
+        all_songs, family_suppressed = suppress_song_families(
+            all_songs, mandatory_ids=mandatory_seed_ids,
+            allow_multiple=allow_multiple_versions, min_spacing=5,
+        )
     if family_suppressed:
         retained_ids = {str(song.get('item_id')) for song in all_songs}
         for family in family_groups.values():
@@ -1053,33 +1114,36 @@ def _run_chat_pipeline(data, log_messages):
     log_messages.append(f"Selection source: {selection_source}")
     if selection_source == 'native fallback':
         log_messages.append("Selection strategy: native fallback")
-    log_messages.append(
-        f"\nCollected {len(all_songs)} songs (target {target_song_count}, cap {collection_cap})"
-    )
+    if is_llm_compose and selection_source == 'LLM compose failed':
+        log_messages.append(
+            f"\nFinal playlist unavailable; UI default target: {ui_song_cap}; "
+            f"retrieved candidates before Composer: {candidates_retrieved_before_composer}"
+        )
+    else:
+        if is_llm_compose and composer_target_mode == 'DURATION':
+            log_messages.append(f"\nValidated playlist: {len(all_songs)} tracks for {int(shape['total_seconds'])} s target")
+        else:
+            log_messages.append(
+                f"\nCollected {len(all_songs)} songs (target "
+                f"{(composer_requested_target if composer_requested_target is not None else 'unspecified') if is_llm_compose else target_song_count}, "
+                f"cap {collection_cap})"
+            )
 
     yield
 
     # Prepare final results
-    actual_duration_seconds = None
-    if all_songs:
+    actual_duration_seconds = (
+        composer_duration_diagnostics.get('actual_seconds')
+        if composer_duration_diagnostics else None
+    )
+    if all_songs or (is_llm_compose and composer_duration_diagnostics):
         # NOTE: rating is NOT hard-filtered here. Like every other filter dim it
         # is applied as a SOFT re-rank inside tasks.ai.rerank (rating/5
         # gradient), so high-rated songs float up but nothing is removed.
 
         # --- Phase 1: Artist Diversity Cap on full collected pool ---
         requested_cap = plan_result.get('max_per_artist')
-        max_per_artist = requested_cap or MAX_SONGS_PER_ARTIST_PLAYLIST
-        if selection_source in {'LLM rerank only', 'LLM curate only'}:
-            artist_fraction = config.INSTANT_PLAYLIST_MAX_ARTIST_FRACTION
-            absolute_cap = requested_cap or MAX_SONGS_PER_ARTIST_PLAYLIST
-            from tasks.playlist_curation import effective_llm_artist_cap
-            max_per_artist = effective_llm_artist_cap(
-                target_song_count, absolute_cap, artist_fraction,
-            )
-            log_messages.append(
-                f"Dynamic LLM artist cap: {max_per_artist}/artist "
-                f"(target {target_song_count} x {artist_fraction:.0%}, absolute cap {absolute_cap})"
-            )
+        max_per_artist = len(all_songs) if is_llm_compose else (requested_cap or MAX_SONGS_PER_ARTIST_PLAYLIST)
         artist_song_counts = {}
         diversified_pool = []
         diversity_overflow = []
@@ -1098,14 +1162,48 @@ def _run_chat_pipeline(data, log_messages):
                 f"\nArtist diversity: removed {diversity_removed} excess songs from pool (max {max_per_artist}/artist)"
             )
 
+        if (
+            selection_source in {'LLM rerank only', 'LLM curate only'}
+            and semantic_target is not None
+            and len(diversified_pool) < target_song_count
+        ):
+            log_messages.append(
+                f"LLM selection unusable after artist diversity: {len(diversified_pool)} candidates cannot satisfy "
+                f"the requested final count of {target_song_count}"
+            )
+            log_messages.append("LLM candidate pool discarded; full native fallback selected")
+            selection_mode = 'NATIVE'
+            selection_source = 'native fallback'
+            all_songs, _ = suppress_song_families(
+                native_candidate_pool, mandatory_ids=mandatory_seed_ids,
+                allow_multiple=allow_multiple_versions, min_spacing=5,
+            )
+            artist_song_counts = {}
+            diversified_pool = []
+            diversity_overflow = []
+            for song in all_songs:
+                artist = song.get('artist', 'Unknown')
+                artist_song_counts[artist] = artist_song_counts.get(artist, 0) + 1
+                if str(song.get('item_id')) in mandatory_id_set or artist_song_counts[artist] <= max_per_artist:
+                    diversified_pool.append(song)
+                else:
+                    diversity_overflow.append(song)
+
         optimized_duration = False
         duration_target_seconds = shape.get('total_seconds')
-        if duration_target_seconds is not None and duration_target_seconds > 0:
+        if duration_target_seconds is not None and duration_target_seconds > 0 and not is_llm_compose:
             log_messages.append("Duration optimizer:")
             try:
                 from tasks.ai.tool_impl import _fetch_pool_features
                 from tasks.playlist_curation import optimize_playlist_duration
-                optimizer_limit = min(100, max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)))
+                optimizer_limit = min(
+                    len(diversified_pool),
+                    config.INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES,
+                )
+                if optimizer_limit < len(diversified_pool):
+                    log_messages.append(
+                        f"Configured duration optimizer limit applied: {len(diversified_pool)} -> {optimizer_limit}"
+                    )
                 if selection_source in {'LLM rerank only', 'LLM curate only'}:
                     optimizer_limit = min(target_song_count, len(diversified_pool))
                 optimizer_pool = diversified_pool[:optimizer_limit]
@@ -1151,14 +1249,13 @@ def _run_chat_pipeline(data, log_messages):
                     for song in all_songs:
                         artist = song.get('artist', 'Unknown')
                         artist_song_counts[artist] = artist_song_counts.get(artist, 0) + 1
-                        if artist_song_counts[artist] <= max_per_artist:
+                        if str(song.get('item_id')) in mandatory_id_set or artist_song_counts[artist] <= max_per_artist:
                             diversified_pool.append(song)
                         else:
                             diversity_overflow.append(song)
                     optimizer_limit = min(
-                        100,
-                        max(1, int(config.INSTANT_PLAYLIST_LLM_CANDIDATE_POOL)),
-                        target_song_count,
+                        config.INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES,
+                        len(diversified_pool), target_song_count,
                     )
                     optimizer_pool = diversified_pool[:optimizer_limit]
                     if mandatory_seed_ids:
@@ -1257,7 +1354,9 @@ def _run_chat_pipeline(data, log_messages):
                 logger.exception("Duration optimization failed")
                 final_query_results_list = [s for s in diversified_pool if str(s.get('item_id')) in {str(i) for i in mandatory_seed_ids}]
         # --- Phase 2: Proportional sampling from diversified pool ---
-        if optimized_duration:
+        if is_llm_compose:
+            final_query_results_list = list(diversified_pool)
+        elif optimized_duration:
             pass
         elif len(diversified_pool) <= target_song_count:
             # Not enough songs after diversity cap - use all, then backfill from overflow
@@ -1328,7 +1427,7 @@ def _run_chat_pipeline(data, log_messages):
 
             final_query_results_list = final_query_results_list[:target_song_count]
 
-        if shape.get('total_seconds') is not None and not shape.get('song_count') and not optimized_duration:
+        if shape.get('total_seconds') is not None and not shape.get('song_count') and not optimized_duration and not is_llm_compose:
             final_query_results_list = _trim_to_duration(
                 final_query_results_list, shape['total_seconds'], log_messages
             )
@@ -1343,7 +1442,9 @@ def _run_chat_pipeline(data, log_messages):
         # the order the score produced -- matched songs on top, then the rest by
         # similarity. Re-sorting by tempo/energy/key here would scramble that and
         # bury the matched songs, so the scored order is preserved instead.
-        if filter_applied:
+        if is_llm_compose:
+            log_messages.append("Playlist kept in LLM composer order")
+        elif filter_applied:
             log_messages.append(
                 "\nPlaylist kept in filter-ranked order (matched songs first); smooth-transition reorder skipped"
             )
@@ -1351,6 +1452,8 @@ def _run_chat_pipeline(data, log_messages):
             log_messages.append(
                 "\nPlaylist kept in journey order (from the first seed to the second)"
             )
+        elif selection_source in {'LLM rerank only', 'LLM curate only', 'LLM compose only'}:
+            log_messages.append("Playlist kept in LLM composer order")
         elif shape.get('total_seconds') is None:
             log_messages.append(
                 "\nPlaylist kept in native/curator rank order (no explicit duration constraint)"
@@ -1410,9 +1513,28 @@ def _run_chat_pipeline(data, log_messages):
             for n in plan_notes:
                 log_messages.append(f"   {n}")
 
-        log_messages.append(
-            f"\nOK SUCCESS! Generated playlist with {len(final_query_results_list)} songs"
-        )
+        if is_llm_compose and composer_duration_diagnostics and (
+            not composer_duration_diagnostics.get('within_tolerance') or
+            composer_duration_diagnostics.get('reason')
+        ):
+            reason = composer_duration_diagnostics.get('reason') or 'Duration target was not met.'
+            error = composer_duration_diagnostics.get('error_seconds')
+            log_messages.append(
+                f"\nPlaylist duration validation failed: {reason} "
+                f"(difference {error:+d} s)" if isinstance(error, int) else
+                f"\nPlaylist duration validation failed: {reason}"
+            )
+            composer_shortfall_reason = (
+                f"{reason} Closest difference: {error:+d} s."
+                if isinstance(error, int) else reason
+            )
+            composer_failure_category = 'DURATION_MISMATCH'
+            selection_source = 'LLM compose failed'
+            final_query_results_list = []
+        else:
+            log_messages.append(
+                f"\nOK SUCCESS! Generated playlist with {len(final_query_results_list)} songs"
+            )
         log_messages.append(f"   Total songs collected: {len(all_songs)}")
         log_messages.append(f"   Tools called: {len(tools_used_history)}")
 
@@ -1484,6 +1606,11 @@ def _run_chat_pipeline(data, log_messages):
                 )
             else:
                 log_messages.append(f"   - {tool_name}({args_str}): {song_count} songs")
+    elif (is_llm_compose and selection_source == 'LLM compose failed'
+          and (candidates_retrieved_before_composer > 0 or composer_failure_category)):
+        log_messages.append("\nNo Composer result was available; playlist validation was skipped")
+        final_query_results_list = []
+        final_executed_query_str = "LLM Compose failed before playlist validation"
     else:
         log_messages.append("\nNo songs collected")
         if plan_notes:
@@ -1500,11 +1627,16 @@ def _run_chat_pipeline(data, log_messages):
 
     actual_model_used = ai_config.get(f'{ai_provider.lower()}_model')
 
-    if selection_source in {'LLM rerank only', 'LLM curate only', 'native fallback'}:
-        log_messages.append(f"Final requested target: {target_song_count}")
+    if selection_source in {'LLM rerank only', 'LLM curate only', 'native fallback', 'LLM compose only'}:
+        if composer_target_mode == 'DURATION':
+            log_messages.append(f"Final requested duration: {int(shape['total_seconds'])} s")
+        else:
+            log_messages.append(f"Final requested target: {composer_requested_target or target_song_count}")
         final_count = len(final_query_results_list or [])
         log_messages.append(f"Final playlist: {final_count}")
-        if selection_source == 'LLM curate only' and final_count < target_song_count:
+        if selection_source == 'LLM compose only' and composer_requested_target is not None and final_count < composer_requested_target:
+            log_messages.append("Reason: composer reported fewer suitable tracks than the requested target")
+        elif selection_source == 'LLM curate only' and final_count < target_song_count:
             log_messages.append(
                 "Reason: curator returned fewer high-confidence candidates than target"
             )
@@ -1516,10 +1648,26 @@ def _run_chat_pipeline(data, log_messages):
     # The pool stayed canonical for internal selection/ordering; translate the
     # FINAL list to the selected server's provider ids so the response never emits
     # an internal fp_ id. /api/create_playlist resolves them back to canonical.
+    if is_llm_compose and final_query_results_list:
+        try:
+            from tasks.ai.tool_impl import _fetch_pool_features
+            duration_rows = _fetch_pool_features([song['item_id'] for song in final_query_results_list])
+            duration_values = [duration_rows.get(song['item_id'], {}).get('duration') for song in final_query_results_list]
+            if all(value is not None and float(value) > 0 for value in duration_values):
+                actual_duration_seconds = sum(int(float(value)) for value in duration_values)
+            if shape.get('total_seconds'):
+                log_messages.append(
+                    f"Composer duration validation: target={int(shape['total_seconds'])} s; "
+                    f"actual={actual_duration_seconds if actual_duration_seconds is not None else 'unknown'} s"
+                )
+        except Exception:
+            logger.warning("Could not compute composed playlist duration", exc_info=True)
     if final_query_results_list:
         final_query_results_list = app_server_context.scope_results(
             final_query_results_list, None, id_key='item_id'
         )
+
+    log_messages.append(f"Playlist rules wall-clock: {time.monotonic() - playlist_rules_started:.1f}s")
 
     # Return final response object (caller wraps it for HTTP).
     return (
@@ -1532,6 +1680,8 @@ def _run_chat_pipeline(data, log_messages):
             "query_results": final_query_results_list,
             "target_duration_seconds": shape.get('total_seconds'),
             "actual_duration_seconds": actual_duration_seconds,
+            "requested_output": composer_requested_output,
+            "shortfall_reason": composer_shortfall_reason,
         },
         200,
     )

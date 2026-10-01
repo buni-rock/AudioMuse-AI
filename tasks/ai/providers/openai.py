@@ -342,15 +342,109 @@ def generate_text(
     return "Error: Max retries exceeded."
 
 
+class SelectionStreamGuard:
+    """Decode completed JSON array values, including values split across chunks."""
+    def __init__(self):
+        self.text = ""
+        self.position = None
+        self.refs = []
+        self.seen = set()
+        self.repeated = 0
+        self.repetition = False
+        self.closed = False
+
+    def feed(self, text):
+        self.text += text
+        if self.position is None:
+            match = re.search(r'"playlist_ids"\s*:\s*\[', self.text)
+            if not match:
+                return
+            self.position = match.end()
+        decoder = json.JSONDecoder()
+        while not self.closed:
+            pos = self.position
+            while pos < len(self.text) and self.text[pos].isspace():
+                pos += 1
+            if pos >= len(self.text):
+                return
+            if self.text[pos] == ']':
+                self.closed = True
+                return
+            try:
+                value, end = decoder.raw_decode(self.text, pos)
+            except ValueError:
+                return
+            delimiter = end
+            while delimiter < len(self.text) and self.text[delimiter].isspace():
+                delimiter += 1
+            # A numeric token may still be arriving (e.g. 1 then 23).
+            if delimiter >= len(self.text) or self.text[delimiter] not in ',]':
+                return
+            if type(value) in (int, str):
+                key = (type(value), value)
+                self.repeated = self.repeated + 1 if key in self.seen else 0
+                self.seen.add(key)
+                self.refs.append(value)
+                if self.repeated >= 4:
+                    self.repetition = True
+                    return
+            self.position = delimiter + 1
+            if self.text[delimiter] == ']':
+                self.closed = True
+
+
+def _ollama_selection_stream(chat_url, model_name, payload, *, timeout, operation):
+    """Close the HTTP stream promptly when selection references degenerate."""
+    guard = SelectionStreamGuard()
+    thinking = []
+    final = {}
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", chat_url, json={**payload, "stream": True}) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("error"):
+                    raise RuntimeError(str(chunk["error"]))
+                message = chunk.get("message") or {}
+                guard.feed(message.get("content") or "")
+                thinking.append(message.get("thinking") or "")
+                if guard.repetition:
+                    final = {"done_reason": "COMPOSER_REPETITION"}
+                    break
+                if chunk.get("done"):
+                    final = chunk
+                    break
+    if guard.repetition:
+        # This is a recovered prefix, never a fabricated complete model answer.
+        content = json.dumps({"playlist_ids": guard.refs})
+    elif final.get("done_reason") == "length" and guard.refs:
+        content = json.dumps({"playlist_ids": guard.refs})
+    else:
+        content = guard.text
+    return {**final, "message": {"role": "assistant", "content": content,
+                                  "thinking": "".join(thinking)}}
+
+
 def generate_text_ollama_chat(
     server_url: str, model_name: str, full_prompt: str, *,
     temperature: Optional[float] = None, max_tokens: Optional[int] = None,
     structured_format: Optional[Dict | str] = None, system_prompt: Optional[str] = None,
     think: Optional[bool | str] = None,
+    num_ctx: Optional[int] = None,
+    call_metadata: Optional[Dict] = None,
+    timeout: Optional[float] = None,
+    allow_think_fallbacks: bool = True,
+    selection_stream: bool = False,
 ) -> str:
     """Generate Ollama text through the shared native /api/chat transport."""
     chat_url, _ = _ollama_endpoints(server_url)
-    timeout = config.AI_REQUEST_TIMEOUT_SECONDS
+    timeout = (
+        None if timeout == 0
+        else float(timeout) if timeout is not None
+        else config.AI_REQUEST_TIMEOUT_SECONDS
+    )
     payload = {
         "model": model_name,
         "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else [])
@@ -366,21 +460,26 @@ def generate_text_ollama_chat(
             "num_predict": 8000 if max_tokens is None else int(max_tokens),
         },
     }
+    if num_ctx is not None:
+        payload["options"]["num_ctx"] = int(num_ctx)
     payload = {key: value for key, value in payload.items() if value is not None}
     if structured_format is not None:
         payload["format"] = structured_format
     endpoint = _safe_endpoint(chat_url)
-    logger.info("Ollama text call started: provider=OLLAMA model=%s endpoint=%s timeout=%ss", model_name, endpoint, timeout)
+    logger.info("Ollama text call started: provider=OLLAMA model=%s endpoint=%s timeout=%s", model_name, endpoint, f"{timeout:g}s" if timeout is not None else "unlimited")
     try:
         cache_key = (chat_url, model_name)
-        cached_setting = _OLLAMA_TEXT_THINK_SETTINGS.get(cache_key) if think is not None else None
+        cached_setting = (
+            _OLLAMA_TEXT_THINK_SETTINGS.get(cache_key)
+            if think is not None and allow_think_fallbacks else None
+        )
         initial_setting = cached_setting if cached_setting is not None else payload.get("think", "omitted")
         think_settings = [initial_setting]
         # Some reasoning-capable models return an empty final channel when
         # thinking is disabled; others spend the output budget in reasoning
         # when thinking is enabled. Retry empty responses with supported
         # Ollama modes, while never treating reasoning text as the answer.
-        if think is not None:
+        if think is not None and allow_think_fallbacks:
             think_settings.extend(["low", "omitted", "medium"])
         seen_settings = set()
         last_details = None
@@ -394,11 +493,65 @@ def generate_text_ollama_chat(
                 request_payload.pop("think", None)
             else:
                 request_payload["think"] = setting
-            envelope = _ollama_chat_request(
+            transport = _ollama_selection_stream if selection_stream else _ollama_chat_request
+            envelope = transport(
                 chat_url, model_name, request_payload, timeout=timeout, operation="text",
             )
             content, thinking = response_text_and_thinking(envelope)
             shape = ollama_response_shape(envelope)
+            if call_metadata is not None:
+                prompt_eval_count = envelope.get("prompt_eval_count") if isinstance(envelope, dict) else None
+                prompt_eval_duration = envelope.get("prompt_eval_duration") if isinstance(envelope, dict) else None
+                eval_count = envelope.get("eval_count") if isinstance(envelope, dict) else None
+                eval_duration = envelope.get("eval_duration") if isinstance(envelope, dict) else None
+                total_duration = envelope.get("total_duration") if isinstance(envelope, dict) else None
+                load_duration = envelope.get("load_duration") if isinstance(envelope, dict) else None
+                call_metadata.update({
+                    "http_status": 200,
+                    "response_type": type(envelope).__name__,
+                    "think_requested": think is False,
+                    "think_accepted": think is False,
+                    "done_reason": shape.get("done_reason"),
+                    "assistant_content_present": bool(content.strip()),
+                    "assistant_content_length": len(content),
+                    "thinking_present": bool(thinking.strip()),
+                    "thinking_length": len(thinking),
+                    "tool_calls_present": bool(shape.get("tool_calls", 0)),
+                    "structured_format_requested": structured_format is not None,
+                    "structured_format_mode": (
+                        "json" if structured_format == "json"
+                        else "schema" if isinstance(structured_format, dict)
+                        else "none"
+                    ),
+                    "prompt_eval_count": prompt_eval_count,
+                    "prompt_eval_duration": prompt_eval_duration,
+                    "eval_count": eval_count,
+                    "eval_duration": eval_duration,
+                    "tokens_per_second": (
+                        eval_count / (eval_duration / 1_000_000_000)
+                        if isinstance(eval_count, (int, float)) and isinstance(eval_duration, (int, float)) and eval_duration > 0
+                        else None
+                    ),
+                    "total_duration": total_duration,
+                    "load_duration": load_duration,
+                })
+                logger.info(
+                    "Ollama composer generation telemetry: prompt_eval_count=%s prompt_eval_duration=%s "
+                    "eval_count=%s eval_duration=%s tokens_per_second=%s total_duration=%s load_duration=%s",
+                    prompt_eval_count, prompt_eval_duration, eval_count, eval_duration,
+                    call_metadata["tokens_per_second"], total_duration, load_duration,
+                )
+            logger.info(
+                "Ollama text response diagnostics: HTTP status=200 response_type=%s "
+                "assistant_content_present=%s assistant_content_length=%d thinking_present=%s "
+                "thinking_length=%d tool_calls_present=%s done_reason=%s structured_format_requested=%s "
+                "think_requested=%s think_accepted=%s",
+                type(envelope).__name__, "yes" if content else "no", len(content),
+                "yes" if thinking else "no", len(thinking),
+                "yes" if shape.get("tool_calls", 0) else "no",
+                shape.get("done_reason") or "unknown", "yes" if structured_format is not None else "no",
+                "false" if think is False else "not requested", "yes" if think is False else "unknown",
+            )
             if isinstance(content, str) and content.strip():
                 if think is not None:
                     _OLLAMA_TEXT_THINK_SETTINGS[cache_key] = setting
@@ -427,13 +580,15 @@ def generate_text_ollama_chat(
         )
     except Exception as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
+        if call_metadata is not None:
+            call_metadata.update({"http_status": status, "exception_type": type(exc).__name__})
         exception_message = str(exc)
         exception_message = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", exception_message)
         exception_message = re.sub(r"(?i)(api[\s_-]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", exception_message)
         exception_message = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[REDACTED]", exception_message)
         logger.error(
-            "Ollama text call failed: provider=OLLAMA model=%s endpoint=%s HTTP status=%s timeout=%ss exception=%s: %s",
-            model_name, endpoint, status, timeout, type(exc).__name__, exception_message,
+            "Ollama text call failed: provider=OLLAMA model=%s endpoint=%s HTTP status=%s timeout=%s exception=%s: %s",
+            model_name, endpoint, status, f"{timeout:g}s" if timeout is not None else "unlimited", type(exc).__name__, exception_message,
             exc_info=True,
         )
         return f"Error: {type(exc).__name__}" + (f" HTTP {status}" if status else "") + f": {exception_message}"
@@ -596,10 +751,6 @@ def call_with_tools(
                                 "arguments": json.loads(tc["function"]["arguments"]),
                             }
                         )
-
-        if len(tool_calls) > 4:
-            log_messages.append(f"OpenAI returned {len(tool_calls)} tool calls; capping to first 4")
-            tool_calls = tool_calls[:4]
 
         if not tool_calls:
             text_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")

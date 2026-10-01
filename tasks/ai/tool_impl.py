@@ -336,6 +336,9 @@ def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Di
     """Resolve a song title, preferring matches available on the selected server."""
     title = (song_title or "").strip()
     artist_hint = (artist_hint or "").strip()
+    # Natural references such as "the Nightwish's song Harvest" carry a
+    # grammatical article, not a different artist identity.
+    artist_hint = re.sub(r"^the\s+", "", artist_hint)
     if not title:
         return None
     db_conn = get_db_connection()
@@ -381,20 +384,33 @@ def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Di
                     str(row.get('item_id') or ''),
                 )
 
-            resolved = min(rows, key=match_key)
-            resolved.pop('_match_count', None)
-            resolved['_match_count'] = match_count
-            if match_count > 1:
-                logger.info(
-                    "Song seed title %r matched %d library tracks; selected %r by %r%s%s",
-                    title, match_count, resolved.get('title'), resolved.get('author'),
-                    " using the requested artist hint" if artist_hint and
-                    (resolved.get('author') or '').casefold() == artist_hint.casefold() else
-                    " using deterministic best match",
-                    "; available on selected server" if resolved.get('item_id') in available_ids else
-                    "; unavailable on selected server",
-                )
-            return resolved
+            exact_artist_rows = [
+                row for row in rows
+                if artist_hint and _normalize_for_match(row.get('author') or '')
+                == _normalize_for_match(artist_hint)
+            ]
+            # A title-only exact hit is not authoritative when the user
+            # supplied an artist and the exact-title rows belong to somebody
+            # else. Continue to the same-artist title-prefix/fuzzy lookup.
+            matching_rows = exact_artist_rows if artist_hint else rows
+            if matching_rows:
+                resolved = min(matching_rows, key=match_key)
+                resolved.pop('_match_count', None)
+                resolved['_match_count'] = match_count
+                if match_count > 1:
+                    logger.info(
+                        "Song seed title %r matched %d library tracks; selected %r by %r%s%s",
+                        title, match_count, resolved.get('title'), resolved.get('author'),
+                        " using the requested artist hint" if exact_artist_rows else
+                        " using deterministic best match",
+                        "; available on selected server" if resolved.get('item_id') in available_ids else
+                        "; unavailable on selected server",
+                    )
+                return resolved
+            logger.info(
+                "Exact song-title rows for %r did not match requested artist %r; trying same-artist fuzzy resolution",
+                title, artist_hint,
+            )
         # A title-only mention often omits library annotations such as
         # “(feat. Eyelar)” or “(PMEDIA)”. Prefer a title-prefix match by the
         # requested artist before the broad fuzzy search, whose bounded pool can
@@ -443,6 +459,13 @@ def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Di
                 return resolved
         match = _fuzzy_match_author_title(db_conn, artist_hint, title)
         if match:
+            # Artist-only token overlap can score highly while selecting an
+            # entirely different song. Explicit song seeds need title fidelity.
+            from rapidfuzz import fuzz
+            if fuzz.ratio(_normalize_for_match(title), _normalize_for_match(match.get('title'))) < 75:
+                logger.warning("Rejected unrelated fuzzy song seed: %r by %r -> %r by %r",
+                               title, artist_hint, match.get('title'), match.get('author'))
+                return None
             resolved = dict(match)
             resolved['_match_count'] = 1
             return resolved

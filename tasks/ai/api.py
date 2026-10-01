@@ -217,6 +217,11 @@ def generate_text(
     structured_format: Optional[Dict | str] = None,
     system_prompt: Optional[str] = None,
     think: Optional[bool | str] = None,
+    num_ctx: Optional[int] = None,
+    call_metadata: Optional[Dict] = None,
+    timeout: Optional[float] = None,
+    allow_think_fallbacks: bool = True,
+    selection_stream: bool = False,
 ) -> str:
     valid, err = validate_ai_config(ai_config)
     if not valid:
@@ -239,6 +244,11 @@ def generate_text(
             structured_format=structured_format,
             system_prompt=system_prompt,
             think=think,
+            num_ctx=num_ctx,
+            call_metadata=call_metadata,
+            timeout=timeout,
+            allow_think_fallbacks=allow_think_fallbacks,
+            selection_stream=selection_stream,
         )
     if provider == "OPENAI":
         return ai_api_openai.generate_text(

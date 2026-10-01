@@ -16,6 +16,298 @@ from tasks.playlist_curation import (
 )
 
 
+def _install_compact_composer_response(monkeypatch, *, target_count, selected_count=None, shortfall=None):
+    import tasks.ai.api as api
+
+    captured = []
+
+    def generate(prompt, _config, **kwargs):
+        captured.append((prompt, kwargs))
+        if prompt.startswith('Interpret the ORIGINAL'):
+            anchors = json.loads(prompt.split('Resolved anchors: ', 1)[1].split('\nAvailable candidate count:', 1)[0])
+            payload = {'anchor_decisions': {anchor['id']: True for anchor in anchors},
+                       'target_count': target_count, 'target_duration_seconds': None}
+        elif prompt.startswith('Select only the missing tracks'):
+            remaining = json.loads(prompt.split('Remaining available candidates: ', 1)[1])
+            missing = int(prompt.split('Missing count: ', 1)[1].split('\n', 1)[0])
+            payload = {'playlist_ids': [row['id'] for row in remaining[:missing]]}
+        else:
+            records = json.loads(prompt.split('Available candidates: ', 1)[1].split('\n\nREPAIR', 1)[0])
+            anchors = json.loads(prompt.split('Resolved anchors: ', 1)[1].split('\nAvailable candidates:', 1)[0])
+            required = [anchor['candidate_ref'] for anchor in anchors if anchor['include']]
+            ids = required + [row['id'] for row in records if row['id'] not in required]
+            payload = {'playlist_ids': ids[:selected_count or target_count]}
+            if shortfall is not None:
+                payload['shortfall_reason'] = shortfall
+        raw = json.dumps(payload, separators=(',', ':'))
+        metadata = kwargs.get('call_metadata')
+        if metadata is not None:
+            metadata.update(done_reason='stop', eval_count=80, assistant_content_length=len(raw))
+        return raw
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    return captured
+
+
+def test_compose_debug_fixture_ten_candidates_two_anchors_five_tracks(monkeypatch):
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Fixture Artist'}
+             for index in range(10)]
+    anchors = [{'type': 'song', 'resolved_track': song} for song in songs[:2]]
+    logs = []
+    calls = _install_compact_composer_response(monkeypatch, target_count=5)
+    result, sent = compose_playlist_with_llm(
+        'Include the two listed songs in a five-track playlist', songs,
+        {'provider': 'OLLAMA'}, resolved_anchors=anchors, ui_default_count=50, log_messages=logs,
+    )
+
+    assert sent == 10
+    assert 'Composer context present: resolved anchors=2' in logs
+    assert len(result['playlist']) == 5
+    assert len(calls) == 2
+    assert all(kwargs['structured_format'] == 'json' and kwargs['max_tokens'] == 512 for _, kwargs in calls)
+    assert 'playlist_ids' not in calls[0][0]
+    assert 'request-local INTEGER references' in calls[1][0]
+    assert 'Original user request (verbatim):' in calls[1][0]
+    assert any('Compose Phase A: target_count=5' in line for line in logs)
+    assert any('Compose Phase B: IDs returned=5; unique IDs=5' in line for line in logs)
+
+
+def test_compose_keeps_all_242_candidates_and_four_canonical_anchors(monkeypatch):
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': f'Artist {index % 17}'}
+             for index in range(242)]
+    anchor_specs = [
+        ('track-0', 'Temple Of The King', 'Rainbow'),
+        ('track-1', 'Loud And Clear', 'The Cranberries'),
+        ('track-2', 'Every Breaking Wave', 'U2'),
+        ('track-3', 'Paradise (What About Us?) (Feat. Tarja)', 'Within Temptation'),
+    ]
+    anchors = []
+    for item_id, title, artist in anchor_specs:
+        track = next(song for song in songs if song['item_id'] == item_id)
+        track.update(title=title, artist=artist)
+        anchors.append({'type': 'song', 'title': title, 'artist': artist,
+                        'resolved_track': track})
+    logs = []
+    calls = _install_compact_composer_response(monkeypatch, target_count=64)
+    result, sent = compose_playlist_with_llm(
+        'Here is a list of songs I love:\n'
+        '- Temple of the King from Rainbow,\n'
+        '- Lound and clear from The Cranberries,\n'
+        '- Every breaking wave from U2,\n'
+        '- Paradise from Within Temptation.\n\n'
+        'Could you assemble a playlist to contain these songs and add another\n'
+        '60 similar songs?', songs,
+        {'provider': 'OLLAMA'}, resolved_anchors=anchors, ui_default_count=50, log_messages=logs,
+    )
+
+    assert sent == 242
+    assert len(calls) == 2
+    assert len(result['playlist']) == 64
+    assert all(any(song['item_id'] == item_id for song in result['playlist'])
+               for item_id, _, _ in anchor_specs)
+    assert result['requested_output']['target_count'] == 64
+    assert any('Composer anchor A004: Paradise (What About Us?) (Feat. Tarja) / Within Temptation' in line for line in logs)
+    assert any('Compose Phase A: target_count=64; target_duration=None; anchor decisions=' in line for line in logs)
+    assert any('Compose Phase B: candidates supplied=242; requested selections=64' in line for line in logs)
+    assert any('Compose Phase B: IDs returned=64; unique IDs=64' in line for line in logs)
+
+
+def test_compose_truncated_selection_attempts_only_one_targeted_fill(monkeypatch, caplog):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    calls = []
+    raw = '{"playlist_ids":[1,2,3'
+
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        if prompt.startswith('Interpret the ORIGINAL'):
+            kwargs['call_metadata'].update(done_reason='stop', eval_count=30)
+            return '{"anchor_decisions":{},"target_count":5,"target_duration_seconds":null}'
+        kwargs['call_metadata'].update(done_reason='length', eval_count=4096)
+        return raw
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'Choose five songs', [{'item_id': 'track-1', 'title': 'Track 1', 'artist': 'Artist'}],
+        {'provider': 'OLLAMA'},
+    )
+    assert result['error']['category'] == 'OUTPUT_LIMIT'
+    assert len(calls) == 3
+    assert calls[-1].startswith("Select only the missing tracks")
+
+
+@pytest.mark.parametrize('shortfall_reason', [None, 'Only some tracks are suitable.'])
+def test_compose_trims_overselection_after_validation(monkeypatch, shortfall_reason):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    calls = []
+
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        kwargs['call_metadata']['done_reason'] = 'stop'
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return '{"anchor_decisions":{},"target_count":64,"target_duration_seconds":null}'
+        records = json.loads(prompt.split('Available candidates: ', 1)[1].split('\n\nREPAIR', 1)[0])
+        payload = {'playlist_ids': [record['id'] for record in records]}
+        if shortfall_reason is not None:
+            payload['shortfall_reason'] = shortfall_reason
+        return json.dumps(payload)
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Artist'}
+             for index in range(242)]
+    result, sent = compose_playlist_with_llm('Choose 64 tracks', songs, {'provider': 'OLLAMA'})
+    assert sent == 242
+    assert len(calls) == 2
+    assert len(result['playlist']) == 64
+    assert result['shortfall_reason'] is None
+    records = json.loads(calls[1].split('Available candidates: ', 1)[1])
+    assert [song['title'] for song in result['playlist']] == [row['title'] for row in records[:64]]
+
+
+def test_compose_fills_explained_shortfall_without_regenerating_selection(monkeypatch):
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Artist'}
+             for index in range(10)]
+    anchors = [{'type': 'song', 'resolved_track': song} for song in songs[:2]]
+    calls = _install_compact_composer_response(
+        monkeypatch, target_count=5, selected_count=3,
+        shortfall='Only three candidates suit the request.',
+    )
+    result, _ = compose_playlist_with_llm(
+        'Choose five tracks', songs, {'provider': 'OLLAMA'}, resolved_anchors=anchors,
+    )
+    assert len(result['playlist']) == 5
+    assert len(calls) == 3
+    assert calls[2][0].startswith('Select only the missing tracks')
+    assert result['requested_output']['target_count'] == 5
+    assert result['shortfall_reason'] is None
+
+
+@pytest.mark.parametrize('raw_refs,valid_count,fill_count,trimmed', [
+    (list(range(1, 64)) + [1, 2, 3, 1000, 'bad', True], 63, 1, 0),
+    (list(range(1, 75)) + [1], 74, 0, 10),
+    (list(range(1, 62)), 61, 3, 0),
+    (list(range(1, 65)), 64, 0, 0),
+    (list(range(1, 68)), 67, 0, 3),
+])
+def test_compose_finalizes_count_variance(monkeypatch, raw_refs, valid_count, fill_count, trimmed):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    calls = []
+
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        kwargs['call_metadata']['done_reason'] = 'stop'
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return '{"anchor_decisions":{},"target_count":64,"target_duration_seconds":null}'
+        if prompt.startswith('Select only the missing tracks'):
+            return json.dumps({'playlist_ids': list(range(valid_count + 1, valid_count + fill_count + 1))})
+        return json.dumps({'playlist_ids': raw_refs})
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Artist'}
+             for index in range(242)]
+    logs = []
+    result, sent = compose_playlist_with_llm(
+        'Choose 64 songs', songs, {'provider': 'OLLAMA'}, log_messages=logs,
+    )
+    assert sent == 242
+    assert len(result['playlist']) == 64
+    assert len(calls) == (3 if fill_count else 2)
+    assert not any('selection repair' in line for line in logs)
+    records = json.loads(calls[1].split('Available candidates: ', 1)[1])
+    assert [song['title'] for song in result['playlist']] == [row['title'] for row in records[:64]]
+    assert any(f'Composer raw IDs: {len(raw_refs)}; Valid IDs: {valid_count};' in line for line in logs)
+    if fill_count:
+        assert f'Targeted fill requested: {fill_count}' in logs
+        assert f'Targeted fill returned: {fill_count}' in logs
+    if trimmed:
+        assert f'Tail trimmed: {trimmed}' in logs
+
+
+def test_compose_repairs_duplicate_selection_without_reinterpreting(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    calls = []
+
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        kwargs['call_metadata']['done_reason'] = 'stop'
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return '{"anchor_decisions":{},"target_count":3,"target_duration_seconds":null}'
+        return '{"playlist_ids":[1,1,2]}' if len(calls) == 2 else '{"playlist_ids":[3]}'
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Artist'}
+             for index in range(10)]
+    result, _ = compose_playlist_with_llm('Choose three tracks', songs, {'provider': 'OLLAMA'})
+    assert len(result['playlist']) == 3
+    assert len(calls) == 3
+    assert sum(prompt.startswith('Interpret the ORIGINAL') for prompt in calls) == 1
+    assert calls[2].startswith('Select only the missing tracks')
+
+
+def test_compose_repairs_missing_required_anchor(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    calls = []
+
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        kwargs['call_metadata']['done_reason'] = 'stop'
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return '{"anchor_decisions":{"A001":true},"target_count":3,"target_duration_seconds":null}'
+        anchors = json.loads(prompt.split('Resolved anchors: ', 1)[1].split('\nAvailable candidates:', 1)[0])
+        anchor_ref = anchors[0]['candidate_ref']
+        choices = [ref for ref in range(1, 5) if ref != anchor_ref][:3]
+        if len(calls) == 3:
+            choices[0] = anchor_ref
+        return json.dumps({'playlist_ids': choices})
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Artist'}
+             for index in range(10)]
+    result, _ = compose_playlist_with_llm(
+        'Include the named song in three tracks', songs, {'provider': 'OLLAMA'},
+        resolved_anchors=[{'type': 'song', 'resolved_track': songs[0]}],
+    )
+    assert len(calls) == 2
+    assert len(result['playlist']) == 3
+    assert songs[0]['item_id'] in {song['item_id'] for song in result['playlist']}
+
+
+def test_compose_does_not_repair_provider_timeout(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    calls = []
+
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        kwargs['call_metadata']['done_reason'] = 'stop'
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return '{"anchor_decisions":{},"target_count":3,"target_duration_seconds":null}'
+        return 'Error: Request timed out'
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    songs = [{'item_id': f'track-{index}', 'title': f'Track {index}', 'artist': 'Artist'}
+             for index in range(10)]
+    result, _ = compose_playlist_with_llm('Choose three tracks', songs, {'provider': 'OLLAMA'})
+    assert result['error']['category'] == 'TIMEOUT'
+    assert len(calls) == 2
+
+
 def _rerank_aliases(prompt):
     records = json.loads(prompt.rsplit("Candidates: ", 1)[1])
     return [record["id"] for record in records]
@@ -24,6 +316,27 @@ def _rerank_aliases(prompt):
 def test_llm_selection_rejects_unknown_and_duplicate_ids():
     raw = json.dumps({"selected_ids": ["a", "invented", "a", "b"]})
     assert validate_llm_candidate_selection(raw, ["a", "b"], "LLM_CURATE") == ["a", "b"]
+
+
+def test_multi_seed_shortlist_balances_all_neighborhoods_before_global_fill():
+    songs = []
+    provenance = {}
+    for seed_index in range(4):
+        label = f"seed-{seed_index}"
+        ids = []
+        for rank in range(200):
+            item_id = f"{label}-track-{rank}"
+            ids.append(item_id)
+            songs.append({"item_id": item_id, "title": item_id, "artist": label})
+        provenance[label] = ids
+
+    shortlist, _aliases, _reverse, _payload = prepare_llm_candidate_shortlist(
+        songs, "multi-seed request", limit=50, seed_provenance=provenance,
+    )
+    selected = {song["item_id"] for song in shortlist}
+    assert len(shortlist) == 50
+    assert all(any(item_id in selected for item_id in ids) for ids in provenance.values())
+    assert len(selected) == 50
 
 
 def test_bad_response_is_empty_and_falls_back_to_native(monkeypatch):
@@ -244,7 +557,7 @@ def test_curator_prompt_includes_compact_resolved_seed_metadata(monkeypatch):
         resolved_seed={'item_id': 'seed-id', 'title': 'Harvest', 'artist': 'Nightwish'},
     )
     assert ids == ['seed-id']
-    assert 'Resolved explicit/seed songs:' in captured['prompt']
+    assert 'Authoritative planner interpretation' in captured['prompt']
     assert '"title":"Harvest"' in captured['prompt']
     assert '"artist":"Nightwish"' in captured['prompt']
     assert 'audio profile' not in captured['prompt']
@@ -508,16 +821,16 @@ def test_rerank_and_curate_share_opaque_shortlist_payload_and_provider_settings(
     assert "musicnn" not in captured[1]["prompt"] and "dclap" not in captured[1]["prompt"]
     assert len(captured[1]["prompt"].rsplit("Candidates: ", 1)[1]) < 7000
     assert captured[1]["schema"] == {
-        "type": "object",
+        "type": "object", "additionalProperties": False,
         "properties": {"selected_ids": {"type": "array", "items": {"type": "string"}}},
         "required": ["selected_ids"],
     }
-    assert captured[0]["max_tokens"] == captured[1]["max_tokens"] == 1200
+    assert captured[0]["max_tokens"] == captured[1]["max_tokens"] == 4096
     assert captured[0]["think"] == captured[1]["think"] is False
     assert "Candidate presentation shuffled: yes" in logs
     assert "AudioMuse scores sent to LLM: no" in logs
     assert "AudioMuse native ranks sent to LLM: no" in logs
-    assert "Effective LLM output token budget: 1200" in logs
+    assert "Effective LLM output token budget: 4096" in logs
     assert any(line.startswith("Serialized candidate payload chars:") for line in logs)
 
 
@@ -611,6 +924,21 @@ def test_mandatory_song_family_variant_wins_and_feature_title_is_preserved():
     kept, removed = suppress_song_families(songs, mandatory_ids=['mandatory-remix'])
     assert [song['item_id'] for song in kept] == ['mandatory-remix', 'dopamine-a', 'dopamine-b']
     assert song_family_key(songs[2]) != song_family_key(songs[3])
+    assert removed == 1
+
+
+def test_every_mandatory_song_survives_shared_version_family_suppression():
+    from tasks.playlist_curation import suppress_song_families
+
+    songs = [
+        {'item_id': 'mandatory-original', 'title': 'Take Me Home', 'artist': 'Artist'},
+        {'item_id': 'mandatory-live', 'title': 'Take Me Home (Live)', 'artist': 'Artist'},
+        {'item_id': 'optional-remix', 'title': 'Take Me Home (Radio Remix)', 'artist': 'Artist'},
+    ]
+    kept, removed = suppress_song_families(
+        songs, mandatory_ids=['mandatory-original', 'mandatory-live'],
+    )
+    assert {song['item_id'] for song in kept} == {'mandatory-original', 'mandatory-live'}
     assert removed == 1
 
 
@@ -1070,3 +1398,86 @@ def test_curator_provider_failure_logs_reason_and_returns_empty_for_native_fallb
     assert "ConnectError" in caplog.text
     assert any(line.startswith("Curator status: PROVIDER_ERROR") for line in logs)
     assert "Curator JSON parsing: failure" not in logs
+def test_finalize_composer_duration_uses_library_lengths_and_ignores_model_claim():
+    from tasks.playlist_curation import finalize_composer_duration
+
+    songs = [
+        {'item_id': str(i), 'title': f'Track {i}', 'artist': f'Artist {i}'}
+        for i in range(23)
+    ]
+    durations = {str(i): {'duration': 280 if i < 22 else 412} for i in range(23)}
+    # The complete preference list is 6572 seconds. It is a pool, not a
+    # duration-compliant final playlist, regardless of Composer prose.
+    assert sum(row['duration'] for row in durations.values()) == 6572
+    selected, actual, details = finalize_composer_duration(
+        songs, durations, 1800, tolerance_seconds=15,
+    )
+    assert len(selected) < len(songs)
+    assert actual == 1812
+    assert details['within_tolerance']
+
+
+def test_finalize_composer_duration_preserves_required_anchor_and_count():
+    from tasks.playlist_curation import finalize_composer_duration
+
+    songs = [
+        {'item_id': str(i), 'title': f'Track {i}', 'artist': f'Artist {i}'}
+        for i in range(4)
+    ]
+    durations = {'0': {'duration': 600}, '1': {'duration': 300},
+                 '2': {'duration': 300}, '3': {'duration': 1000}}
+    selected, actual, details = finalize_composer_duration(
+        songs, durations, 900, target_count=2, required_ids=['0'],
+    )
+    assert len(selected) == 2
+    assert selected[0]['item_id'] == '0'
+    assert actual == 900
+    assert details['within_tolerance']
+
+
+def test_finalize_composer_duration_rejects_6572_second_violation():
+    from tasks.playlist_curation import finalize_composer_duration
+
+    songs = [{'item_id': 'a', 'title': 'Long track', 'artist': 'Artist'}]
+    selected, actual, details = finalize_composer_duration(
+        songs, {'a': {'duration': 6572}}, 1800,
+    )
+    assert selected == songs
+    assert actual == 6572
+    assert details['error_seconds'] == 4772
+    assert not details['within_tolerance']
+
+
+def test_compose_repetition_keeps_61_and_fills_only_three(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+    calls = []
+    prefix = []
+    expected_track_ids = []
+    def generate(prompt, _config, **kwargs):
+        calls.append(prompt)
+        kwargs['call_metadata']['done_reason'] = 'stop'
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({'anchor_decisions': {}, 'target_count': 64, 'target_duration_seconds': None})
+        if prompt.startswith('Select only the missing tracks'):
+            assert 'Missing count: 3' in prompt
+            remaining = json.loads(prompt.split('Remaining available candidates: ', 1)[1])
+            assert not set(prefix) & {r['id'] for r in remaining}
+            return json.dumps({'playlist_ids': [r['id'] for r in remaining[:3]]})
+        records = json.loads(prompt.split('Available candidates: ', 1)[1])
+        prefix.extend(r['id'] for r in records[:61])
+        expected_track_ids.extend(r['title'] for r in records[:61])
+        kwargs['call_metadata']['done_reason'] = 'COMPOSER_REPETITION'
+        return json.dumps({'playlist_ids': prefix + [prefix[-1]] * 4})
+    monkeypatch.setattr(api, 'generate_text', generate)
+    logs = []
+    result, sent = compose_playlist_with_llm('Choose 64 songs',
+        [{'item_id': str(i), 'title': str(i), 'artist': 'Artist'} for i in range(242)],
+        {'provider': 'OLLAMA'}, log_messages=logs)
+    assert len(calls) == 3
+    assert sent == 242
+    assert len(result['playlist']) == 64
+    assert len({s['item_id'] for s in result['playlist']}) == 64
+    assert [s['item_id'] for s in result['playlist'][:61]] == expected_track_ids
+    assert any('COMPOSER_REPETITION' in line for line in logs)
+    assert 'Targeted fill requested: 3' in logs
