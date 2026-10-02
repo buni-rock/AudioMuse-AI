@@ -967,12 +967,83 @@ def _run_chat_pipeline(data, log_messages):
         log_messages.append("Composing final playlist...")
         yield
         try:
-            from tasks.playlist_curation import compose_playlist_with_llm
+            from tasks.playlist_curation import compose_playlist_with_llm, suppress_duplicate_title_artist
             from tasks.ai.tool_impl import _fetch_pool_features
             llm_selection_started = time.monotonic()
             candidate_duration_rows = _fetch_pool_features(
                 [song['item_id'] for song in all_songs]
             )
+
+            def expand_composer_candidates(intent, current_pool):
+                """Fetch wider canonical seed neighborhoods after LLM2A interprets intent."""
+                from tasks.ai.tools import execute_mcp_tool
+
+                seed_history = next((entry for entry in tools_used_history
+                                     if entry.get('name') == 'seed_search'), None)
+                seed_args = (seed_history or {}).get('args') or {}
+                seeds = seed_args.get('seeds') or []
+                seed_count = len(seeds)
+                if seed_count < 2 or intent.get('discovery_priority') == 'focused':
+                    return None
+                initial_budget = max(1, int(seed_args.get('get_songs') or 0))
+                saturated = any(
+                    len(ids) >= initial_budget
+                    for ids in seed_provenance.values()
+                )
+                capacity = max(1, int(config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES))
+                per_seed_limit = capacity // seed_count
+                if not saturated or per_seed_limit <= initial_budget:
+                    log_messages.append('Adaptive retrieval: initial seed neighborhoods were sufficient')
+                    return None
+                target_count = int(intent.get('target_count') or ui_song_cap)
+                wider_budget = min(
+                    per_seed_limit,
+                    max(initial_budget * 2, (target_count * 3 + seed_count - 1) // seed_count),
+                )
+                result = execute_mcp_tool('seed_search', {
+                    'seeds': seeds, 'blend_mode': 'union', 'get_songs': wider_budget,
+                }, ai_config_with_secrets)
+                retrieved = result.get('songs') or []
+                if not retrieved:
+                    log_messages.append('Adaptive retrieval: AudioMuse returned no additional tracks')
+                    return None
+                extra_mapping = app_server_context.translate_ids_for_request(
+                    [song['item_id'] for song in retrieved]
+                )
+                composer_server_ids.update(extra_mapping)
+                scoped = [song for song in retrieved
+                          if str(song.get('item_id')) in composer_server_ids]
+                expanded, _ = suppress_duplicate_title_artist(list(current_pool) + scoped)
+                expanded = expanded[:capacity]
+                if len(expanded) <= len(current_pool):
+                    log_messages.append('Adaptive retrieval: no new available tracks')
+                    return None
+                retained = {str(song['item_id']) for song in expanded}
+                for neighborhood in result.get('seed_neighborhoods') or []:
+                    label = str(neighborhood.get('label') or 'seed')
+                    bucket = seed_provenance.setdefault(label, [])
+                    seen = set(bucket)
+                    for song in neighborhood.get('songs') or []:
+                        item_id = str(song.get('item_id'))
+                        if item_id in retained and item_id not in seen:
+                            bucket.append(item_id)
+                            seen.add(item_id)
+                new_ids = [song['item_id'] for song in expanded
+                           if song['item_id'] not in candidate_duration_rows]
+                if new_ids:
+                    candidate_duration_rows.update(_fetch_pool_features(new_ids))
+                for song in expanded:
+                    song_sources.setdefault(song['item_id'], 0)
+                if seed_history is not None:
+                    seed_history['songs'] = len(retrieved)
+                    seed_history['args']['get_songs'] = wider_budget
+                log_messages.append(
+                    f"Adaptive retrieval: {initial_budget} -> {wider_budget} tracks per seed; "
+                    f"{len(current_pool)} -> {len(expanded)} available candidates; "
+                    f"{len({str(song.get('artist') or song.get('author') or '') for song in expanded})} artists"
+                )
+                return expanded
+
             composition_result, candidates_sent = compose_playlist_with_llm(
                 original_user_input, all_songs, ai_config_with_secrets,
                 seed_provenance=seed_provenance,
@@ -981,6 +1052,7 @@ def _run_chat_pipeline(data, log_messages):
                 log_messages=log_messages,
                 duration_rows=candidate_duration_rows,
                 musical_review=True,
+                expansion_callback=expand_composer_candidates,
             )
             if composition_result.get('error'):
                 failure = composition_result['error']

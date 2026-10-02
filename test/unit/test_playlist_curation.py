@@ -317,6 +317,178 @@ def test_composer_selects_each_seed_neighborhood_to_model_balance_plan(monkeypat
     assert {'b1', 'b2'} & {song['item_id'] for song in result['playlist']}
 
 
+def test_composer_expands_candidates_after_phase_a_without_reinterpreting(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': str(index), 'title': f'Song {index}', 'artist': f'Artist {index}'}
+        for index in range(4)
+    ]
+    calls = []
+
+    def generate(prompt, _config, **_kwargs):
+        calls.append(prompt)
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {}, 'target_count': 3,
+                'target_duration_seconds': None, 'discovery_priority': 'exploratory',
+            })
+        rows = json.loads(prompt.split('Available candidates: ', 1)[1])
+        return json.dumps({'playlist_ids': [row['id'] for row in rows[:3]]})
+
+    def expand(intent, pool):
+        assert intent['target_count'] == 3
+        assert intent['discovery_priority'] == 'exploratory'
+        return pool + songs[2:]
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, supplied = compose_playlist_with_llm(
+        'Explore related artists', songs[:2], {'provider': 'OLLAMA'},
+        expansion_callback=expand,
+    )
+    assert not result.get('error')
+    assert supplied == 4
+    assert len(result['playlist']) == 3
+    assert sum(prompt.startswith('Interpret the ORIGINAL') for prompt in calls) == 1
+
+
+def test_composer_rejects_required_anchor_unavailable_on_server(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    available = {'item_id': 'available', 'title': 'Available', 'artist': 'Artist'}
+    missing = {'item_id': 'missing', 'title': 'Missing', 'artist': 'Artist'}
+    monkeypatch.setattr(api, 'generate_text', lambda *_args, **_kwargs: json.dumps({
+        'anchor_decisions': {'A001': True, 'A002': True},
+        'target_count': 2, 'target_duration_seconds': None,
+    }))
+    result, _ = compose_playlist_with_llm(
+        'Include both songs', [available], {'provider': 'OLLAMA'},
+        resolved_anchors=[
+            {'type': 'song', 'resolved_track': available},
+            {'type': 'song', 'resolved_track': missing},
+        ],
+    )
+    assert result['error']['category'] == 'COMPOSER_ANCHOR_UNAVAILABLE'
+    assert 'Missing' in result['error']['reason']
+
+
+def test_composer_artist_mix_limits_concentration_without_losing_anchors(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': key, 'title': key, 'artist': artist}
+        for key, artist in [
+            ('a0', 'A'), ('b0', 'B'), ('a1', 'A'), ('a2', 'A'),
+            ('c1', 'C'), ('d1', 'D'), ('b1', 'B'), ('b2', 'B'),
+            ('e1', 'E'), ('f1', 'F'),
+        ]
+    ]
+
+    def generate(prompt, _config, **_kwargs):
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {'A001': True, 'A002': True},
+                'target_count': 6, 'target_duration_seconds': None,
+                'discovery_priority': 'exploratory',
+            })
+        if prompt.startswith('Plan musical representation'):
+            return json.dumps({
+                'minimum_neighborhood_tracks': {'1': 2, '2': 2},
+                'artist_mix': {'max_tracks_per_artist': 2, 'minimum_distinct_artists': 4},
+            })
+        if prompt.startswith('Choose musically suitable real-library tracks'):
+            rows = json.loads(prompt.split('Eligible candidates: ', 1)[1])
+            distinct = []
+            seen_artists = set()
+            for row in rows:
+                if row['artist'] not in seen_artists:
+                    distinct.append(row['id'])
+                    seen_artists.add(row['artist'])
+                if len(distinct) == 2:
+                    break
+            return json.dumps({'playlist_ids': distinct})
+        if prompt.startswith('Order exactly these LLM2-selected library tracks'):
+            rows = json.loads(prompt.split('Selected tracks: ', 1)[1])
+            return json.dumps({'playlist_ids': [row['id'] for row in rows]})
+        raise AssertionError(f'Unexpected Composer phase: {prompt[:80]}')
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'Discover music around two different songs', songs, {'provider': 'OLLAMA'},
+        seed_provenance={
+            'A / a0': ['a1', 'a2', 'c1', 'd1'],
+            'B / b0': ['b1', 'b2', 'e1', 'f1'],
+        },
+        resolved_anchors=[
+            {'type': 'song', 'resolved_track': songs[0]},
+            {'type': 'song', 'resolved_track': songs[1]},
+        ],
+    )
+    assert not result.get('error')
+    assert len(result['playlist']) == 6
+    assert {'a0', 'b0'}.issubset({song['item_id'] for song in result['playlist']})
+    artists = [song['artist'] for song in result['playlist']]
+    assert len(set(artists)) >= 4
+    assert max(artists.count(artist) for artist in set(artists)) <= 2
+
+
+def test_composer_retries_malformed_global_fill_without_losing_playlist(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': key, 'title': key, 'artist': artist}
+        for key, artist in [
+            ('a0', 'A'), ('b0', 'B'), ('a1', 'C'), ('a2', 'D'),
+            ('b1', 'E'), ('b2', 'F'), ('extra', 'G'),
+        ]
+    ]
+    global_calls = []
+    order_calls = []
+
+    def generate(prompt, _config, **_kwargs):
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {'A001': True, 'A002': True},
+                'target_count': 5, 'target_duration_seconds': None,
+            })
+        if prompt.startswith('Plan musical representation'):
+            return json.dumps({'minimum_neighborhood_tracks': {'1': 1, '2': 1}})
+        if prompt.startswith('Choose musically suitable real-library tracks'):
+            rows = json.loads(prompt.split('Eligible candidates: ', 1)[1])
+            if 'Seed neighborhood: All related music' in prompt:
+                global_calls.append(prompt)
+                if len(global_calls) == 1:
+                    return 'this is not JSON'
+                return json.dumps({'playlist_ids': [999, 998, 997], 'track_ids': [rows[0]['id']]})
+            return json.dumps({'playlist_ids': [rows[0]['id']]})
+        if prompt.startswith('Order exactly these LLM2-selected library tracks'):
+            order_calls.append(prompt)
+            _kwargs['call_metadata']['done_reason'] = 'COMPOSER_REPETITION'
+            return ''
+        raise AssertionError(f'Unexpected Composer phase: {prompt[:80]}')
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    logs = []
+    result, _ = compose_playlist_with_llm(
+        'Mix these two songs', songs, {'provider': 'OLLAMA'},
+        seed_provenance={'A / a0': ['a1', 'a2'], 'B / b0': ['b1', 'b2']},
+        resolved_anchors=[
+            {'type': 'song', 'resolved_track': songs[0]},
+            {'type': 'song', 'resolved_track': songs[1]},
+        ],
+        log_messages=logs,
+    )
+    assert not result.get('error')
+    assert len(result['playlist']) == 5
+    assert len(global_calls) == 2
+    assert len(order_calls) == 2
+    assert any('model ordering unavailable; preserving LLM2 selections' in line for line in logs)
+
+
 def test_compose_truncated_selection_attempts_only_one_targeted_fill(monkeypatch, caplog):
     import tasks.ai.api as api
     from tasks.playlist_curation import compose_playlist_with_llm

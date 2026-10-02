@@ -9,6 +9,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import Counter, deque
 
 import config
 from tasks.ai.json_response import parse_json_response
@@ -274,7 +275,7 @@ def build_llm_candidate_alias_map(songs, context):
 
 
 def _balanced_candidate_shortlist(songs, seed_provenance, limit, mandatory_ids=()):
-    """Allocate bounded slots round-robin across seed neighborhoods."""
+    """Allocate bounded slots across seeds and artists without choosing the playlist."""
     limit = max(0, int(limit))
     by_id = {str(song.get('item_id')): song for song in songs if song.get('item_id') is not None}
     selected, selected_ids = [], set()
@@ -289,7 +290,16 @@ def _balanced_candidate_shortlist(songs, seed_provenance, limit, mandatory_ids=(
         for label, ids in seed_provenance.items():
             group = [by_id[str(item_id)] for item_id in ids if str(item_id) in by_id]
             if group:
-                neighborhoods.append((str(label), group))
+                artist_queues = {}
+                for song in group:
+                    artist = str(song.get('artist') or song.get('author') or 'Unknown').casefold()
+                    artist_queues.setdefault(artist, deque()).append(song)
+                varied_group = []
+                while any(artist_queues.values()):
+                    for queue in artist_queues.values():
+                        if queue:
+                            varied_group.append(queue.popleft())
+                neighborhoods.append((str(label), varied_group))
     # Round-robin through ranked members of each group; overlap is de-duplicated
     # and unused capacity is filled from the stable global candidate order.
     rank = 0
@@ -793,7 +803,8 @@ def curate_candidates_with_llm(
 def compose_playlist_with_llm(
     user_request, songs, ai_config, *, seed_provenance=None,
     resolved_anchors=None, ui_default_count=None, log_messages=None,
-    duration_rows=None, musical_review=False,
+    duration_rows=None, musical_review=False, expansion_callback=None,
+    preinterpreted_intent=None,
 ):
     """Compose one ordered final playlist from the original request and library candidates."""
     from tasks.ai.api import generate_text
@@ -822,8 +833,6 @@ def compose_playlist_with_llm(
             continue
         track = anchor.get("resolved_track") or {}
         alias = item_id_to_alias.get(str(track.get("item_id")))
-        if not alias:
-            continue
         user_reference = anchor.get("user_reference") or {
             key: str(anchor.get(key) or "").strip()
             for key in ("title", "artist", "name", "album") if anchor.get(key)
@@ -838,6 +847,7 @@ def compose_playlist_with_llm(
             "type": anchor.get("type"),
             "user_reference": user_reference,
             "resolved_library_track": resolved_identity,
+            "available_on_server": bool(alias),
         })
 
     # Request-local references keep Phase B output compact. The shuffled,
@@ -879,6 +889,7 @@ def compose_playlist_with_llm(
     anchor_ref = {
         anchor["id"]: item_id_to_numeric[str(anchor["resolved_library_track"]["track_id"])]
         for anchor in phase_a_anchors
+        if str(anchor["resolved_library_track"]["track_id"]) in item_id_to_numeric
     }
     provider = str(ai_config.get("provider") or "unknown").upper()
     context_setting = int(config.INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE)
@@ -913,7 +924,7 @@ def compose_playlist_with_llm(
 
     def call_phase(phase, prompt, system_prompt, selection_count=None):
         metadata = {}
-        is_selection = (phase.startswith("Phase B") and not phase.startswith("Phase B balance")) or phase in {"Review", "Coverage repair"}
+        is_selection = (phase.startswith("Phase B") and not phase.startswith("Phase B balance")) or phase in {"Review", "Coverage repair", "Artist mix repair"}
         budget = (
             min(output_ceiling, max(2048 if phase in {"Review", "Coverage repair"} else 512,
                                     128 + 8 * (selection_count or len(records))))
@@ -977,7 +988,8 @@ def compose_playlist_with_llm(
     phase_a_prompt = (
         "Interpret the ORIGINAL user request into the final executable playlist intent. "
         "Return only JSON: {\"anchor_decisions\":{\"A001\":true},\"target_count\":64,"
-        "\"target_duration_seconds\":null,\"allow_nonstandard_versions\":false}. "
+        "\"target_duration_seconds\":null,\"allow_nonstandard_versions\":false,"
+        "\"discovery_priority\":\"balanced\"}. "
         "Do not return playlist IDs, candidate rankings, "
         "explanations, analysis, or markdown. Include one boolean decision for every resolved anchor ID. "
         "Set target_count to the final TOTAL track count, including every anchor marked true. "
@@ -987,21 +999,30 @@ def compose_playlist_with_llm(
         "target_duration_seconds is the requested duration in seconds. "
         "Set allow_nonstandard_versions true when the user wants live, remixed, acoustic, "
         "instrumental, edited or other alternate recordings; otherwise set it false. "
+        "Set discovery_priority to focused for a narrow artist/song request, balanced for "
+        "a general mix, or exploratory when the user wants a broad discovery mix. "
+        "For several contrasting positive song seeds, prefer balanced or exploratory "
+        "unless the request clearly asks to stay close to those artists. "
         "Stop after the JSON object.\n"
         f"Original user request (verbatim): {original_request}\n"
         f"UI default song count: {default_count}\n"
         f"Resolved anchors: {serialized_anchors}\n"
         f"Available candidate count: {len(records)}"
     )
-    raw_a, failure = call_phase("Phase A", phase_a_prompt, "Interpret playlist intent. Return only JSON.")
-    if failure:
-        return failed(failure, f"Compose interpretation provider failed: {failure}.")
-    anchor_ids = set(anchor_ref)
+    if preinterpreted_intent is None:
+        raw_a, failure = call_phase("Phase A", phase_a_prompt, "Interpret playlist intent. Return only JSON.")
+        if failure:
+            return failed(failure, f"Compose interpretation provider failed: {failure}.")
+        intent, _extracted, _thinking, parse_error = parse_json_response(raw_a)
+    else:
+        intent, parse_error = preinterpreted_intent, None
+    anchor_ids = {anchor["id"] for anchor in phase_a_anchors}
     def valid_phase_a(parsed):
         required_keys = {"anchor_decisions", "target_count", "target_duration_seconds"}
         if not isinstance(parsed, dict) or not required_keys.issubset(parsed):
             return False
-        if set(parsed) not in (required_keys, required_keys | {"allow_nonstandard_versions"}):
+        allowed_keys = required_keys | {"allow_nonstandard_versions", "discovery_priority"}
+        if not set(parsed).issubset(allowed_keys):
             return False
         decisions = parsed["anchor_decisions"]
         count = parsed["target_count"]
@@ -1014,11 +1035,24 @@ def compose_playlist_with_llm(
                  and math.isfinite(duration) and duration > 0)
             and (count is not None or duration is not None)
             and type(parsed.get("allow_nonstandard_versions", False)) is bool
+            and parsed.get("discovery_priority", "balanced") in {"focused", "balanced", "exploratory"}
         )
-
-    intent, _extracted, _thinking, parse_error = parse_json_response(raw_a)
     if parse_error or not valid_phase_a(intent):
         return failed("SCHEMA_MISMATCH", "Compose interpretation values failed validation.")
+    missing_required = [
+        anchor for anchor in phase_a_anchors
+        if intent["anchor_decisions"][anchor["id"]] and anchor["id"] not in anchor_ref
+    ]
+    if missing_required:
+        names = ", ".join(
+            f"{anchor['resolved_library_track'].get('title', 'Unknown')} / "
+            f"{anchor['resolved_library_track'].get('artist', 'Unknown')}"
+            for anchor in missing_required
+        )
+        return failed(
+            "COMPOSER_ANCHOR_UNAVAILABLE",
+            f"Required library track(s) are unavailable on the selected server: {names}.",
+        )
     target_count = intent["target_count"]
     target_duration = intent["target_duration_seconds"]
     if (target_count is not None and target_duration is not None
@@ -1055,9 +1089,28 @@ def compose_playlist_with_llm(
                     "COMPOSER_SELECTION_SIZE_MISMATCH",
                     "The requested count and duration cannot both fit the library.",
                 )
+    if expansion_callback is not None and preinterpreted_intent is None:
+        try:
+            expanded_pool = expansion_callback(intent, pool)
+        except Exception:
+            logger.exception("Adaptive candidate retrieval failed; continuing with the initial pool")
+            expanded_pool = None
+        if expanded_pool and len(expanded_pool) > len(pool):
+            if log_messages is not None:
+                log_messages.append(
+                    f"Adaptive candidate universe: {len(pool)} -> {len(expanded_pool)} tracks"
+                )
+            return compose_playlist_with_llm(
+                user_request, expanded_pool, ai_config,
+                seed_provenance=seed_provenance, resolved_anchors=resolved_anchors,
+                ui_default_count=ui_default_count, log_messages=log_messages,
+                duration_rows=duration_rows, musical_review=musical_review,
+                preinterpreted_intent=intent,
+            )
     decisions = intent["anchor_decisions"]
     required_refs = {anchor_ref[key] for key, include in decisions.items() if include}
-    excluded_refs = {anchor_ref[key] for key, include in decisions.items() if not include}
+    excluded_refs = {anchor_ref[key] for key, include in decisions.items()
+                     if not include and key in anchor_ref}
     positive_neighborhoods = set()
     for anchor in phase_a_anchors:
         if not decisions.get(anchor["id"]):
@@ -1097,9 +1150,17 @@ def compose_playlist_with_llm(
             f"Only {available_count} eligible candidates are available for {target_count} tracks.",
         )
     neighborhood_minima = {}
+    artist_policy = None
     if target_count is not None and len(positive_neighborhoods) > 1:
-        from collections import Counter
-
+        available_artist_counts = Counter(
+            row.get("artist") or "Unknown" for row in numeric_records
+            if row["id"] not in excluded_refs
+        )
+        required_artist_counts = Counter(
+            next((row.get("artist") or "Unknown" for row in numeric_records
+                  if row["id"] == ref), "Unknown")
+            for ref in required_refs
+        )
         summary = []
         for index in sorted(positive_neighborhoods):
             members = [
@@ -1122,12 +1183,20 @@ def compose_playlist_with_llm(
             "meaningfully. Counts may differ substantially when the music or availability "
             "warrants it. A track in two neighborhoods can count toward both. Keep the "
             "minima feasible within the final playlist size, allowing room for other "
-            "related tracks. Return only JSON: "
-            '{"minimum_neighborhood_tracks":{"1":8,"2":6}}.\n'
+            "related tracks. Also decide an artist mix from the actual availability: "
+            "maximum tracks per artist and minimum distinct artists. A focused request "
+            "may allow concentration; a balanced or exploratory mix should prefer "
+            "meaningful discovery without choosing unrelated music. These are musical "
+            "targets, not a fixed source-code quota. Return only JSON with "
+            "minimum_neighborhood_tracks and artist_mix objects; artist_mix must contain "
+            "positive integer max_tracks_per_artist and minimum_distinct_artists.\n"
             f"Original request: {original_request}\n"
+            f"Discovery priority interpreted by LLM2A: {intent.get('discovery_priority', 'balanced')}\n"
             f"Final track count: {target_count}\n"
             f"Included library anchors: {len(required_refs)}\n"
             f"Additional track slots after included anchors: {target_count - len(required_refs)}\n"
+            f"Available distinct artists: {len(available_artist_counts)}\n"
+            f"Available artist counts: {json.dumps(available_artist_counts.most_common(30), ensure_ascii=False)}\n"
             f"Seed candidate availability: {json.dumps(summary, ensure_ascii=False)}"
         )
         availability = {
@@ -1142,31 +1211,50 @@ def compose_playlist_with_llm(
                 return failed(balance_failure, "Composer musical balance plan was unavailable.")
             balance, _, _, balance_parse_error = parse_json_response(balance_raw)
             requested_minima = balance.get("minimum_neighborhood_tracks") if isinstance(balance, dict) else None
+            raw_policy = balance.get("artist_mix") if isinstance(balance, dict) else None
             if (balance_parse_error or not isinstance(requested_minima, dict)
-                    or set(balance) != {"minimum_neighborhood_tracks"}
+                    or not set(balance).issubset({"minimum_neighborhood_tracks", "artist_mix"})
                     or set(requested_minima) != {str(index) for index in positive_neighborhoods}
                     or any(type(value) is not int or value < 1 for value in requested_minima.values())):
                 return failed("SCHEMA_MISMATCH", "Composer musical balance plan was invalid.")
             neighborhood_minima = {int(key): value for key, value in requested_minima.items()}
+            artist_policy = None
+            if (isinstance(raw_policy, dict)
+                    and set(raw_policy) == {"max_tracks_per_artist", "minimum_distinct_artists"}
+                    and all(type(value) is int and value > 0 for value in raw_policy.values())):
+                artist_policy = raw_policy
             excess = sum(neighborhood_minima.values()) - (target_count - len(required_refs))
             over_available = {
                 index: value for index, value in neighborhood_minima.items()
                 if value > availability[index]
             }
-            if excess <= 0 and not over_available:
+            cap = artist_policy.get("max_tracks_per_artist") if artist_policy else None
+            minimum_artists = artist_policy.get("minimum_distinct_artists") if artist_policy else None
+            artist_infeasible = bool(artist_policy and (
+                cap > target_count or minimum_artists > min(target_count, len(available_artist_counts))
+                or any(count > cap for count in required_artist_counts.values())
+                or sum(min(cap, count) for count in available_artist_counts.values()) < target_count
+            ))
+            if excess <= 0 and not over_available and not artist_infeasible:
                 break
             if attempt:
-                return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Composer musical balance plan exceeds available candidates.")
+                if excess > 0 or over_available:
+                    return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Composer musical balance plan exceeds available candidates.")
+                artist_policy = None  # Keep the valid playlist plan if its soft artist goal is infeasible.
+                break
             balance_prompt += (
                 "\n\nREVISE YOUR MUSICAL BALANCE PLAN: Your previous minima were "
                 f"{json.dumps(neighborhood_minima, sort_keys=True)}. Their sum exceeds "
                 f"the {target_count - len(required_refs)} available additional slots by "
                 f"{max(0, excess)}. Counts above neighborhood availability: "
                 f"{json.dumps(over_available, sort_keys=True)}. Decide revised unequal "
-                "minima that fit the real slot and candidate counts. Return only the same JSON shape."
+                "minima that fit the real slot and candidate counts. Revise artist_mix too "
+                "if its cap or distinct-artist target exceeds the available music. "
+                "Return the same JSON fields."
             )
         if log_messages is not None:
             log_messages.append(f"Compose Phase B musical seed minima: {json.dumps(neighborhood_minima, sort_keys=True)}")
+            log_messages.append(f"Compose Phase B artist mix: {json.dumps(artist_policy, sort_keys=True)}")
     if log_messages is not None:
         log_messages.append(
             f"Compose Phase A: target_count={target_count}; target_duration={target_duration}; "
@@ -1180,7 +1268,7 @@ def compose_playlist_with_llm(
 
     phase_b_anchors = [
         {**anchor, "candidate_ref": anchor_ref[anchor["id"]], "include": decisions[anchor["id"]]}
-        for anchor in phase_a_anchors
+        for anchor in phase_a_anchors if anchor["id"] in anchor_ref
     ]
     duration_instruction = (
         f"Rank exactly {selection_count} musically suitable, UNIQUE candidate references in preference order. "
@@ -1234,6 +1322,7 @@ def compose_playlist_with_llm(
     repair_attempted = False
     if neighborhood_minima:
         by_ref = {row["id"]: row for row in numeric_records}
+        artist_cap = artist_policy.get("max_tracks_per_artist") if artist_policy else None
         refs = [
             anchor_ref[anchor["id"]] for anchor in phase_a_anchors
             if decisions[anchor["id"]]
@@ -1242,25 +1331,45 @@ def compose_playlist_with_llm(
 
         def select_exact_group(phase, label, rows, requested):
             selected_ids = []
-            for attempt in range(2):
-                remaining = [
-                    row for row in rows
-                    if row["id"] not in chosen and row["id"] not in selected_ids
-                ]
+            for attempt in range(4 if artist_cap is not None else 2):
                 missing = requested - len(selected_ids)
                 if missing <= 0:
                     break
+                active_cap = artist_cap if attempt < 3 else None
+                if attempt == 3 and log_messages is not None:
+                    log_messages.append(f"{phase}: relaxing soft artist target to preserve playlist completion")
+                artist_counts = Counter(
+                    by_ref[ref].get("artist") or "Unknown" for ref in refs + selected_ids
+                )
+                remaining = [
+                    row for row in rows
+                    if row["id"] not in chosen and row["id"] not in selected_ids
+                    and (active_cap is None
+                         or artist_counts[row.get("artist") or "Unknown"] < active_cap)
+                ]
+                if len(remaining) < missing and active_cap is not None:
+                    if log_messages is not None:
+                        log_messages.append(f"{phase}: artist target leaves only {len(remaining)} choices for {missing} slots")
+                    continue
+                retry_guidance = (
+                    f"Your earlier reply did not fill all slots. Return exactly {missing} "
+                    "eligible numeric IDs in one JSON object with playlist_ids and no prose.\n"
+                    if attempt else ""
+                )
                 prompt = (
                     "Choose musically suitable real-library tracks for this portion of the "
                     "playlist. This neighborhood's representation was decided by LLM2's "
                     "musical balance plan. Return exactly the missing number of UNIQUE "
-                    "numeric candidate references and no prose: "
-                    '{"playlist_ids":[1,2,3]}.\n'
+                    "numeric candidate references. Return one JSON object containing only "
+                    "playlist_ids, with the chosen references as its array; no prose or "
+                    "example values.\n"
                     f"Original request: {original_request}\n"
                     f"Normalized intent: {json.dumps(intent, ensure_ascii=False)}\n"
+                    f"LLM2 artist mix: {json.dumps(artist_policy, ensure_ascii=False)}\n"
                     f"Seed neighborhood: {label}\n"
                     f"Missing track choices: {missing}\n"
                     f"Already chosen tracks: {json.dumps([by_ref[ref] for ref in refs + selected_ids], ensure_ascii=False)}\n"
+                    f"{retry_guidance}"
                     f"Eligible candidates: {json.dumps(remaining, ensure_ascii=False)}"
                 )
                 raw, failure = call_phase(
@@ -1271,18 +1380,35 @@ def compose_playlist_with_llm(
                         log_messages.append(f"{phase}: provider guard {failure}")
                     return None
                 parsed, _, _, parse_error = parse_json_response(raw)
-                group_key = next(iter(parsed)) if isinstance(parsed, dict) and len(parsed) == 1 else None
-                proposed = parsed.get(group_key) if group_key in {"playlist_ids", "ids", "selected_ids"} else None
+                allowed = {row["id"] for row in remaining}
+                proposed = None
+                if isinstance(parsed, dict) and set(parsed).issubset(
+                    {"playlist_ids", "ids", "selected_ids", "track_ids"}
+                ):
+                    options = []
+                    for priority, key in enumerate(("playlist_ids", "ids", "selected_ids", "track_ids")):
+                        values = parsed.get(key)
+                        if not isinstance(values, list):
+                            continue
+                        normalized = [int(value) if type(value) is str and value.isdecimal() else value
+                                      for value in values]
+                        valid_count = len({value for value in normalized
+                                           if type(value) is int and value in allowed})
+                        options.append((valid_count, -priority, values))
+                    if options:
+                        proposed = max(options)[2]
                 if parse_error or not isinstance(proposed, list):
                     if log_messages is not None:
-                        log_messages.append(f"{phase}: invalid JSON shape")
-                    return None
-                allowed = {row["id"] for row in remaining}
+                        log_messages.append(f"{phase}: invalid JSON shape; retrying remaining choices")
+                    continue
                 for ref in proposed:
                     if type(ref) is str and ref.isdecimal():
                         ref = int(ref)
-                    if type(ref) is int and ref in allowed and ref not in selected_ids:
+                    artist = by_ref[ref].get("artist") or "Unknown" if type(ref) is int and ref in by_ref else None
+                    if (type(ref) is int and ref in allowed and ref not in selected_ids
+                            and (active_cap is None or artist_counts[artist] < active_cap)):
                         selected_ids.append(ref)
+                        artist_counts[artist] += 1
                         if len(selected_ids) == requested:
                             break
                 if log_messages is not None:
@@ -1329,16 +1455,20 @@ def compose_playlist_with_llm(
                 return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "LLM2 could not fill the remaining playlist slots.")
             refs.extend(extra_ids)
             chosen.update(extra_ids)
-        order_presentation = [
-            by_ref[item_id_to_numeric[str(song["item_id"])]]
-            for song in _rerank_candidate_order(
-                [numeric_to_song[ref] for ref in refs], context + "-final-order"
-            )
-        ]
+        order_presentation = []
+        for song in _rerank_candidate_order(
+            [numeric_to_song[ref] for ref in refs], context + "-final-order"
+        ):
+            row = by_ref[item_id_to_numeric[str(song["item_id"])]]
+            order_presentation.append({
+                key: row[key] for key in ("id", "title", "artist", "seed_neighborhoods")
+                if key in row
+            })
         order_prompt = (
             "Order exactly these LLM2-selected library tracks as a coherent playlist. "
             "Return every supplied numeric ID exactly once, with no additions, omissions, "
-            "or prose: {\"playlist_ids\":[1,2,3]}. Respect any explicit ordering in the "
+            "or prose. Return one JSON object with only playlist_ids, containing the ordered "
+            "numeric references. Respect any explicit ordering in the "
             "original request. Otherwise weave the different seed directions into a "
             "musically plausible journey rather than placing each seed in one long block. "
             "The selected tracks below are shuffled; their presentation order is not a "
@@ -1346,17 +1476,28 @@ def compose_playlist_with_llm(
             f"Original request: {original_request}\n"
             f"Selected tracks: {json.dumps(order_presentation, ensure_ascii=False)}"
         )
-        order_raw, order_failure = call_phase(
-            "Phase B order", order_prompt, "Order selected music. Return only JSON.", len(refs),
-        )
-        if order_failure:
-            return failed(order_failure, "LLM2 playlist ordering was unavailable.")
-        order_result, _, _, order_parse_error = parse_json_response(order_raw)
-        order_key = next(iter(order_result)) if isinstance(order_result, dict) and len(order_result) == 1 else None
-        ordered_ids = order_result.get(order_key) if order_key in {"playlist_ids", "ids", "selected_ids"} else None
-        if (order_parse_error or not isinstance(ordered_ids, list)
-                or order_key not in {"playlist_ids", "ids", "selected_ids"}):
-            return failed("SCHEMA_MISMATCH", "LLM2 playlist ordering JSON was invalid.")
+        ordered_ids = None
+        for attempt in range(2):
+            prompt = order_prompt + (
+                "\nYour prior ordering reply was unusable. Return the complete numeric ID list "
+                "once, in a single playlist_ids array, and stop." if attempt else ""
+            )
+            order_raw, order_failure = call_phase(
+                "Phase B order" if not attempt else "Phase B order retry",
+                prompt, "Order selected music. Return only JSON.", len(refs),
+            )
+            if order_failure:
+                continue
+            order_result, _, _, order_parse_error = parse_json_response(order_raw)
+            order_key = next(iter(order_result)) if isinstance(order_result, dict) and len(order_result) == 1 else None
+            candidate_order = order_result.get(order_key) if order_key in {"playlist_ids", "ids", "selected_ids"} else None
+            if not order_parse_error and isinstance(candidate_order, list):
+                ordered_ids = candidate_order
+                break
+        if ordered_ids is None:
+            ordered_ids = list(refs)
+            if log_messages is not None:
+                log_messages.append("Compose Phase B order: model ordering unavailable; preserving LLM2 selections")
         ordered = []
         ordered_set = set()
         for ref in ordered_ids:
@@ -1532,8 +1673,6 @@ def compose_playlist_with_llm(
 
     preferred_final_count = None
     if musical_review and not neighborhood_minima and len(valid_refs) > 1 and len(valid_refs) < available_count:
-        from collections import Counter
-
         by_ref = {row["id"]: row for row in numeric_records}
         current_rows = [by_ref[ref] for ref in valid_refs]
         selected_artists = Counter(row.get("artist") or "Unknown" for row in current_rows)
@@ -1806,6 +1945,76 @@ def compose_playlist_with_llm(
             )
         if log_messages is not None:
             log_messages.append(f"Compose Phase B final seed coverage: {json.dumps(final_coverage, sort_keys=True)}")
+
+    if artist_policy and valid_refs:
+        by_ref = {row["id"]: row for row in numeric_records}
+        artist_cap = artist_policy["max_tracks_per_artist"]
+        artist_floor = artist_policy["minimum_distinct_artists"]
+
+        def artist_mix_gap(refs):
+            counts = Counter(by_ref[ref].get("artist") or "Unknown" for ref in refs)
+            excess = sum(max(0, count - artist_cap) for count in counts.values())
+            return excess + max(0, artist_floor - len(counts)), counts
+
+        gap, artist_counts = artist_mix_gap(valid_refs)
+        if gap:
+            remaining = [row for row in numeric_records
+                         if row["id"] not in set(valid_refs) and row["id"] not in excluded_refs]
+            repair_prompt = (
+                "Improve the artist variety of this selected playlist using only the supplied "
+                "real-library alternatives. Return JSON with swaps only: "
+                '{"swaps":[{"remove_id":1,"add_id":2}]}. Preserve every required anchor, '
+                "the playlist size, and each seed neighborhood's musical minimum. "
+                "Choose musically fitting replacements; do not add unrelated music solely "
+                "to meet a number. Return an empty swaps list if no suitable improvement exists.\n"
+                f"Original request: {original_request}\n"
+                f"Discovery priority: {intent.get('discovery_priority', 'balanced')}\n"
+                f"Artist mix chosen by LLM2: {json.dumps(artist_policy)}\n"
+                f"Current distinct artists: {len(artist_counts)}\n"
+                f"Current artist counts: {json.dumps(artist_counts.most_common(), ensure_ascii=False)}\n"
+                f"Required references: {json.dumps(sorted(required_refs))}\n"
+                f"Seed minima: {json.dumps(neighborhood_minima, sort_keys=True)}\n"
+                f"Current selection: {json.dumps([by_ref[ref] for ref in valid_refs], ensure_ascii=False)}\n"
+                f"Alternatives: {json.dumps(remaining, ensure_ascii=False)}"
+            )
+            repair_raw, repair_failure = call_phase(
+                "Artist mix repair", repair_prompt,
+                "Improve musical artist variety using only supplied candidates. Return JSON.",
+                len(valid_refs),
+            )
+            if not repair_failure:
+                proposal, _, _, parse_error = parse_json_response(repair_raw)
+                swaps = proposal.get("swaps") if isinstance(proposal, dict) else None
+                if not parse_error and isinstance(swaps, list) and set(proposal) == {"swaps"}:
+                    for swap in swaps:
+                        if not isinstance(swap, dict) or set(swap) != {"remove_id", "add_id"}:
+                            continue
+                        old, new = swap["remove_id"], swap["add_id"]
+                        if (type(old) is not int or type(new) is not int or old in required_refs
+                                or old not in valid_refs or new not in eligible_refs
+                                or new in valid_refs or new in excluded_refs):
+                            continue
+                        candidate = list(valid_refs)
+                        candidate[candidate.index(old)] = new
+                        if any(
+                            sum(index in by_ref[ref].get("seed_neighborhoods", [])
+                                for ref in candidate) < minimum
+                            for index, minimum in neighborhood_minima.items()
+                        ):
+                            continue
+                        new_gap, _ = artist_mix_gap(candidate)
+                        if new_gap < gap:
+                            valid_refs = candidate
+                            gap = new_gap
+            if log_messages is not None:
+                log_messages.append(f"Compose artist mix repair: remaining gap={gap}")
+        if log_messages is not None:
+            final_gap, final_counts = artist_mix_gap(valid_refs)
+            log_messages.append(
+                f"Compose artist variety: {len(final_counts)} distinct artists; "
+                f"largest artist share={max(final_counts.values())}/{len(valid_refs)}; "
+                f"LLM2 target gap={final_gap}"
+            )
 
     authoritative = [numeric_to_song[ref] for ref in valid_refs]
     if log_messages is not None:
