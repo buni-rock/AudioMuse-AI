@@ -138,6 +138,16 @@ ENUM_FIELD_OPTIONS = {
     'IVF_METRIC': ['angular', 'euclidean', 'dot'],
 }
 
+INSTANT_PLAYLIST_LIMIT_MINIMUMS = {
+    'INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES': 0,
+    'INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE': 2048,
+    'COMPOSER_MAX_OUTPUT_TOKENS': 1,
+    'INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS': 0,
+    'INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES': 1,
+    'INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS': 0,
+    'INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES': 1,
+}
+
 HIDDEN_ADVANCED_FIELDS = {
     # Internal vocabularies and derived/runtime state that are not settings at
     # all. They are already in SETUP_BOOTSTRAP_EXCLUDED_KEYS or recomputed on
@@ -536,6 +546,23 @@ def _validate_ai_prompt_values(filtered_values):
     return None
 
 
+def _validate_instant_playlist_limits(filtered_values):
+    for name, minimum in INSTANT_PLAYLIST_LIMIT_MINIMUMS.items():
+        if name not in filtered_values:
+            continue
+        value = filtered_values[name]
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return f'{name} must be an integer of at least {minimum}.'
+        if parsed < minimum:
+            return f'{name} must be an integer of at least {minimum}.'
+        filtered_values[name] = parsed
+    return None
+
+
 def _get_allowed_setup_keys():
     allowed_keys = set()
     for f in setup_manager.get_all_fields(config):
@@ -770,6 +797,10 @@ def setup_api():
         prompt_problem = _validate_ai_prompt_values(filtered_values)
         if prompt_problem:
             return json_error(ERR_INVALID_REQUEST, prompt_problem)
+
+        limit_problem = _validate_instant_playlist_limits(filtered_values)
+        if limit_problem:
+            return json_error(ERR_INVALID_REQUEST, limit_problem)
 
         # Validate any Lyrics API URL templates before persisting them.
         for slot in (1, 2):

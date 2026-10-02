@@ -2125,8 +2125,6 @@ composition and validation as separate stages. Native mode remains a separate
 baseline and omits the composer stage. Configured retrieval, composer-context,
 output-token and application maximums are logged capacity limits; they do not
 silently turn additional-count requests into smaller playlists.
-For source-build and regression steps, see
-[Instant Playlist validation](INSTANT_PLAYLIST_VALIDATION.md).
 `POST /chat/api/chatPlaylist` returns the final result in one response.
 `POST /chat/api/chatPlaylistStream` streams the same run as Server-Sent Events, so
 the page can show each step as it happens. Optionally

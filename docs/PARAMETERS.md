@@ -119,7 +119,7 @@ These are the default parameters used when launching analysis or clustering task
 | `INSTANT_PLAYLIST_SELECTION_MODE` | Default final selection mode: `NATIVE` or `LLM_COMPOSE` (`LLM_RERANK` and `LLM_CURATE` migrate to `LLM_COMPOSE`). | `NATIVE` |
 | `INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES` | Maximum compact candidate records sent to LLM Compose. Balanced reduction preserves seed neighborhoods; `0` sends the full collected candidate pool. | `300` |
 | `INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE` | Explicit Ollama context size for LLM Compose. | `32768` |
-| `COMPOSER_MAX_OUTPUT_TOKENS` | Temporary Composer generation ceiling for diagnosis, independent of UI song count. | `4096` |
+| `COMPOSER_MAX_OUTPUT_TOKENS` | Composer generation ceiling, independent of UI song count. | `4096` |
 | `INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS` | Ollama Compose request timeout; `0` disables the timeout. Other providers keep their own timeout behavior. | `300` |
 | `INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES` | Technical candidate limit for duration optimization. | `100` |
 | `INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS` | Maximum final playlist duration error in seconds for a successful duration request. | `15` |
