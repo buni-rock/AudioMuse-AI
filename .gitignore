@@ -28,7 +28,6 @@ env/
 # IDE and editor configuration
 .vscode/
 .idea/
-.devcontainer/
 
 # macOS Finder / metadata files
 .DS_Store

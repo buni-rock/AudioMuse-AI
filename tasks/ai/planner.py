@@ -1187,16 +1187,6 @@ def _shape_result(result: Dict, hints: Dict, log_messages: List[str], plan: 'Too
     return result
 
 
-def requested_playlist_shape(text: str) -> Dict:
-    """Deprecated compatibility parser; do not use for application semantics."""
-    hints: Dict = {}
-    notes: List[str] = []
-    if text and isinstance(text, str):
-        _duration_hints(text, hints, notes)
-        _playlist_shape_hints(text, hints, notes)
-    return {k: hints[k] for k in ('song_count', 'total_seconds', 'max_per_artist') if hints.get(k)}
-
-
 _NAMED_SEED_CUES = (
     re.compile(r"\bstarting\s+from\s+", re.IGNORECASE),
     re.compile(r"\bstart(?:ing)?\s+with\s+", re.IGNORECASE),
@@ -1297,12 +1287,6 @@ def extract_named_song_seed_details(text: str) -> Optional[Dict[str, str]]:
         if artist:
             details["artist"] = artist
     return details
-
-
-def extract_named_song_seed(text: str) -> Optional[str]:
-    """Return the title extracted from explicit named-song wording."""
-    details = extract_named_song_seed_details(text)
-    return details.get("title") if details else None
 
 
 def extract_explicit_song_mentions(text: str) -> List[Dict[str, str]]:

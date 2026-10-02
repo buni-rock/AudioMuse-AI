@@ -123,7 +123,7 @@ These are the default parameters used when launching analysis or clustering task
 | `INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS` | Ollama Compose request timeout; `0` disables the timeout. Other providers keep their own timeout behavior. | `300` |
 | `INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES` | Technical candidate limit for duration optimization. | `100` |
 | `INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS` | Maximum final playlist duration error in seconds for a successful duration request. | `15` |
-| `INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES` | Technical collection limit across retrieval calls; requested per-seed budgets remain authoritative below this cap. | `300` |
+| `INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES` | Technical collection limit across retrieval calls; requested per-seed budgets remain authoritative below this cap. | `600` |
 | `PLAYLIST_ENERGY_ARC`                       | Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down).                                       | `false`         |
 | **Similarity General**                      |                                                                                                                           |                 |
 | `IVF_METRIC`                                | Distance metric used by the similarity index: `angular` (cosine), `euclidean`, or `dot` (inner product). Changing it requires an index rebuild.                                                                                            | `angular`       |

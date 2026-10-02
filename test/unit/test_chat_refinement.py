@@ -189,20 +189,12 @@ class TestShapeHints:
         assert _hints('songs added recently')['added_within_days'] == planner.RECENTLY_ADDED_DAYS
         assert _hints('songs added this week')['added_within_days'] == 7
 
-    def test_requested_playlist_shape(self):
-        shape = planner.requested_playlist_shape('give me 20 songs, one per artist')
-        assert shape == {'song_count': 20, 'max_per_artist': 1}
-
-    def test_thirty_minute_budget_is_seconds_not_song_count(self):
-        shape = planner.requested_playlist_shape('30 minute playlist')
-        assert shape == {'total_seconds': 1800.0}
-
     def test_named_seed_extraction_handles_starting_from_request(self):
         request = (
             'I would like a 30 minute playlist starting from Dark chest of wonders songs. '
             'The playlist should contain similar songs to this one.'
         )
-        assert planner.extract_named_song_seed(request) == 'Dark chest of wonders'
+        assert planner.extract_named_song_seed_details(request)['title'] == 'Dark chest of wonders'
 
     @pytest.mark.parametrize(
         'request_text, expected_title, expected_artist',
@@ -227,7 +219,7 @@ class TestShapeHints:
         assert details.get('artist') == expected_artist
 
     def test_named_seed_parser_does_not_treat_would_like_as_a_seed(self):
-        assert planner.extract_named_song_seed('I would like you to build a 30 minutes playlist') is None
+        assert planner.extract_named_song_seed_details('I would like you to build a 30 minutes playlist') is None
 
     def test_planner_failure_does_not_infer_seed_semantics_from_raw_text(self, monkeypatch):
         monkeypatch.setattr(planner, 'call_ai_for_plan', lambda *a, **k: {'error': 'invalid JSON: unexpected text'})

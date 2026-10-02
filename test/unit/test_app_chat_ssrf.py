@@ -75,8 +75,6 @@ def _install_fakes(planner_calls):
 
     fake_planner = types.ModuleType('tasks.ai.planner')
     fake_planner.plan_and_execute_once = _planner
-    fake_planner.requested_playlist_shape = lambda text: {}
-    fake_planner.extract_named_song_seed = lambda text: None
     fake_planner.extract_named_song_seed_details = lambda text: None
 
     fake_mcp = types.ModuleType('tasks.mcp_helper')
