@@ -60,7 +60,7 @@ def _song(item_id, artist):
     return {'item_id': item_id, 'artist': artist, 'title': f'{artist} {item_id}'}
 
 
-def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_applied=True, plan_result_extra=None):
+def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_applied=True, plan_result_extra=None, translate_ids=None):
     import tasks.ai.planner as planner
     import tasks.mcp_helper as mcp_helper
 
@@ -82,6 +82,11 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_appli
         app_chat.app_server_context,
         'scope_results',
         lambda rows, _server, **kwargs: list(rows),
+    )
+    monkeypatch.setattr(
+        app_chat.app_server_context,
+        'translate_ids_for_request',
+        translate_ids or (lambda ids: {str(item_id): str(item_id) for item_id in ids}),
     )
 
     payload = {'userInput': 'build me a playlist', 'ai_provider': 'OLLAMA'}
@@ -209,6 +214,40 @@ def test_compose_count_and_duration_respects_both(monkeypatch):
     assert len(response['query_results']) == 2
     assert response['actual_duration_seconds'] == 900
     assert 'OK SUCCESS' in response['message']
+
+
+def test_compose_delivers_provider_ids_from_initial_availability_check(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    songs = [_song(str(i), f'Artist {i}') for i in range(3)]
+    translations = []
+    feature_calls = []
+
+    def translate(ids):
+        translations.append(list(ids))
+        return {str(item_id): f'provider-{item_id}' for item_id in ids}
+
+    def features(ids):
+        feature_calls.append(list(ids))
+        return {str(item_id): {'duration': 200} for item_id in ids}
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm',
+                        lambda _request, rows, _config, **kwargs: ({
+                            'playlist': rows,
+                            'requested_output': {'target_count': 3, 'target_duration_seconds': None},
+                            'anchor_decisions': [], 'shortfall_reason': None,
+                        }, len(rows)))
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', features)
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE'}, translate_ids=translate,
+    )
+    assert [row['item_id'] for row in response['query_results']] == [
+        'provider-0', 'provider-1', 'provider-2',
+    ]
+    assert len(translations) == 1
+    assert len(feature_calls) == 1
+    assert 'Playlist response ready: 3 tracks' in response['message']
 
 
 def test_resolved_explicit_song_is_mandatory_and_first_in_native_playlist(monkeypatch):

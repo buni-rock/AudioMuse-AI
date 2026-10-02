@@ -2831,7 +2831,6 @@ def plan_and_execute_once(
         if retrieval_only:
             semantic_intent = {
                 'anchors': semantic_intent['anchors'],
-                'retrieval_size_hint': semantic_intent.get('retrieval_size_hint'),
             }
             semantic_intent = _preserve_explicit_song_references(semantic_intent, raw_request, log_messages)
         planner_wall_clock = time.monotonic() - planner_started
@@ -2852,12 +2851,20 @@ def plan_and_execute_once(
         requested_final_count = (
             count_spec['value'] + (included_songs if count_spec['mode'] == 'additional' else 0)
         ) if count_spec else None
-        retrieval_target = max(
-            int(retrieval_hint or 0), int(requested_final_count or target_song_count or config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS)
-        )
-        retrieval_size = min(collection_cap, _retrieval_budget(retrieval_target))
+        if retrieval_only:
+            seed_count = max(1, sum(
+                anchor.get('type') in {'song', 'artist', 'album'}
+                for anchor in semantic_intent.get('anchors', [])
+            ))
+            composer_window = int(config.INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES or collection_cap)
+            retrieval_size = max(1, min(collection_cap, composer_window) // seed_count)
+        else:
+            retrieval_target = max(
+                int(retrieval_hint or 0), int(requested_final_count or target_song_count or config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS)
+            )
+            retrieval_size = min(collection_cap, _retrieval_budget(retrieval_target))
         semantic_intent['effective_retrieval_budget'] = retrieval_size
-        log_messages.append(f"Retrieval size hint: {retrieval_hint or 'not specified'}; effective retrieval budget: {retrieval_size}")
+        log_messages.append(f"Effective per-seed retrieval budget: {retrieval_size}")
         for call in raw_calls:
             if isinstance(call,dict) and call.get('name') in {'seed_search','text_match','knowledge_lookup',FILTER_NAME}:
                 args=call.setdefault('arguments',{}); args['get_songs']=retrieval_size

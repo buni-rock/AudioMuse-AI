@@ -4,6 +4,13 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    volumes:
+      - ../app_chat.py:/app/app_chat.py:ro
+      - ../config.py:/app/config.py:ro
+      - ../tasks/ai/planner.py:/app/tasks/ai/planner.py:ro
+      - ../tasks/ai/prompts.py:/app/tasks/ai/prompts.py:ro
+      - ../tasks/playlist_curation.py:/app/tasks/playlist_curation.py:ro
+      - ../templates/chat.html:/app/templates/chat.html:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
   audiomuse-ai-worker:

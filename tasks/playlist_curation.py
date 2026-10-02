@@ -369,12 +369,25 @@ def suppress_duplicate_title_artist(songs):
 _VERSION_MARKER_RE = re.compile(
     r"(?:remix|\b[a-z0-9 &'._-]*\bmix\b|radio\s+edit|single\s+edit|extended\s+edit|"
     r"\bedit\b|instrumental|acoustic|demo|live(?:\s+version)?|remaster(?:ed)?|"
-    r"single\s+version|album\s+version|\bversion\b|mono\s+version|stereo\s+version)",
+    r"single\s+version|album\s+version|\bversion\b|mono\s+version|stereo\s+version|"
+    r"evolution\s+track|bonus\s+track)",
     re.I,
 )
 _TRAILING_VERSION_RE = re.compile(
     r"\s*(?:\(([^()]*)\)|\[([^\[\]]*)\]|\s[-–—]\s([^()\[\]]+))\s*$"
 )
+
+
+def is_alternate_recording(song):
+    """Identify explicit version labels in library titles, not request language."""
+    title = str(song.get("title") or "").strip()
+    if re.search(r"\bversion$", title, re.I):
+        return True
+    match = _TRAILING_VERSION_RE.search(title)
+    if not match:
+        return False
+    suffix = next((value for value in match.groups() if value is not None), "")
+    return bool(_VERSION_MARKER_RE.search(suffix))
 
 
 def song_family_key(song):
@@ -780,6 +793,7 @@ def curate_candidates_with_llm(
 def compose_playlist_with_llm(
     user_request, songs, ai_config, *, seed_provenance=None,
     resolved_anchors=None, ui_default_count=None, log_messages=None,
+    duration_rows=None, musical_review=False,
 ):
     """Compose one ordered final playlist from the original request and library candidates."""
     from tasks.ai.api import generate_text
@@ -835,6 +849,29 @@ def compose_playlist_with_llm(
     numeric_records = [
         {**record, "id": index} for index, record in enumerate(records, 1)
     ]
+    neighborhood_labels = []
+    neighborhoods_by_track = {}
+    for label, ids in (seed_provenance or {}).items():
+        neighborhood_labels.append(str(label))
+        neighborhood_ref = len(neighborhood_labels)
+        for item_id in ids:
+            neighborhoods_by_track.setdefault(str(item_id), []).append(neighborhood_ref)
+    for index, record in enumerate(numeric_records, 1):
+        memberships = neighborhoods_by_track.get(str(numeric_to_song[index]["item_id"]))
+        if memberships:
+            record["seed_neighborhoods"] = memberships
+    duration_rows = duration_rows or {}
+    candidate_durations = []
+    for index, record in enumerate(numeric_records, 1):
+        song = numeric_to_song[index]
+        raw_duration = (duration_rows.get(song["item_id"]) or {}).get("duration")
+        try:
+            seconds = int(float(raw_duration))
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            record["duration_seconds"] = seconds
+            candidate_durations.append(seconds)
     phase_a_anchors = [
         {**anchor, "id": f"A{index:03d}"}
         for index, anchor in enumerate(anchor_records, 1)
@@ -876,8 +913,12 @@ def compose_playlist_with_llm(
 
     def call_phase(phase, prompt, system_prompt, selection_count=None):
         metadata = {}
-        is_selection = phase != "Phase A"
-        budget = min(output_ceiling, max(512, 128 + 5 * (selection_count or len(records)))) if is_selection else min(output_ceiling, 512)
+        is_selection = (phase.startswith("Phase B") and not phase.startswith("Phase B balance")) or phase in {"Review", "Coverage repair"}
+        budget = (
+            min(output_ceiling, max(2048 if phase in {"Review", "Coverage repair"} else 512,
+                                    128 + 8 * (selection_count or len(records))))
+            if is_selection else min(output_ceiling, 512)
+        )
         options = (
             {"think": False, "allow_think_fallbacks": False, "num_ctx": context_setting,
              "call_metadata": metadata, "timeout": timeout, "selection_stream": is_selection}
@@ -936,12 +977,16 @@ def compose_playlist_with_llm(
     phase_a_prompt = (
         "Interpret the ORIGINAL user request into the final executable playlist intent. "
         "Return only JSON: {\"anchor_decisions\":{\"A001\":true},\"target_count\":64,"
-        "\"target_duration_seconds\":null}. Do not return playlist IDs, candidate rankings, "
+        "\"target_duration_seconds\":null,\"allow_nonstandard_versions\":false}. "
+        "Do not return playlist IDs, candidate rankings, "
         "explanations, analysis, or markdown. Include one boolean decision for every resolved anchor ID. "
         "Set target_count to the final TOTAL track count, including every anchor marked true. "
         "For 'add N' requests, add N to the count of included anchors. "
-        "If no count is requested, use the UI default. For duration-only requests, "
-        "target_count may be null and target_duration_seconds is the requested duration in seconds. "
+        "If the request states a duration but no track count, target_count MUST be null. "
+        "Use the UI default only when the request states neither a count nor a duration. "
+        "target_duration_seconds is the requested duration in seconds. "
+        "Set allow_nonstandard_versions true when the user wants live, remixed, acoustic, "
+        "instrumental, edited or other alternate recordings; otherwise set it false. "
         "Stop after the JSON object.\n"
         f"Original user request (verbatim): {original_request}\n"
         f"UI default song count: {default_count}\n"
@@ -951,31 +996,182 @@ def compose_playlist_with_llm(
     raw_a, failure = call_phase("Phase A", phase_a_prompt, "Interpret playlist intent. Return only JSON.")
     if failure:
         return failed(failure, f"Compose interpretation provider failed: {failure}.")
-    intent, _extracted, _thinking, parse_error = parse_json_response(raw_a)
     anchor_ids = set(anchor_ref)
-    if (
-        parse_error or not isinstance(intent, dict)
-        or set(intent) != {"anchor_decisions", "target_count", "target_duration_seconds"}
-    ):
-        return failed("SCHEMA_MISMATCH", "Compose interpretation did not return the required JSON fields.")
-    decisions = intent["anchor_decisions"]
+    def valid_phase_a(parsed):
+        required_keys = {"anchor_decisions", "target_count", "target_duration_seconds"}
+        if not isinstance(parsed, dict) or not required_keys.issubset(parsed):
+            return False
+        if set(parsed) not in (required_keys, required_keys | {"allow_nonstandard_versions"}):
+            return False
+        decisions = parsed["anchor_decisions"]
+        count = parsed["target_count"]
+        duration = parsed["target_duration_seconds"]
+        return (
+            isinstance(decisions, dict) and set(decisions) == anchor_ids
+            and all(type(value) is bool for value in decisions.values())
+            and (count is None or type(count) is int and count > 0)
+            and (duration is None or type(duration) in (int, float)
+                 and math.isfinite(duration) and duration > 0)
+            and (count is not None or duration is not None)
+            and type(parsed.get("allow_nonstandard_versions", False)) is bool
+        )
+
+    intent, _extracted, _thinking, parse_error = parse_json_response(raw_a)
+    if parse_error or not valid_phase_a(intent):
+        return failed("SCHEMA_MISMATCH", "Compose interpretation values failed validation.")
     target_count = intent["target_count"]
     target_duration = intent["target_duration_seconds"]
-    if (
-        not isinstance(decisions, dict) or set(decisions) != anchor_ids
-        or any(type(value) is not bool for value in decisions.values())
-        or not (target_count is None or type(target_count) is int and target_count > 0)
-        or not (target_duration is None or type(target_duration) in (int, float)
-                and math.isfinite(target_duration) and target_duration > 0)
-        or (target_count is None and target_duration is None)
-    ):
-        return failed("SCHEMA_MISMATCH", "Compose interpretation values failed validation.")
+    if (target_count is not None and target_duration is not None
+            and len(candidate_durations) >= target_count):
+        shortest_possible = sum(sorted(candidate_durations)[:target_count])
+        if shortest_possible > target_duration + config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS:
+            repair_prompt = (
+                f"{phase_a_prompt}\n"
+                f"Your previous target_count={target_count} and target_duration_seconds={target_duration} "
+                f"cannot both fit the library: even the {target_count} shortest eligible tracks "
+                f"take {shortest_possible} seconds. Re-read the original request. If it does not "
+                "explicitly request a track count, set target_count=null; otherwise retain the "
+                "explicit count so the application can report that it is impossible. "
+                "Return the same Phase A JSON fields only."
+            )
+            repaired_raw, repair_failure = call_phase(
+                "Phase A feasibility repair", repair_prompt,
+                "Reconsider only the count interpretation. Return only JSON.",
+            )
+            if repair_failure:
+                return failed(repair_failure, f"Compose interpretation repair failed: {repair_failure}.")
+            repaired, _extracted, _thinking, repair_parse_error = parse_json_response(repaired_raw)
+            if (repair_parse_error or not valid_phase_a(repaired)
+                    or repaired["anchor_decisions"] != intent["anchor_decisions"]
+                    or repaired["target_duration_seconds"] != target_duration):
+                return failed("SCHEMA_MISMATCH", "Compose interpretation repair was invalid.")
+            intent = repaired
+            target_count = intent["target_count"]
+            target_duration = intent["target_duration_seconds"]
+            if (target_count is not None and len(candidate_durations) >= target_count
+                    and sum(sorted(candidate_durations)[:target_count])
+                    > target_duration + config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS):
+                return failed(
+                    "COMPOSER_SELECTION_SIZE_MISMATCH",
+                    "The requested count and duration cannot both fit the library.",
+                )
+    decisions = intent["anchor_decisions"]
     required_refs = {anchor_ref[key] for key, include in decisions.items() if include}
     excluded_refs = {anchor_ref[key] for key, include in decisions.items() if not include}
+    positive_neighborhoods = set()
+    for anchor in phase_a_anchors:
+        if not decisions.get(anchor["id"]):
+            continue
+        identity = anchor["resolved_library_track"]
+        artist = _normalized_content_text(identity.get("artist"))
+        title = _normalized_content_text(identity.get("title"))
+        for index, label in enumerate(neighborhood_labels, 1):
+            label_artist, _, label_title = label.partition(" / ")
+            if (_normalized_content_text(label_artist) == artist
+                    and _normalized_content_text(label_title) == title):
+                positive_neighborhoods.add(index)
+    if not intent.get("allow_nonstandard_versions", False):
+        numeric_records = [
+            row for row in numeric_records
+            if row["id"] in required_refs or not is_alternate_recording(numeric_to_song[row["id"]])
+        ]
+        candidate_durations = [
+            row["duration_seconds"] for row in numeric_records if "duration_seconds" in row
+        ]
+    eligible_refs = {row["id"] for row in numeric_records}
+    available_count = len(eligible_refs - excluded_refs)
+    if target_duration is not None:
+        if candidate_durations:
+            median_duration = sorted(candidate_durations)[len(candidate_durations) // 2]
+            duration_options = math.ceil(target_duration / median_duration) * 3
+        else:
+            duration_options = max(12, math.ceil(available_count / 2))
+        selection_count = min(available_count, max(
+            len(required_refs), (target_count or 0) * 2, duration_options,
+        ))
+    else:
+        selection_count = target_count
+    if target_count is not None and available_count < target_count:
+        return failed(
+            "COMPOSER_SELECTION_SIZE_MISMATCH",
+            f"Only {available_count} eligible candidates are available for {target_count} tracks.",
+        )
+    neighborhood_minima = {}
+    if target_count is not None and len(positive_neighborhoods) > 1:
+        from collections import Counter
+
+        summary = []
+        for index in sorted(positive_neighborhoods):
+            members = [
+                row for row in numeric_records
+                if index in row.get("seed_neighborhoods", [])
+                and row["id"] not in excluded_refs
+            ]
+            summary.append({
+                "id": str(index), "seed": neighborhood_labels[index - 1],
+                "available_tracks": len(members),
+                "available_artists": dict(Counter(
+                    row.get("artist") or "Unknown" for row in members
+                ).most_common(16)),
+            })
+        balance_prompt = (
+            "Plan musical representation across the user's positive song seeds using the "
+            "REAL candidate availability. This is a musical decision for LLM Compose, not "
+            "a fixed quota. Decide the minimum number of candidate tracks the final "
+            "playlist should draw from EACH seed neighborhood to represent all references "
+            "meaningfully. Counts may differ substantially when the music or availability "
+            "warrants it. A track in two neighborhoods can count toward both. Keep the "
+            "minima feasible within the final playlist size, allowing room for other "
+            "related tracks. Return only JSON: "
+            '{"minimum_neighborhood_tracks":{"1":8,"2":6}}.\n'
+            f"Original request: {original_request}\n"
+            f"Final track count: {target_count}\n"
+            f"Included library anchors: {len(required_refs)}\n"
+            f"Additional track slots after included anchors: {target_count - len(required_refs)}\n"
+            f"Seed candidate availability: {json.dumps(summary, ensure_ascii=False)}"
+        )
+        availability = {
+            int(row["id"]): row["available_tracks"] for row in summary
+        }
+        for attempt in range(2):
+            balance_raw, balance_failure = call_phase(
+                "Phase B balance" if attempt == 0 else "Phase B balance repair",
+                balance_prompt, "Decide musical seed representation. Return only JSON.",
+            )
+            if balance_failure:
+                return failed(balance_failure, "Composer musical balance plan was unavailable.")
+            balance, _, _, balance_parse_error = parse_json_response(balance_raw)
+            requested_minima = balance.get("minimum_neighborhood_tracks") if isinstance(balance, dict) else None
+            if (balance_parse_error or not isinstance(requested_minima, dict)
+                    or set(balance) != {"minimum_neighborhood_tracks"}
+                    or set(requested_minima) != {str(index) for index in positive_neighborhoods}
+                    or any(type(value) is not int or value < 1 for value in requested_minima.values())):
+                return failed("SCHEMA_MISMATCH", "Composer musical balance plan was invalid.")
+            neighborhood_minima = {int(key): value for key, value in requested_minima.items()}
+            excess = sum(neighborhood_minima.values()) - (target_count - len(required_refs))
+            over_available = {
+                index: value for index, value in neighborhood_minima.items()
+                if value > availability[index]
+            }
+            if excess <= 0 and not over_available:
+                break
+            if attempt:
+                return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Composer musical balance plan exceeds available candidates.")
+            balance_prompt += (
+                "\n\nREVISE YOUR MUSICAL BALANCE PLAN: Your previous minima were "
+                f"{json.dumps(neighborhood_minima, sort_keys=True)}. Their sum exceeds "
+                f"the {target_count - len(required_refs)} available additional slots by "
+                f"{max(0, excess)}. Counts above neighborhood availability: "
+                f"{json.dumps(over_available, sort_keys=True)}. Decide revised unequal "
+                "minima that fit the real slot and candidate counts. Return only the same JSON shape."
+            )
+        if log_messages is not None:
+            log_messages.append(f"Compose Phase B musical seed minima: {json.dumps(neighborhood_minima, sort_keys=True)}")
     if log_messages is not None:
         log_messages.append(
             f"Compose Phase A: target_count={target_count}; target_duration={target_duration}; "
-            f"anchor decisions={json.dumps(decisions, sort_keys=True)}"
+            f"anchor decisions={json.dumps(decisions, sort_keys=True)}; "
+            f"allow_nonstandard_versions={intent.get('allow_nonstandard_versions', False)}"
         )
     logger.info(
         "Compose Phase A: target_count=%s target_duration=%s anchors_included=%d",
@@ -986,14 +1182,25 @@ def compose_playlist_with_llm(
         {**anchor, "candidate_ref": anchor_ref[anchor["id"]], "include": decisions[anchor["id"]]}
         for anchor in phase_a_anchors
     ]
-    selection_prompt = (
-        "Compose the FINAL ordered playlist from these candidates. Return only JSON with playlist_ids, "
-        "an array of request-local INTEGER references. Do not restate target_count, anchor decisions, "
-        "constraints, reasoning, scores, rejected IDs, or prose. "
+    duration_instruction = (
+        f"Rank exactly {selection_count} musically suitable, UNIQUE candidate references in preference order. "
+        "These are Composer-selected options for the duration optimizer, which will choose the "
+        "final subset using real library durations. Include enough varied options for an accurate duration. "
+        if target_duration is not None else
         "playlist_ids is the final selection, not a ranking of all candidates. "
         "Return exactly the required count of UNIQUE references. Never rank the complete candidate pool. "
+    )
+    selection_prompt = (
+        "Compose an ordered playlist selection from these candidates. Return only JSON with playlist_ids, "
+        "an array of request-local INTEGER references. Do not restate target_count, anchor decisions, "
+        "constraints, reasoning, scores, rejected IDs, or prose. "
+        f"{duration_instruction}"
         "Phase A intent is authoritative: do not reinterpret count or duration. "
-        "Order the most suitable tracks first. "
+        "Order the most suitable tracks first. Normally choose only one version of each song; "
+        "include remixes, live versions or edits when the request calls for them. "
+        "Use the seed neighborhoods to consider all of the user's musical references. "
+        "Make a musical compromise across different styles rather than equal quotas or "
+        "an avoidable concentration in one or two artists. "
         "Include every anchor marked include=true exactly once; exclude anchors marked include=false "
         "when the original request uses them only as inspiration or explicitly excludes them. "
         "Return only {\"playlist_ids\":[1,2,3]}. "
@@ -1001,11 +1208,14 @@ def compose_playlist_with_llm(
         f"Original user request (verbatim): {original_request}\n"
         f"Normalized intent: {json.dumps(intent, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Required final count: {target_count if target_count is not None else 'duration-driven'}\n"
+        f"Composer option count: {selection_count}\n"
+        f"Seed neighborhoods: {json.dumps(neighborhood_labels, ensure_ascii=False, separators=(',', ':'))}\n"
+        f"LLM2 musical seed minima: {json.dumps(neighborhood_minima, sort_keys=True)}\n"
         f"Resolved anchors: {json.dumps(phase_b_anchors, ensure_ascii=False, separators=(',', ':'))}\n"
         f"Available candidates: {json.dumps(numeric_records, ensure_ascii=False, separators=(',', ':'))}"
     )
     if log_messages is not None:
-        log_messages.append(f"Compose Phase B: candidates supplied={len(numeric_records)}; requested selections={target_count}")
+        log_messages.append(f"Compose Phase B: candidates supplied={len(numeric_records)}; requested selections={selection_count}")
 
     if target_count is not None and target_count > int(config.INSTANT_PLAYLIST_MAX_N_RESULTS):
         return failed(
@@ -1022,36 +1232,173 @@ def compose_playlist_with_llm(
     # malformed response is repaired with another full selection; count variance
     # is handled below without regenerating the entire playlist.
     repair_attempted = False
-    for attempt in range(2):
-        raw_b, failure = call_phase(
-            "Phase B" if attempt == 0 else "Phase B repair",
-            selection_prompt, "Select only the final playlist. Return only JSON.", target_count,
+    if neighborhood_minima:
+        by_ref = {row["id"]: row for row in numeric_records}
+        refs = [
+            anchor_ref[anchor["id"]] for anchor in phase_a_anchors
+            if decisions[anchor["id"]]
+        ]
+        chosen = set(refs)
+
+        def select_exact_group(phase, label, rows, requested):
+            selected_ids = []
+            for attempt in range(2):
+                remaining = [
+                    row for row in rows
+                    if row["id"] not in chosen and row["id"] not in selected_ids
+                ]
+                missing = requested - len(selected_ids)
+                if missing <= 0:
+                    break
+                prompt = (
+                    "Choose musically suitable real-library tracks for this portion of the "
+                    "playlist. This neighborhood's representation was decided by LLM2's "
+                    "musical balance plan. Return exactly the missing number of UNIQUE "
+                    "numeric candidate references and no prose: "
+                    '{"playlist_ids":[1,2,3]}.\n'
+                    f"Original request: {original_request}\n"
+                    f"Normalized intent: {json.dumps(intent, ensure_ascii=False)}\n"
+                    f"Seed neighborhood: {label}\n"
+                    f"Missing track choices: {missing}\n"
+                    f"Already chosen tracks: {json.dumps([by_ref[ref] for ref in refs + selected_ids], ensure_ascii=False)}\n"
+                    f"Eligible candidates: {json.dumps(remaining, ensure_ascii=False)}"
+                )
+                raw, failure = call_phase(
+                    phase, prompt, "Choose only supplied library candidates. Return only JSON.", missing,
+                )
+                if failure:
+                    if log_messages is not None:
+                        log_messages.append(f"{phase}: provider guard {failure}")
+                    return None
+                parsed, _, _, parse_error = parse_json_response(raw)
+                group_key = next(iter(parsed)) if isinstance(parsed, dict) and len(parsed) == 1 else None
+                proposed = parsed.get(group_key) if group_key in {"playlist_ids", "ids", "selected_ids"} else None
+                if parse_error or not isinstance(proposed, list):
+                    if log_messages is not None:
+                        log_messages.append(f"{phase}: invalid JSON shape")
+                    return None
+                allowed = {row["id"] for row in remaining}
+                for ref in proposed:
+                    if type(ref) is str and ref.isdecimal():
+                        ref = int(ref)
+                    if type(ref) is int and ref in allowed and ref not in selected_ids:
+                        selected_ids.append(ref)
+                        if len(selected_ids) == requested:
+                            break
+                if log_messages is not None:
+                    log_messages.append(
+                        f"{phase}: model returned {len(proposed)} references; "
+                        f"validated {len(selected_ids)}/{requested}; "
+                        f"sample={json.dumps(proposed[:5])}"
+                    )
+            return selected_ids if len(selected_ids) == requested else None
+
+        for index, quota in sorted(neighborhood_minima.items()):
+            neighborhood_rows = [
+                row for row in numeric_records
+                if index in row.get("seed_neighborhoods", [])
+                and row["id"] not in excluded_refs
+            ]
+            group_ids = select_exact_group(
+                f"Phase B neighborhood {index}", neighborhood_labels[index - 1],
+                neighborhood_rows, quota,
+            )
+            if group_ids is None:
+                return failed(
+                    "COMPOSER_SELECTION_SIZE_MISMATCH",
+                    f"LLM2 could not select {quota} valid tracks for {neighborhood_labels[index - 1]}.",
+                )
+            refs.extend(group_ids)
+            chosen.update(group_ids)
+            if log_messages is not None:
+                log_messages.append(
+                    f"Compose Phase B neighborhood {index}: {len(group_ids)} model-selected tracks"
+                )
+        remaining_slots = target_count - len(refs)
+        if remaining_slots < 0:
+            return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Musical balance plan exceeded the final track count.")
+        if remaining_slots:
+            global_rows = [
+                row for row in numeric_records
+                if row["id"] not in chosen and row["id"] not in excluded_refs
+            ]
+            extra_ids = select_exact_group(
+                "Phase B global fill", "All related music", global_rows, remaining_slots,
+            )
+            if extra_ids is None:
+                return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "LLM2 could not fill the remaining playlist slots.")
+            refs.extend(extra_ids)
+            chosen.update(extra_ids)
+        order_presentation = [
+            by_ref[item_id_to_numeric[str(song["item_id"])]]
+            for song in _rerank_candidate_order(
+                [numeric_to_song[ref] for ref in refs], context + "-final-order"
+            )
+        ]
+        order_prompt = (
+            "Order exactly these LLM2-selected library tracks as a coherent playlist. "
+            "Return every supplied numeric ID exactly once, with no additions, omissions, "
+            "or prose: {\"playlist_ids\":[1,2,3]}. Respect any explicit ordering in the "
+            "original request. Otherwise weave the different seed directions into a "
+            "musically plausible journey rather than placing each seed in one long block. "
+            "The selected tracks below are shuffled; their presentation order is not a "
+            "suggested playlist order.\n"
+            f"Original request: {original_request}\n"
+            f"Selected tracks: {json.dumps(order_presentation, ensure_ascii=False)}"
         )
-        if failure and failure not in {"COMPOSER_REPETITION", "OUTPUT_LIMIT"}:
-            return failed(failure, f"Compose selection provider failed: {failure}.", repair_attempted)
-        if failure and log_messages is not None:
-            log_messages.append(f"Compose Phase B guard: {failure}; preserving valid unique prefix")
-        selection, _extracted, _thinking, parse_error = parse_json_response(raw_b)
-        refs = selection.get("playlist_ids") if isinstance(selection, dict) else None
-        shortfall = selection.get("shortfall_reason") if isinstance(selection, dict) else None
-        valid_shape = (
-            not parse_error and isinstance(selection, dict)
-            and set(selection) in ({"playlist_ids"}, {"playlist_ids", "shortfall_reason"})
-            and isinstance(refs, list)
-            and (shortfall is None or isinstance(shortfall, str) and bool(shortfall.strip()))
+        order_raw, order_failure = call_phase(
+            "Phase B order", order_prompt, "Order selected music. Return only JSON.", len(refs),
         )
-        if valid_shape:
-            break
-        if failure:
-            refs, shortfall = [], None
-            break
-        if attempt == 1:
-            return failed("SCHEMA_MISMATCH", "Compose selection JSON shape is invalid.", repair_attempted)
-        repair_attempted = True
-        selection_prompt += (
-            "\n\nREPAIR SELECTION JSON ONLY: Return {\"playlist_ids\":[1,2,3]} "
-            "with numeric request-local references. Do not reinterpret the request."
-        )
+        if order_failure:
+            return failed(order_failure, "LLM2 playlist ordering was unavailable.")
+        order_result, _, _, order_parse_error = parse_json_response(order_raw)
+        order_key = next(iter(order_result)) if isinstance(order_result, dict) and len(order_result) == 1 else None
+        ordered_ids = order_result.get(order_key) if order_key in {"playlist_ids", "ids", "selected_ids"} else None
+        if (order_parse_error or not isinstance(ordered_ids, list)
+                or order_key not in {"playlist_ids", "ids", "selected_ids"}):
+            return failed("SCHEMA_MISMATCH", "LLM2 playlist ordering JSON was invalid.")
+        ordered = []
+        ordered_set = set()
+        for ref in ordered_ids:
+            if type(ref) is int and ref in chosen and ref not in ordered_set:
+                ordered.append(ref)
+                ordered_set.add(ref)
+        ordered.extend(ref for ref in refs if ref not in ordered_set)
+        refs = ordered
+        shortfall = None
+        if log_messages is not None:
+            log_messages.append(f"Compose Phase B order: {len(ordered_set)}/{len(refs)} model-ordered references")
+    else:
+        for attempt in range(2):
+            raw_b, failure = call_phase(
+                "Phase B" if attempt == 0 else "Phase B repair",
+                selection_prompt, "Select only ordered playlist candidates. Return only JSON.", selection_count,
+            )
+            if failure and failure not in {"COMPOSER_REPETITION", "OUTPUT_LIMIT"}:
+                return failed(failure, f"Compose selection provider failed: {failure}.", repair_attempted)
+            if failure and log_messages is not None:
+                log_messages.append(f"Compose Phase B guard: {failure}; preserving valid unique prefix")
+            selection, _extracted, _thinking, parse_error = parse_json_response(raw_b)
+            refs = selection.get("playlist_ids") if isinstance(selection, dict) else None
+            shortfall = selection.get("shortfall_reason") if isinstance(selection, dict) else None
+            valid_shape = (
+                not parse_error and isinstance(selection, dict)
+                and set(selection) in ({"playlist_ids"}, {"playlist_ids", "shortfall_reason"})
+                and isinstance(refs, list)
+                and (shortfall is None or isinstance(shortfall, str) and bool(shortfall.strip()))
+            )
+            if valid_shape:
+                break
+            if failure:
+                refs, shortfall = [], None
+                break
+            if attempt == 1:
+                return failed("SCHEMA_MISMATCH", "Compose selection JSON shape is invalid.", repair_attempted)
+            repair_attempted = True
+            selection_prompt += (
+                "\n\nREPAIR SELECTION JSON ONLY: Return {\"playlist_ids\":[1,2,3]} "
+                "with numeric request-local references. Do not reinterpret the request."
+            )
 
     raw_count = len(refs)
     valid_refs, seen = [], set()
@@ -1059,7 +1406,7 @@ def compose_playlist_with_llm(
     for ref in refs:
         if type(ref) is not int:
             malformed_removed += 1
-        elif ref not in numeric_to_song:
+        elif ref not in eligible_refs:
             unknown_removed += 1
         elif ref in seen:
             duplicate_removed += 1
@@ -1095,13 +1442,13 @@ def compose_playlist_with_llm(
     if log_messages is not None:
         log_messages.append(f"Validated ordered selection: {len(valid_refs)}")
         log_messages.append(f"Target count: {target_count}")
-    if target_count is not None and len(valid_refs) > target_count:
+    if selection_count is not None and len(valid_refs) > selection_count:
         if raw_count == len(numeric_records):
             logger.warning("Composer substantially over-selected candidates: returned entire candidate universe")
             if log_messages is not None:
                 log_messages.append("Composer substantially over-selected candidates: entire candidate universe returned")
-        trimmed = len(valid_refs) - target_count
-        while len(valid_refs) > target_count:
+        trimmed = len(valid_refs) - selection_count
+        while len(valid_refs) > selection_count:
             tail_nonrequired = next(
                 (index for index in range(len(valid_refs) - 1, -1, -1)
                  if valid_refs[index] not in required_refs), None,
@@ -1113,12 +1460,15 @@ def compose_playlist_with_llm(
             log_messages.append(f"Tail trimmed: {trimmed}")
         logger.info("Composer tail trimmed: %d", trimmed)
 
-    if target_count is not None and len(valid_refs) < target_count:
+    if selection_count is not None and len(valid_refs) < selection_count:
         if repair_attempted:
             return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Selection is still short after one repair.", True)
         repair_attempted = True
-        missing_count = target_count - len(valid_refs)
-        remaining = [row for row in numeric_records if row["id"] not in seen and row["id"] not in excluded_refs]
+        missing_count = selection_count - len(valid_refs)
+        remaining = [
+            row for row in numeric_records
+            if row["id"] not in seen and row["id"] not in excluded_refs
+        ]
         if log_messages is not None:
             log_messages.extend([
                 f"Shortfall: {missing_count}",
@@ -1129,7 +1479,8 @@ def compose_playlist_with_llm(
             "Select only the missing tracks that best complete this EXISTING ordered playlist. "
             f"Return JSON with playlist_ids containing at most {missing_count} UNIQUE numeric references. "
             "Do not return already-selected references, reinterpret the request, restate the target, "
-            "or regenerate the playlist. Stop after the JSON object.\n"
+            "or regenerate the playlist. Preserve artist variety and avoid repeated song versions. "
+            "Stop after the JSON object.\n"
             f"Original user request (verbatim): {original_request}\n"
             f"Normalized intent: {json.dumps(intent, ensure_ascii=False, separators=(',', ':'))}\n"
             f"Missing count: {missing_count}\n"
@@ -1154,7 +1505,7 @@ def compose_playlist_with_llm(
         for ref in fill_refs:
             if (
                 fill_added >= missing_count or type(ref) is not int
-                or ref not in numeric_to_song or ref in seen or ref in excluded_refs
+                or ref not in eligible_refs or ref in seen or ref in excluded_refs
             ):
                 continue
             valid_refs.append(ref)
@@ -1167,17 +1518,295 @@ def compose_playlist_with_llm(
         if fill_failure and not shortfall:
             return failed(fill_failure, f"Compose targeted fill failed: {fill_failure}.", repair_attempted)
 
-    if target_count is not None and len(valid_refs) < target_count:
-        if not shortfall:
+    if selection_count is not None and len(valid_refs) < selection_count:
+        if (target_count is not None and len(valid_refs) < target_count) or not shortfall:
             return failed(
                 "COMPOSER_SELECTION_SIZE_MISMATCH",
-                f"Composer target_count={target_count}; final valid IDs={len(valid_refs)} after targeted fill.",
+                f"Composer option count={selection_count}; final valid IDs={len(valid_refs)} after targeted fill.",
                 repair_attempted,
             )
     else:
         shortfall = None
     if len(valid_refs) != len(set(valid_refs)) or not required_refs.issubset(valid_refs):
         return failed("SCHEMA_MISMATCH", "Final Composer validation failed.", repair_attempted)
+
+    preferred_final_count = None
+    if musical_review and not neighborhood_minima and len(valid_refs) > 1 and len(valid_refs) < available_count:
+        from collections import Counter
+
+        by_ref = {row["id"]: row for row in numeric_records}
+        current_rows = [by_ref[ref] for ref in valid_refs]
+        selected_artists = Counter(row.get("artist") or "Unknown" for row in current_rows)
+        available_artists = Counter(
+            row.get("artist") or "Unknown" for row in numeric_records
+        )
+        selected_neighborhoods = Counter(
+            neighborhood for row in current_rows
+            for neighborhood in row.get("seed_neighborhoods", [])
+        )
+        available_neighborhoods = Counter(
+            neighborhood for row in numeric_records
+            for neighborhood in row.get("seed_neighborhoods", [])
+        )
+        uncovered_neighborhoods = [
+            index for index in range(1, len(neighborhood_labels) + 1)
+            if available_neighborhoods[index] and not selected_neighborhoods[index]
+        ]
+        uncovered_options = {
+            neighborhood_labels[index - 1]: [
+                {key: row[key] for key in ("id", "title", "artist") if key in row}
+                for row in numeric_records
+                if index in row.get("seed_neighborhoods", [])
+                and row["id"] not in excluded_refs
+            ]
+            for index in uncovered_neighborhoods
+        }
+        remaining_rows = [
+            row for row in numeric_records
+            if row["id"] not in valid_refs and row["id"] not in excluded_refs
+        ]
+        duration_facts = ""
+        if target_duration is not None and target_count is None:
+            required_seconds = sum(
+                by_ref[ref].get("duration_seconds", 0) for ref in required_refs
+            )
+            optional_lengths = sorted(
+                by_ref[ref].get("duration_seconds", 0)
+                for ref in valid_refs if ref not in required_refs
+            )
+            optional_lengths = [seconds for seconds in optional_lengths if seconds > 0]
+            feasible_count_ceiling = len(required_refs)
+            running_seconds = required_seconds
+            for seconds in optional_lengths:
+                if running_seconds + seconds > target_duration + config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS:
+                    break
+                running_seconds += seconds
+                feasible_count_ceiling += 1
+            preview, preview_seconds, _ = finalize_composer_duration(
+                [numeric_to_song[ref] for ref in valid_refs], duration_rows,
+                target_duration,
+                required_ids=[numeric_to_song[ref]["item_id"] for ref in required_refs],
+                tolerance_seconds=config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS,
+            )
+            preview_refs = [item_id_to_numeric[str(song["item_id"])] for song in preview]
+            duration_facts = (
+                f"Duration target: {target_duration} seconds. Current duration-validated preview: "
+                f"{json.dumps([by_ref[ref] for ref in preview_refs], ensure_ascii=False)} "
+                f"totaling {preview_seconds} seconds. "
+                f"With the lengths of the currently selected options, no more than "
+                f"{feasible_count_ceiling} tracks can fit the target even if the shortest options "
+                f"are used. Choose a preferred_final_count within that feasible range; "
+                f"propose swaps at positions in the preview when its musical mix should change.\n"
+            )
+        review_output = (
+            '{"swaps":[{"remove_id":1,"add_id":2}],"ordered_ids":[2,3,4],"preferred_final_count":6}'
+            if target_duration is not None and target_count is None else
+            '{"swaps":[{"remove_id":1,"add_id":2}],"ordered_ids":[2,3,4]}'
+        )
+        duration_review_instruction = (
+            "For this duration-only request, decide how many tracks the final musical playlist "
+            "should contain based on the candidate lengths and the user's intent. Set "
+            "preferred_final_count to that positive number. The application will verify the "
+            "actual total duration. "
+            if target_duration is not None and target_count is None else ""
+        )
+        review_prompt = (
+            "Review your ordered music selection against the user's ORIGINAL request. "
+            "Decide whether its artist mix, seed coverage, versions, mood and musical journey "
+            "fit the request and the real candidate availability. You own this musical judgment; "
+            "do not apply equal seed quotas or a fixed artist cap. When a better fit exists, "
+            "propose one-for-one swaps from remaining candidates. Preserve required anchors, "
+            "playlist size, and the order of unchanged tracks. Otherwise return no swaps. "
+            "When the request names several contrasting songs, examine how the current selection "
+            "represents each musical direction and compare its artist mix with what is available. "
+            "If viable alternatives are present, use as many swaps as the musical result needs; "
+            "a small cosmetic adjustment is insufficient when a broad request is dominated by "
+            "one or two artists. "
+            "A seed neighborhood with available candidates but no selected tracks is a specific "
+            "coverage gap: choose musically suitable replacements from it when the user treats "
+            "that seed as a positive reference. Do not assign fixed equal quotas. "
+            "Return ordered_ids containing EVERY selected reference exactly once AFTER swaps, "
+            "ordered as a coherent playlist; avoid long blocks from one artist unless the "
+            "user asks for them. "
+            "Prefer standard studio versions over live, demo, remixed or edited tracks unless "
+            "the request calls for those versions. "
+            f"{duration_review_instruction}"
+            f"Return only JSON: {review_output}.\n"
+            f"Original user request (verbatim): {original_request}\n"
+            f"Normalized intent: {json.dumps(intent, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"Required anchor references: {json.dumps(sorted(required_refs))}\n"
+            f"Seed neighborhood labels: {json.dumps(neighborhood_labels, ensure_ascii=False)}\n"
+            f"Selected artists: {json.dumps(selected_artists, ensure_ascii=False)}\n"
+            f"Available artists: {json.dumps(available_artists, ensure_ascii=False)}\n"
+            f"Selected seed neighborhood counts: {json.dumps(selected_neighborhoods)}\n"
+            f"Available seed neighborhood counts: {json.dumps(available_neighborhoods)}\n"
+            f"Uncovered seed neighborhoods and eligible options: {json.dumps(uncovered_options, ensure_ascii=False)}\n"
+            f"{duration_facts}"
+            f"Current ordered selection: {json.dumps(current_rows, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"Remaining candidates: {json.dumps(remaining_rows, ensure_ascii=False, separators=(',', ':'))}"
+        )
+        review_raw, review_failure = call_phase(
+            "Review", review_prompt, "Review musical fit. Return only JSON.", len(valid_refs),
+        )
+        if review_failure:
+            if log_messages is not None:
+                log_messages.append(f"Compose musical review unavailable: {review_failure}")
+        else:
+            review, _extracted, _thinking, review_parse_error = parse_json_response(review_raw)
+            swaps = review.get("swaps") if isinstance(review, dict) else None
+            expected_review_keys = (
+                {"swaps", "preferred_final_count"}
+                if target_duration is not None and target_count is None else {"swaps"}
+            )
+            ordered_ids = review.get("ordered_ids") if isinstance(review, dict) else None
+            if (review_parse_error or not isinstance(swaps, list)
+                    or set(review) not in (expected_review_keys,
+                                           expected_review_keys | {"ordered_ids"})
+                    or (ordered_ids is not None and not isinstance(ordered_ids, list))):
+                if log_messages is not None:
+                    log_messages.append("Compose musical review returned invalid JSON; original selection retained")
+            else:
+                proposed_count = review.get("preferred_final_count")
+                if (type(proposed_count) is int and 1 <= proposed_count <= len(valid_refs)):
+                    preferred_final_count = proposed_count
+                    if log_messages is not None:
+                        log_messages.append(f"Compose preferred final duration count: {proposed_count}")
+                applied = 0
+                replacements = {}
+                selected_set = set(valid_refs)
+                for swap in swaps:
+                    if not isinstance(swap, dict) or set(swap) != {"remove_id", "add_id"}:
+                        continue
+                    old_ref, new_ref = swap["remove_id"], swap["add_id"]
+                    if (type(old_ref) is not int or type(new_ref) is not int
+                            or old_ref not in selected_set or old_ref in required_refs
+                            or new_ref not in by_ref or new_ref in selected_set
+                            or new_ref in excluded_refs):
+                        continue
+                    position = valid_refs.index(old_ref)
+                    valid_refs[position] = new_ref
+                    selected_set.remove(old_ref)
+                    selected_set.add(new_ref)
+                    replacements[old_ref] = new_ref
+                    applied += 1
+                if ordered_ids is not None:
+                    reordered = []
+                    reordered_set = set()
+                    for proposed_ref in ordered_ids:
+                        if type(proposed_ref) is not int:
+                            continue
+                        ref = replacements.get(proposed_ref, proposed_ref)
+                        if ref in selected_set and ref not in reordered_set:
+                            reordered.append(ref)
+                            reordered_set.add(ref)
+                    for ref in valid_refs:
+                        if ref not in reordered_set:
+                            reordered.append(ref)
+                    valid_refs = reordered
+                    if log_messages is not None:
+                        log_messages.append(f"Compose musical review: {len(reordered_set)} model-ordered references applied")
+                if log_messages is not None:
+                    log_messages.append(f"Compose musical review: {applied} model-selected swaps applied")
+
+        selected_set = set(valid_refs)
+        covered_counts = Counter(
+            neighborhood for ref in valid_refs
+            for neighborhood in by_ref[ref].get("seed_neighborhoods", [])
+        )
+        required_coverage = (
+            neighborhood_minima or {
+                index: 1 for index in positive_neighborhoods
+                if available_neighborhoods[index]
+            }
+        )
+        missing_positive = sorted(
+            index for index, minimum in required_coverage.items()
+            if covered_counts[index] < minimum
+        )
+        if missing_positive:
+            focus = {
+                neighborhood_labels[index - 1]: [
+                    {key: row[key] for key in ("id", "title", "artist") if key in row}
+                    for row in numeric_records
+                    if index in row.get("seed_neighborhoods", [])
+                    and row["id"] not in selected_set
+                    and row["id"] not in excluded_refs
+                ]
+                for index in missing_positive
+            }
+            coverage_prompt = (
+                "Repair this specific musical coverage gap in your playlist. The original "
+                "request included these positive song seeds, and your selection falls below "
+                "the musical coverage planned for the real candidate availability. "
+                "Choose musically fitting candidate replacements from EACH deficient neighborhood. "
+                "Preserve required anchors and the playlist size. "
+                "Return only JSON with swaps: "
+                '{"swaps":[{"remove_id":1,"add_id":2}]}.\n'
+                f"Original request: {original_request}\n"
+                f"Required references: {json.dumps(sorted(required_refs))}\n"
+                f"LLM2 neighborhood minima: {json.dumps(required_coverage, sort_keys=True)}\n"
+                f"Current neighborhood counts: {json.dumps(covered_counts, sort_keys=True)}\n"
+                f"Current selection: {json.dumps([by_ref[ref] for ref in valid_refs], ensure_ascii=False)}\n"
+                f"Missing positive seed options: {json.dumps(focus, ensure_ascii=False)}"
+            )
+            coverage_raw, coverage_failure = call_phase(
+                "Coverage repair", coverage_prompt,
+                "Repair missing positive seed coverage. Return only JSON.", len(valid_refs),
+            )
+            if not coverage_failure:
+                coverage_result, _, _, coverage_parse_error = parse_json_response(coverage_raw)
+                proposed_swaps = coverage_result.get("swaps") if isinstance(coverage_result, dict) else None
+                if (not coverage_parse_error and isinstance(proposed_swaps, list)
+                        and set(coverage_result) == {"swaps"}):
+                    for swap in proposed_swaps:
+                        if not isinstance(swap, dict) or set(swap) != {"remove_id", "add_id"}:
+                            continue
+                        old_ref, new_ref = swap["remove_id"], swap["add_id"]
+                        if (type(old_ref) is not int or type(new_ref) is not int
+                                or old_ref not in selected_set or old_ref in required_refs
+                                or new_ref not in by_ref or new_ref in selected_set
+                                or new_ref in excluded_refs):
+                            continue
+                        valid_refs[valid_refs.index(old_ref)] = new_ref
+                        selected_set.remove(old_ref)
+                        selected_set.add(new_ref)
+            covered_counts = Counter(
+                neighborhood for ref in valid_refs
+                for neighborhood in by_ref[ref].get("seed_neighborhoods", [])
+            )
+            still_missing = [
+                neighborhood_labels[index - 1] for index in missing_positive
+                if covered_counts[index] < required_coverage[index]
+            ]
+            if log_messages is not None:
+                log_messages.append(
+                    f"Compose positive seed coverage repair: "
+                    f"{len(missing_positive) - len(still_missing)}/{len(missing_positive)} neighborhoods added"
+                )
+            if still_missing:
+                return failed(
+                    "COMPOSER_SEED_COVERAGE_GAP",
+                    f"Composer left positive seed neighborhoods uncovered: {', '.join(still_missing)}.",
+                )
+
+    if neighborhood_minima:
+        final_coverage = Counter(
+            neighborhood for ref in valid_refs
+            for neighborhood in by_ref[ref].get("seed_neighborhoods", [])
+        )
+        deficient = [
+            neighborhood_labels[index - 1]
+            for index, minimum in neighborhood_minima.items()
+            if final_coverage[index] < minimum
+        ]
+        if deficient:
+            return failed(
+                "COMPOSER_SEED_COVERAGE_GAP",
+                f"LLM2 seed selection missed its own musical plan: {', '.join(deficient)}.",
+            )
+        if log_messages is not None:
+            log_messages.append(f"Compose Phase B final seed coverage: {json.dumps(final_coverage, sort_keys=True)}")
+
     authoritative = [numeric_to_song[ref] for ref in valid_refs]
     if log_messages is not None:
         log_messages.append(
@@ -1195,6 +1824,7 @@ def compose_playlist_with_llm(
         "anchor_decisions": [{"id": key, "include": decisions[key]} for key in sorted(decisions)],
         "shortfall_reason": shortfall,
         "candidate_count": len(records),
+        "preferred_final_count": preferred_final_count,
     }, len(records)
 
 
@@ -1222,7 +1852,8 @@ def reorder_preserving_membership(songs, ordered_ids):
 
 
 def finalize_composer_duration(songs, duration_rows, target_seconds, *, target_count=None,
-                               required_ids=(), tolerance_seconds=15):
+                               required_ids=(), tolerance_seconds=15,
+                               preferred_count=None):
     """Select from Composer preference order using library durations, then validate."""
     durations = {
         str(item_id): row.get('duration')
@@ -1233,6 +1864,25 @@ def finalize_composer_duration(songs, duration_rows, target_seconds, *, target_c
     if any(item_id not in available for item_id in required):
         return [], None, {'reason': 'A required Composer anchor is absent from the candidate pool.'}
     diagnostics = {}
+    if target_count is None and type(preferred_count) is int and 0 < preferred_count <= len(songs):
+        preferred_diagnostics = {}
+        preferred = optimize_playlist_duration(
+            songs, durations, int(target_seconds), preferred_count,
+            max(1, len(songs)), exact_count=True,
+            mandatory_ids=required,
+            ranked_ids=[song.get('item_id') for song in songs],
+            tolerance_seconds=tolerance_seconds, diagnostics=preferred_diagnostics,
+        )
+        preferred_seconds = preferred_diagnostics.get('selected_duration')
+        if (len(preferred) == preferred_count and preferred_seconds is not None
+                and abs(preferred_seconds - int(target_seconds)) <= tolerance_seconds):
+            diagnostics.update(preferred_diagnostics)
+            diagnostics['composer_preferred_count_used'] = True
+            diagnostics['actual_seconds'] = preferred_seconds
+            diagnostics['error_seconds'] = preferred_seconds - int(target_seconds)
+            diagnostics['within_tolerance'] = True
+            return preferred, preferred_seconds, diagnostics
+        diagnostics['composer_preferred_count_used'] = False
     selected = optimize_playlist_duration(
         songs, durations, int(target_seconds),
         int(target_count) if target_count is not None else len(songs),

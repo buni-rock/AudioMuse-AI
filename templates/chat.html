@@ -752,6 +752,7 @@
             }
             function rulesHeadline(m) {
                 if (m.llmFailed) return 'No Composer result was available; validation was skipped.';
+                if (m.responseReady && m.finalCount === 0) return 'No playlist was delivered. See the error below.';
                 const finalCount = m.finalCount != null ? m.finalCount : (m.funnel ? m.funnel.c : m.collected);
                 const mandatory = m.composerAnchorsTotal > 0
                     ? m.composerAnchorsPresent + ' of ' + m.composerAnchorsTotal + ' requested anchors preserved'
@@ -782,10 +783,10 @@
                 ];
                 if (m.selectionMode && m.selectionMode !== 'NATIVE') {
                     const title = m.llmFailed ? 'Playlist composition failed' : 'Composed playlist';
-                    defs.push({ id: 'selection', done: m.llmActionCount != null || m.llmFailed, headline: selectionHeadline, title });
+                    defs.push({ id: 'selection', done: Number.isFinite(m.stageSeconds.selection) || m.llmActionCount != null || m.llmFailed, headline: selectionHeadline, title });
                 }
-                defs.push({ id: 'rules', done: (m.success || m.noSongs || m.planningFailed || m.llmFailed), headline: rulesHeadline,
-                    title: m.llmFailed ? 'Validation skipped' : 'Validated playlist' });
+                defs.push({ id: 'rules', done: (m.responseReady || m.noSongs || m.planningFailed || m.llmFailed), headline: rulesHeadline,
+                    title: m.llmFailed ? 'Validation skipped' : (m.responseReady && m.finalCount === 0 ? 'Playlist unavailable' : 'Validated playlist') });
                 return defs;
             }
 
@@ -955,7 +956,7 @@
                     candidatesRetrieved: null, llmShortlisted: null, llmActionCount: null, llmAction: '',
                     durationSelected: null, targetDuration: null,
                     funnel: null, ordered: false, filterRankedOrder: false,
-                    success: false, noSongs: false, planningFailed: false, notesPlain: null
+                    success: false, responseReady: false, noSongs: false, planningFailed: false, notesPlain: null
                 };
                 for (const raw of lines) {
                     const t = raw.trim();
@@ -969,6 +970,8 @@
                     else if ((m = t.match(/^(?:Shortlisted for LLM|Candidates sent to LLM2):\s*(\d+)$/i))) model.llmShortlisted = Number.parseInt(m[1], 10);
                     else if ((m = t.match(/^(LLM ranked|LLM selected):\s*(\d+)$/i))) { model.llmAction = m[1]; model.llmActionCount = Number.parseInt(m[2], 10); }
                     else if ((m = t.match(/^Composed playlist:\s*(\d+) candidates evaluated;\s*(\d+) tracks selected/i))) { model.llmShortlisted = Number.parseInt(m[1], 10); model.llmAction = 'Composed'; model.llmActionCount = Number.parseInt(m[2], 10); }
+                    else if ((m = t.match(/^Composer result: playlist IDs returned=(\d+)/i))) { model.llmAction = 'Selected'; model.llmActionCount = Number.parseInt(m[1], 10); }
+                    else if ((m = t.match(/^Playlist response ready:\s*(\d+) tracks/i))) { model.responseReady = true; model.finalCount = Number.parseInt(m[1], 10); }
                     else if ((m = t.match(/^Selection mode:\s*(LLM_COMPOSE|LLM_RERANK|LLM_CURATE|NATIVE)/i))) model.selectionMode = m[1].toUpperCase();
                     else if ((m = t.match(/^Playlist composition failed:\s*([A-Z_]+)/i))) {
                         model.llmFailed = true;
@@ -1150,6 +1153,7 @@
              * whatever stepper is already in the response area (live or static).
              */
             function renderFinalSections(responseData) {
+                responseData = responseData || {};
                 const logText = responseData.message || "No message from AI.";
 
                 // --- Tool chain (friendly node labels) ---
@@ -1242,12 +1246,12 @@
                     resultsDiv.appendChild(songScroll);
                     responseArea.appendChild(resultsDiv);
                     createPlaylistSection.classList.remove('hidden'); // Show the create playlist form
-                } else if (responseData.executed_query && !String(responseData.executed_query).startsWith('LLM Compose failed')) {
+                } else {
                      const noResultsMessage = document.createElement('p');
                     noResultsMessage.className = 'italic';
                     noResultsMessage.style.marginTop = '1rem';
-                    noResultsMessage.style.color = cv('--text-muted');
-                    noResultsMessage.textContent = "The query returned no songs.";
+                    noResultsMessage.style.color = cv('--color-danger');
+                    noResultsMessage.textContent = responseData.shortfall_reason || 'No playlist was delivered. Check the technical details for the reason.';
                     responseArea.appendChild(noResultsMessage);
                 }
             }

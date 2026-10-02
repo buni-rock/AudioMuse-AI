@@ -782,10 +782,9 @@ def _run_chat_pipeline(data, log_messages):
 
     collection_cap = config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES
 
-    planner_request = (
+    planner_request = original_user_input if is_llm_compose else (
         f"{original_user_input}\n\n"
-        f"UI Number of songs setting: {target_song_count}. This is a retrieval sizing default only; "
-        "if the request explicitly contains a numeric song count, use it as the retrieval size hint."
+        f"UI Number of songs setting: {target_song_count}."
     )
     plan_result = yield from plan_and_execute_once(
         user_message=planner_request,
@@ -902,9 +901,22 @@ def _run_chat_pipeline(data, log_messages):
     # Keep canonical ids here: this pool is filtered for availability but stays
     # internal - it feeds playlist selection and create_instant_playlist_for_server,
     # which re-translates to the server's ids itself. Translating now would double it.
-    scoped_pool = app_server_context.scope_results(
-        all_songs, None, id_key='item_id', translate=False
-    )
+    composer_server_ids = None
+    if is_llm_compose:
+        # Resolve availability and response IDs once. A second registry lookup
+        # after composition can block or fail, discarding an otherwise valid
+        # playlist after we have already reported success.
+        composer_server_ids = app_server_context.translate_ids_for_request(
+            [song['item_id'] for song in all_songs]
+        )
+        scoped_pool = [
+            song for song in all_songs
+            if str(song.get('item_id')) in composer_server_ids
+        ]
+    else:
+        scoped_pool = app_server_context.scope_results(
+            all_songs, None, id_key='item_id', translate=False
+        )
     if len(scoped_pool) != len(all_songs):
         log_messages.append(
             f"\nServer availability: removed {len(all_songs) - len(scoped_pool)} "
@@ -949,18 +961,25 @@ def _run_chat_pipeline(data, log_messages):
     composer_shortfall_reason = None
     composer_failure_category = None
     composer_failure_reason = None
+    candidate_duration_rows = None
     if is_llm_compose and all_songs:
         log_messages.append("Composing final playlist...")
         yield
         try:
             from tasks.playlist_curation import compose_playlist_with_llm
+            from tasks.ai.tool_impl import _fetch_pool_features
             llm_selection_started = time.monotonic()
+            candidate_duration_rows = _fetch_pool_features(
+                [song['item_id'] for song in all_songs]
+            )
             composition_result, candidates_sent = compose_playlist_with_llm(
                 original_user_input, all_songs, ai_config_with_secrets,
                 seed_provenance=seed_provenance,
                 resolved_anchors=resolved_anchors,
                 ui_default_count=ui_song_cap,
                 log_messages=log_messages,
+                duration_rows=candidate_duration_rows,
+                musical_review=True,
             )
             if composition_result.get('error'):
                 failure = composition_result['error']
@@ -1013,7 +1032,6 @@ def _run_chat_pipeline(data, log_messages):
                 )
             composer_requested_target = target_song_count
             if duration_target is not None:
-                from tasks.ai.tool_impl import _fetch_pool_features
                 from tasks.playlist_curation import finalize_composer_duration
                 song_anchors = [a for a in resolved_anchors if isinstance(a, dict) and a.get('type') == 'song']
                 anchor_by_ref = {
@@ -1024,12 +1042,13 @@ def _run_chat_pipeline(data, log_messages):
                     for d in include_decisions if d.get('id') in anchor_by_ref
                 ]
                 preferred_count = len(all_songs)
-                duration_rows = _fetch_pool_features([song['item_id'] for song in all_songs])
+                duration_rows = candidate_duration_rows
                 tolerance = config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS
                 all_songs, actual_duration_seconds, composer_duration_diagnostics = finalize_composer_duration(
                     all_songs, duration_rows, duration_target,
                     target_count=target_song_count, required_ids=required_ids,
                     tolerance_seconds=tolerance,
+                    preferred_count=composition_result.get('preferred_final_count'),
                 )
                 details = composer_duration_diagnostics
                 log_messages.extend([
@@ -1531,10 +1550,6 @@ def _run_chat_pipeline(data, log_messages):
             composer_failure_category = 'DURATION_MISMATCH'
             selection_source = 'LLM compose failed'
             final_query_results_list = []
-        else:
-            log_messages.append(
-                f"\nOK SUCCESS! Generated playlist with {len(final_query_results_list)} songs"
-            )
         log_messages.append(f"   Total songs collected: {len(all_songs)}")
         log_messages.append(f"   Tools called: {len(tools_used_history)}")
 
@@ -1650,8 +1665,7 @@ def _run_chat_pipeline(data, log_messages):
     # an internal fp_ id. /api/create_playlist resolves them back to canonical.
     if is_llm_compose and final_query_results_list:
         try:
-            from tasks.ai.tool_impl import _fetch_pool_features
-            duration_rows = _fetch_pool_features([song['item_id'] for song in final_query_results_list])
+            duration_rows = candidate_duration_rows or {}
             duration_values = [duration_rows.get(song['item_id'], {}).get('duration') for song in final_query_results_list]
             if all(value is not None and float(value) > 0 for value in duration_values):
                 actual_duration_seconds = sum(int(float(value)) for value in duration_values)
@@ -1662,9 +1676,30 @@ def _run_chat_pipeline(data, log_messages):
                 )
         except Exception:
             logger.warning("Could not compute composed playlist duration", exc_info=True)
-    if final_query_results_list:
+    if is_llm_compose and final_query_results_list:
+        missing_ids = [
+            str(song['item_id']) for song in final_query_results_list
+            if str(song['item_id']) not in composer_server_ids
+        ]
+        if missing_ids:
+            log_messages.append(
+                f"Playlist delivery failed: {len(missing_ids)} selected tracks have no provider ID"
+            )
+            composer_shortfall_reason = 'Selected tracks are unavailable on the media server.'
+            final_query_results_list = []
+        else:
+            final_query_results_list = [
+                {**song, 'item_id': composer_server_ids[str(song['item_id'])]}
+                for song in final_query_results_list
+            ]
+    elif final_query_results_list:
         final_query_results_list = app_server_context.scope_results(
             final_query_results_list, None, id_key='item_id'
+        )
+    log_messages.append(f"Playlist response ready: {len(final_query_results_list or [])} tracks")
+    if final_query_results_list:
+        log_messages.append(
+            f"OK SUCCESS! Generated playlist with {len(final_query_results_list)} songs"
         )
 
     log_messages.append(f"Playlist rules wall-clock: {time.monotonic() - playlist_rules_started:.1f}s")

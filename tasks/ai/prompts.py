@@ -488,9 +488,8 @@ def build_playlist_plan_tool(tools: List[Dict], retrieval_only: bool = False) ->
             "type": "object", "additionalProperties": False,
             "properties": {
                 "anchors": {"type": "array", "items": retrieval_anchor_schema},
-                "retrieval_size_hint": nullable_integer,
             },
-            "required": ["anchors", "retrieval_size_hint"],
+            "required": ["anchors"],
         }
     wrapper_schema = {
         "type": "object", "additionalProperties": False,
@@ -509,12 +508,11 @@ def build_playlist_plan_tool(tools: List[Dict], retrieval_only: bool = False) ->
         "description": (
             (
                 "Plan retrieval only: identify human-readable song, artist, and album references; "
-                "choose AudioMuse retrieval tools and a retrieval-size hint. Never decide final playlist "
+                "choose AudioMuse retrieval tools. Never decide final playlist "
                 "membership, anchor inclusion, count semantics, duration, exclusions, versions, artist "
                 "limits, or order. Preserve any explicitly supplied song title and artist exactly as written "
-                "in the anchor fields; do not substitute an artist based on outside knowledge. Use the UI "
-                "song count as the retrieval-size hint unless the request states a different numeric size. "
-                "The hint is a target for EACH seed neighborhood, not a global result count. Include each song "
+                "in the anchor fields; do not substitute an artist based on outside knowledge. "
+                "Include each song "
                 "reference in seed_search. Retrieval filters may describe requested sound/style.\n"
             ) if retrieval_only else (
             "Interpret the complete user request into authoritative structured semantic intent, "

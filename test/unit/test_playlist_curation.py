@@ -116,6 +116,207 @@ def test_compose_keeps_all_242_candidates_and_four_canonical_anchors(monkeypatch
     assert any('Compose Phase B: IDs returned=64; unique IDs=64' in line for line in logs)
 
 
+def test_duration_composer_requests_ranked_options_from_library_lengths(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': str(i), 'title': f'Track {i}', 'artist': f'Artist {i % 5}'}
+        for i in range(24)
+    ]
+    prompts = []
+
+    def generate(prompt, _config, **kwargs):
+        prompts.append(prompt)
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {'A001': True},
+                'target_count': None, 'target_duration_seconds': 1800,
+            })
+        records = json.loads(prompt.split('Available candidates: ', 1)[1])
+        return json.dumps({'playlist_ids': [row['id'] for row in records[:18]]})
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, sent = compose_playlist_with_llm(
+        'Use Track 0 as a seed for exactly 30 minutes', songs,
+        {'provider': 'OLLAMA'},
+        resolved_anchors=[{'type': 'song', 'resolved_track': songs[0]}],
+        duration_rows={song['item_id']: {'duration': 300} for song in songs},
+    )
+    assert sent == 24
+    assert result['requested_output'] == {
+        'target_count': None, 'target_duration_seconds': 1800,
+    }
+    assert len(result['playlist']) == 18
+    assert 'Rank exactly 18 musically suitable' in prompts[1]
+    assert '"duration_seconds":300' in prompts[1]
+
+
+def test_duration_composer_repairs_infeasible_ui_default_count(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': str(i), 'title': f'Track {i}', 'artist': f'Artist {i % 8}'}
+        for i in range(51)
+    ]
+    prompts = []
+
+    def generate(prompt, _config, **kwargs):
+        prompts.append(prompt)
+        if prompt.startswith('Interpret the ORIGINAL') and 'Your previous target_count' not in prompt:
+            return json.dumps({
+                'anchor_decisions': {}, 'target_count': 50,
+                'target_duration_seconds': 1800,
+            })
+        if 'Your previous target_count' in prompt:
+            return json.dumps({
+                'anchor_decisions': {}, 'target_count': None,
+                'target_duration_seconds': 1800,
+            })
+        records = json.loads(prompt.split('Available candidates: ', 1)[1])
+        return json.dumps({'playlist_ids': [row['id'] for row in records[:18]]})
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'Make a playlist of exactly 30 minutes', songs, {'provider': 'OLLAMA'},
+        ui_default_count=50,
+        duration_rows={song['item_id']: {'duration': 300} for song in songs},
+    )
+    assert len(prompts) == 3
+    assert 'target_count MUST be null' in prompts[0]
+    assert 'Your previous target_count=50' in prompts[1]
+    assert result['requested_output']['target_count'] is None
+    assert len(result['playlist']) == 18
+
+
+def test_composer_musical_review_applies_model_chosen_swaps(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': f'a-{i}', 'title': f'A {i}', 'artist': 'Artist A'}
+        for i in range(3)
+    ] + [
+        {'item_id': 'b', 'title': 'B', 'artist': 'Artist B'},
+        {'item_id': 'c', 'title': 'C', 'artist': 'Artist C'},
+    ]
+    prompts = []
+    expected_order = []
+
+    def generate(prompt, _config, **kwargs):
+        prompts.append(prompt)
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {}, 'target_count': 3,
+                'target_duration_seconds': None,
+            })
+        if prompt.startswith('Review your ordered music selection'):
+            chosen = json.loads(prompt.split('Current ordered selection: ', 1)[1].split('\nRemaining candidates:', 1)[0])
+            remaining = json.loads(prompt.split('Remaining candidates: ', 1)[1])
+            expected_order[:] = [remaining[1]['artist'], chosen[0]['artist'], remaining[0]['artist']]
+            return json.dumps({'swaps': [
+                {'remove_id': chosen[1]['id'], 'add_id': remaining[0]['id']},
+                {'remove_id': chosen[2]['id'], 'add_id': remaining[1]['id']},
+            ], 'ordered_ids': [remaining[1]['id'], chosen[0]['id'], remaining[0]['id']]})
+        records = json.loads(prompt.split('Available candidates: ', 1)[1])
+        return json.dumps({'playlist_ids': [row['id'] for row in records if row['artist'] == 'Artist A']})
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'A varied three-track playlist', songs, {'provider': 'OLLAMA'},
+        musical_review=True,
+    )
+    assert len(prompts) == 3
+    assert len(result['playlist']) == 3
+    assert {song['artist'] for song in result['playlist']} == {'Artist A', 'Artist B', 'Artist C'}
+    assert [song['artist'] for song in result['playlist']] == expected_order
+
+
+def test_composer_obeys_model_version_policy_for_candidate_selection(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': 'studio', 'title': 'The Song', 'artist': 'Artist'},
+        {'item_id': 'live', 'title': 'The Song (Live)', 'artist': 'Artist'},
+        {'item_id': 'instrumental', 'title': 'Other Song (Instrumental version)', 'artist': 'Artist'},
+        {'item_id': 'soundtrack', 'title': 'A Song Soundtrack Version', 'artist': 'Artist'},
+        {'item_id': 'evolution', 'title': 'A Song (Evolution track)', 'artist': 'Artist'},
+        {'item_id': 'other', 'title': 'Other Song', 'artist': 'Artist'},
+    ]
+    available = []
+
+    def generate(prompt, _config, **_kwargs):
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {}, 'target_count': 2,
+                'target_duration_seconds': None,
+                'allow_nonstandard_versions': False,
+            })
+        records = json.loads(prompt.split('Available candidates: ', 1)[1])
+        available.extend(records)
+        return json.dumps({'playlist_ids': [row['id'] for row in records]})
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'Two standard studio tracks', songs, {'provider': 'OLLAMA'},
+    )
+    assert {row['title'] for row in available} == {'The Song', 'Other Song'}
+    assert {song['item_id'] for song in result['playlist']} == {'studio', 'other'}
+
+
+def test_composer_selects_each_seed_neighborhood_to_model_balance_plan(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': 'a0', 'title': 'Seed A', 'artist': 'A'},
+        {'item_id': 'b0', 'title': 'Seed B', 'artist': 'B'},
+        {'item_id': 'a1', 'title': 'A One', 'artist': 'A'},
+        {'item_id': 'a2', 'title': 'A Two', 'artist': 'A'},
+        {'item_id': 'b1', 'title': 'B One', 'artist': 'B'},
+        {'item_id': 'b2', 'title': 'B Two', 'artist': 'B'},
+    ]
+    prompts = []
+
+    def generate(prompt, _config, **_kwargs):
+        prompts.append(prompt)
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({
+                'anchor_decisions': {'A001': True, 'A002': True},
+                'target_count': 4, 'target_duration_seconds': None,
+            })
+        if prompt.startswith('Plan musical representation'):
+            if 'REVISE YOUR MUSICAL BALANCE PLAN' not in prompt:
+                return json.dumps({'minimum_neighborhood_tracks': {'1': 2, '2': 1}})
+            return json.dumps({'minimum_neighborhood_tracks': {'1': 1, '2': 1}})
+        if prompt.startswith('Choose musically suitable real-library tracks'):
+            rows = json.loads(prompt.split('Eligible candidates: ', 1)[1])
+            key = 'ids' if 'Seed neighborhood: B / Seed B' in prompt else 'playlist_ids'
+            return json.dumps({key: [rows[0]['id']]})
+        if prompt.startswith('Order exactly these LLM2-selected library tracks'):
+            rows = json.loads(prompt.split('Selected tracks: ', 1)[1])
+            return json.dumps({'playlist_ids': [row['id'] for row in reversed(rows)]})
+        raise AssertionError(f'Unexpected Composer phase: {prompt[:80]}')
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'A playlist inspired by Seed A and Seed B', songs, {'provider': 'OLLAMA'},
+        seed_provenance={'A / Seed A': {'a1', 'a2'}, 'B / Seed B': {'b1', 'b2'}},
+        resolved_anchors=[{'type': 'song', 'resolved_track': songs[0]},
+                          {'type': 'song', 'resolved_track': songs[1]}],
+        musical_review=True,
+    )
+    assert sum('Choose musically suitable real-library tracks' in prompt for prompt in prompts) == 2
+    assert sum('REVISE YOUR MUSICAL BALANCE PLAN' in prompt for prompt in prompts) == 1
+    assert 'Order exactly these LLM2-selected library tracks' in prompts[-1]
+    assert {'a0', 'b0'}.issubset({song['item_id'] for song in result['playlist']})
+    assert len(result['playlist']) == 4
+    assert {'a1', 'a2'} & {song['item_id'] for song in result['playlist']}
+    assert {'b1', 'b2'} & {song['item_id'] for song in result['playlist']}
+
+
 def test_compose_truncated_selection_attempts_only_one_targeted_fill(monkeypatch, caplog):
     import tasks.ai.api as api
     from tasks.playlist_curation import compose_playlist_with_llm
@@ -133,7 +334,10 @@ def test_compose_truncated_selection_attempts_only_one_targeted_fill(monkeypatch
 
     monkeypatch.setattr(api, 'generate_text', generate)
     result, _ = compose_playlist_with_llm(
-        'Choose five songs', [{'item_id': 'track-1', 'title': 'Track 1', 'artist': 'Artist'}],
+        'Choose five songs', [
+            {'item_id': f'track-{i}', 'title': f'Track {i}', 'artist': 'Artist'}
+            for i in range(5)
+        ],
         {'provider': 'OLLAMA'},
     )
     assert result['error']['category'] == 'OUTPUT_LIMIT'
@@ -825,12 +1029,13 @@ def test_rerank_and_curate_share_opaque_shortlist_payload_and_provider_settings(
         "properties": {"selected_ids": {"type": "array", "items": {"type": "string"}}},
         "required": ["selected_ids"],
     }
-    assert captured[0]["max_tokens"] == captured[1]["max_tokens"] == 4096
+    import config
+    assert captured[0]["max_tokens"] == captured[1]["max_tokens"] == config.INSTANT_PLAYLIST_LLM_OUTPUT_TOKENS
     assert captured[0]["think"] == captured[1]["think"] is False
     assert "Candidate presentation shuffled: yes" in logs
     assert "AudioMuse scores sent to LLM: no" in logs
     assert "AudioMuse native ranks sent to LLM: no" in logs
-    assert "Effective LLM output token budget: 4096" in logs
+    assert f"Effective LLM output token budget: {config.INSTANT_PLAYLIST_LLM_OUTPUT_TOKENS}" in logs
     assert any(line.startswith("Serialized candidate payload chars:") for line in logs)
 
 
@@ -1433,6 +1638,25 @@ def test_finalize_composer_duration_preserves_required_anchor_and_count():
     assert selected[0]['item_id'] == '0'
     assert actual == 900
     assert details['within_tolerance']
+
+
+def test_finalize_composer_duration_honors_model_preferred_count_when_feasible():
+    from tasks.playlist_curation import finalize_composer_duration
+
+    songs = [
+        {'item_id': str(i), 'title': f'Track {i}', 'artist': f'Artist {i}'}
+        for i in range(10)
+    ]
+    durations = {
+        str(i): {'duration': 450 if i < 4 else 300}
+        for i in range(10)
+    }
+    selected, actual, details = finalize_composer_duration(
+        songs, durations, 1800, preferred_count=6, tolerance_seconds=15,
+    )
+    assert len(selected) == 6
+    assert actual == 1800
+    assert details['composer_preferred_count_used']
 
 
 def test_finalize_composer_duration_rejects_6572_second_violation():
