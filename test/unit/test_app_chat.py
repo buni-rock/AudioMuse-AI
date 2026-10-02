@@ -100,6 +100,16 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_appli
     return response
 
 
+def test_planner_failure_is_visible_in_playlist_response(monkeypatch):
+    response = _run_pipeline_with_pool(
+        monkeypatch, [],
+        {'selection_mode': 'LLM_COMPOSE'},
+        plan_result_extra={'error': 'Ollama model process was killed by the server.'},
+    )
+    assert response['query_results'] is None
+    assert response['shortfall_reason'] == 'Ollama model process was killed by the server.'
+
+
 def test_compose_duration_only_finalizes_subset_and_receives_canonical_anchor(monkeypatch):
     from tasks import playlist_curation
     import tasks.ai.tool_impl as tool_impl

@@ -1084,6 +1084,32 @@ def _try_structured_ollama_call(
     return parsed_result
 
 
+def _ollama_planner_http_error(exc: Exception, model_name: str) -> tuple[str, bool]:
+    """Return a useful server error and whether another request is futile."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    message = ""
+    if response is not None:
+        try:
+            body = response.json()
+            if isinstance(body, dict) and isinstance(body.get("error"), str):
+                message = body["error"].strip()[:300]
+        except (ValueError, TypeError):
+            pass
+    if "llama-server process has terminated" in message.lower():
+        if "signal: killed" in message.lower():
+            return (
+                f"Ollama could not run {model_name}: its model process was killed by the server "
+                "(likely insufficient available memory). Free memory on the Ollama host "
+                "or select a smaller model.",
+                True,
+            )
+        return f"Ollama could not run {model_name}: {message}", True
+    if message:
+        return f"Ollama HTTP {status}: {message}", False
+    return f"{type(exc).__name__}" + (f" (HTTP {status})" if status else ""), False
+
+
 def call_with_tools_ollama(
     ollama_url: str,
     model_name: str,
@@ -1125,8 +1151,10 @@ def call_with_tools_ollama(
                 return result
             log_messages.append("Native path returned no tool calls; falling back to format=schema")
         except Exception as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            reason = f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "")
+            reason, terminal = _ollama_planner_http_error(exc, model_name)
+            if terminal:
+                log_messages.append(f"Ollama planner unavailable: {reason}")
+                return {"error": reason}
             logger.warning("Native Ollama tool-calling failed (%s); trying structured output", reason)
             log_messages.append(f"Native /api/chat failed: {reason}; trying format=schema")
 
@@ -1172,8 +1200,7 @@ def call_with_tools_ollama(
             "error": f"Ollama timed out after {timeout} seconds. Increase AI_REQUEST_TIMEOUT_SECONDS for slower hardware or larger models."
         }
     except Exception as exc:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        reason = f"{type(exc).__name__}" + (f" (HTTP {status})" if status else "")
+        reason, _ = _ollama_planner_http_error(exc, model_name)
         logger.error("Error calling Ollama with tools (%s)", reason)
         log_messages.append(f"Ollama planner request failed: {reason}")
         return {"error": reason}

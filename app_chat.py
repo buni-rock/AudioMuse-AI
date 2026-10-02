@@ -813,6 +813,7 @@ def _run_chat_pipeline(data, log_messages):
                 "ai_model_selected": ai_config.get(f'{ai_provider.lower()}_model'),
                 "executed_query": None,
                 "query_results": None,
+                "shortfall_reason": str(plan_result['error']),
             },
             200,
         )
