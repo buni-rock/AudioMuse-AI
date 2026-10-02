@@ -8,6 +8,8 @@ services:
       - ../app_chat.py:/app/app_chat.py:ro
       - ../config.py:/app/config.py:ro
       - ../tasks/ai/planner.py:/app/tasks/ai/planner.py:ro
+      - ../tasks/ai/tools.py:/app/tasks/ai/tools.py:ro
+      - ../tasks/ai/tool_impl.py:/app/tasks/ai/tool_impl.py:ro
       - ../tasks/ai/prompts.py:/app/tasks/ai/prompts.py:ro
       - ../tasks/ai/providers/openai.py:/app/tasks/ai/providers/openai.py:ro
       - ../tasks/playlist_curation.py:/app/tasks/playlist_curation.py:ro

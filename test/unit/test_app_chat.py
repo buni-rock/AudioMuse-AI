@@ -156,7 +156,89 @@ def test_compose_duration_only_finalizes_subset_and_receives_canonical_anchor(mo
     assert response['query_results'][0]['item_id'] == '0'
     assert 'Canonical anchors handed to Composer: 1' in response['message']
     assert 'Final requested duration: 1800 s' in response['message']
+    assert 'Required anchors in final playlist: 1/1' in response['message']
+    assert 'Duration fallback:' not in response['message']
     assert 'OK SUCCESS' in response['message']
+
+
+def test_harvest_30_minute_request_uses_broader_pool_only_after_preferred_failure(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    request = ("Can you create me a playlist which uses the Nightwish's song Harvest "
+               "as a seed? I want to have a playlist of exactly 30 minutes. "
+               "The songs should be similar to the seed.")
+    songs = [
+        {'item_id': 'canonical-harvest', 'title': 'Harvest', 'artist': 'Nightwish'},
+        {'item_id': 'preferred', 'title': 'Preferred', 'artist': 'Artist A'},
+        {'item_id': 'broader', 'title': 'Broader', 'artist': 'Artist B'},
+    ]
+    anchor = {'type': 'song', 'resolved_track': songs[0],
+              'resolved': {'title': 'Harvest', 'artist': 'Nightwish',
+                           'track_id': 'canonical-harvest'}}
+
+    def compose(user_request, pool, _config, **_kwargs):
+        assert user_request == request
+        assert len(pool) == 3
+        return {'playlist': pool[:2],
+                'requested_output': {'target_count': None, 'target_duration_seconds': 1800},
+                'anchor_decisions': [{'id': 'A001', 'include': True}]}, 3
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm', compose)
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {
+        str(item_id): {'duration': {'canonical-harvest': 600, 'preferred': 500,
+                                    'broader': 700}[str(item_id)]} for item_id in ids
+    })
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE', 'userInput': request},
+        plan_result_extra={'canonical_retrieval_anchors': [anchor]},
+    )
+    assert response['shortfall_reason'] is None
+    assert response['actual_duration_seconds'] == 1800
+    assert {song['item_id'] for song in response['query_results']} == {
+        'canonical-harvest', 'preferred', 'broader'
+    }
+    assert 'Duration fallback: tolerance met using broader candidate universe' in response['message']
+    assert 'Required anchors in final playlist: 1/1' in response['message']
+
+
+def test_four_song_request_returns_64_tracks_and_reports_four_required_anchors(monkeypatch):
+    from tasks import playlist_curation
+
+    request = ('Here is a list of songs I love:\n'
+               '- Temple of the King from Rainbow,\n'
+               '- Lound and clear from The Cranberries,\n'
+               '- Every breaking wave from U2,\n'
+               '- Paradise from Within Temptation.\n'
+               'Could you assemble a playlist to contain these songs and add another 60 similar songs?')
+    seeds = [('Temple Of The King', 'Rainbow'), ('Loud And Clear', 'The Cranberries'),
+             ('Every Breaking Wave', 'U2'),
+             ('Paradise (What About Us?) (Feat. Tarja)', 'Within Temptation')]
+    songs = [{'item_id': f'canonical-{i}', 'title': title, 'artist': artist}
+             for i, (title, artist) in enumerate(seeds)]
+    songs += [{'item_id': f'discovery-{i}', 'title': f'Discovery {i}',
+               'artist': f'Discovery Artist {i}'} for i in range(60)]
+    anchors = [{'type': 'song', 'resolved_track': song,
+                'resolved': {'title': song['title'], 'artist': song['artist'],
+                             'track_id': song['item_id']}} for song in songs[:4]]
+
+    def compose(user_request, pool, _config, **_kwargs):
+        assert user_request == request
+        return {'playlist': list(pool),
+                'requested_output': {'target_count': 64, 'target_duration_seconds': None},
+                'anchor_decisions': [{'id': f'A{i:03d}', 'include': True}
+                                     for i in range(1, 5)]}, 64
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm', compose)
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE', 'userInput': request},
+        plan_result_extra={'canonical_retrieval_anchors': anchors},
+    )
+    assert len(response['query_results']) == 64
+    assert {song['item_id'] for song in songs[:4]}.issubset(
+        {song['item_id'] for song in response['query_results']}
+    )
+    assert 'Required anchors in final playlist: 4/4' in response['message']
 
 
 def test_compose_duration_violation_cannot_report_success(monkeypatch):
@@ -592,87 +674,26 @@ class TestArtistDiversityEnforcement:
 
 class TestPlaylistLength:
     @pytest.mark.parametrize(
-        'ui_cap, requested_count, expected',
-        [(25, 70, 25), (25, 12, 12), (45, 70, 30), (100, 100, 30)],
+        'ui_count,requested_count,expected',
+        [(25, 70, 70), (25, 12, 12), (45, 70, 70), (100, 100, 100)],
     )
-    def test_llm_target_is_bounded_by_ui_and_server_hard_caps(
-        self, monkeypatch, ui_cap, requested_count, expected
+    def test_llm_target_uses_explicit_request_with_infrastructure_limit(
+        self, monkeypatch, ui_count, requested_count, expected
     ):
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 25)
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_HARD_MAX_SONGS', 30)
-        target, actual_ui_cap, hard_max = app_chat._resolve_llm_song_target(
-            {'n': ui_cap}, requested_count
-        )
-        assert (target, actual_ui_cap, hard_max) == (expected, ui_cap, 30)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_MAX_N_RESULTS', 200)
+        assert app_chat._resolve_llm_song_target(
+            {'n': ui_count}, requested_count
+        ) == (expected, ui_count, 200)
 
     def test_llm_target_without_prompt_count_uses_ui_default(self, monkeypatch):
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 25)
-        assert app_chat._resolve_llm_song_target({}, None) == (25, 25, 30)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_MAX_N_RESULTS', 200)
+        assert app_chat._resolve_llm_song_target({}, None) == (25, 25, 200)
 
-    @pytest.mark.parametrize(
-        'target, expected', [(10, 30), (15, 30), (20, 40), (25, 50), (30, 50)],
-    )
-    def test_dynamic_llm_candidate_limit_scales_with_target(self, monkeypatch, target, expected):
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_CANDIDATE_POOL', 100)
-        assert app_chat._resolve_llm_candidate_limit(target) == expected
-
-    def test_successful_llm_rerank_keeps_only_valid_ranked_candidates(self, monkeypatch):
-        import tasks.ai.api as ai_api
-        import tasks.ai.tool_impl as tool_impl
-
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES', False)
-        monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
-        def rank_requested_tracks(prompt, *_args, **_kwargs):
-            records = _rerank_aliases(prompt)
-            aliases_by_title = {row.get('title'): row['id'] for row in records}
-            return json.dumps({'ranked_ids': [
-                aliases_by_title[f'Track {i:03d}'] for i in range(49, 19, -1)
-            ]})
-
-        monkeypatch.setattr(ai_api, 'generate_text', rank_requested_tracks)
-        songs = [
-            {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
-            for i in range(80)
-        ]
-
-        response = _run_pipeline_with_pool(
-            monkeypatch,
-            songs,
-            {
-                'n': 25, 'selection_mode': 'LLM_RERANK',
-                'userInput': 'Create a playlist of 70 songs',
-            },
-            filter_applied=False,
-            plan_result_extra={
-                'intent': {'anchors': [], 'count': {'mode': 'total', 'value': 70},
-                           'duration_seconds': None, 'constraints': {}, 'playlist_intent': 'similarity_mix'},
-                'requested_final_count': 70,
-                'effective_final_target': 25,
-            },
-        )
-
-        assert [song['item_id'] for song in response['query_results']] == [
-            f'track-{i:03d}' for i in range(49, 24, -1)
-        ]
-        assert 'Requested final total: 70' in response['message']
-        assert 'Effective final target: 25' in response['message']
-        assert 'LLM candidate limit: 50' in response['message']
-        assert 'Candidates sent to LLM: 50' in response['message']
-        assert 'LLM reranked candidates: 30' in response['message']
-        assert 'Rerank coverage: 60%' in response['message']
-        assert 'Rerank required usable aliases: 30' in response['message']
-        assert 'Rerank status: SUCCESS' in response['message']
-        assert 'Native supplementation: disabled' in response['message']
-        assert 'Candidate pool after LLM rerank: 30' in response['message']
-        assert 'Selection strategy: LLM rerank only' in response['message']
-        assert any(line.startswith('LLM selection wall-clock:') for line in response['message'].splitlines())
-        assert any(line.startswith('Playlist rules wall-clock:') for line in response['message'].splitlines())
-        assert 'Final requested target: 25' in response['message']
-        assert 'Final playlist: 25' in response['message']
-        assert 'Supplemented with' not in response['message']
-        assert 'Selection strategy: native fallback' not in response['message']
+    def test_composer_candidate_limit_is_context_capacity(self, monkeypatch):
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES', 300)
+        assert app_chat._resolve_llm_candidate_limit(10) == 300
+        assert app_chat._resolve_llm_candidate_limit(64) == 300
 
     def test_no_duration_constraint_skips_optimizer_and_preserves_native_order(self, monkeypatch):
         from tasks import playlist_curation
@@ -690,106 +711,6 @@ class TestPlaylistLength:
         assert [song['item_id'] for song in response['query_results']] == ['u0', 'u1', 'u2', 'u3']
         assert 'Duration optimizer' not in response['message']
         assert 'Playlist kept in native/curator rank order (no explicit duration constraint)' in response['message']
-
-    def test_count_only_curate_returns_only_validated_selection(self, monkeypatch):
-        import tasks.ai.api as ai_api
-        import tasks.ai.tool_impl as tool_impl
-
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_SELECTION_MODE', 'LLM_CURATE')
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
-        monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda _ids: {})
-        def select_expected_tracks(prompt, *_args, **_kwargs):
-            records = _rerank_aliases(prompt)
-            aliases_by_title = {row.get('title'): row['id'] for row in records}
-            return json.dumps({
-                'selected_ids': [aliases_by_title[f'Track {i:03d}'] for i in range(17)]
-            })
-        monkeypatch.setattr(
-            ai_api,
-            'generate_text',
-            select_expected_tracks,
-        )
-        songs = [
-            {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
-            for i in range(80)
-        ]
-        response = _run_pipeline_with_pool(
-            monkeypatch, songs, {
-                'n': 25, 'selection_mode': 'LLM_CURATE',
-                'userInput': 'Create a playlist of 70 songs',
-            },
-            filter_applied=False,
-            plan_result_extra={
-                'intent': {'anchors': [], 'count': {'mode': 'total', 'value': 70},
-                           'duration_seconds': None, 'constraints': {}, 'playlist_intent': 'similarity_mix'},
-                'requested_final_count': 70,
-                'effective_final_target': 25,
-            },
-        )
-        assert len(response['query_results']) == 25
-        assert [song['item_id'] for song in response['query_results']] == [
-            f'track-{i:03d}' for i in range(25)
-        ]
-        assert 'Requested final total: 70' in response['message']
-        assert 'Effective final target: 25' in response['message']
-        assert 'Candidates sent to LLM: 50' in response['message']
-        assert 'LLM selected: 17' in response['message']
-        assert 'LLM selection unusable: 17 candidates cannot satisfy the requested final count of 25' in response['message']
-        assert 'LLM candidate pool discarded; full native fallback selected' in response['message']
-        assert 'Selection source: native fallback' in response['message']
-        assert 'Final requested target: 25' in response['message']
-        assert 'Final playlist: 25' in response['message']
-
-    def test_duration_optimizer_input_is_bounded_by_effective_llm_target(self, monkeypatch):
-        import tasks.ai.api as ai_api
-        import tasks.ai.tool_impl as tool_impl
-        import tasks.playlist_ordering as playlist_ordering
-        from tasks import playlist_curation
-
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_MAX_CANDIDATES', 50)
-        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_LLM_INCLUDE_AUDIO_FEATURES', False)
-        monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {
-            item_id: {'duration': 60} for item_id in ids
-        })
-        monkeypatch.setattr(
-            ai_api, 'generate_text',
-            lambda prompt, *args, **kwargs: json.dumps({
-                'ranked_ids': [row['id'] for row in _rerank_aliases(prompt)]
-            }),
-        )
-        optimizer_calls = []
-
-        def capture_optimizer(songs, durations, duration_target, target_count, *args, **kwargs):
-            optimizer_calls.append((len(songs), target_count))
-            return list(songs)
-
-        monkeypatch.setattr(playlist_curation, 'optimize_playlist_duration', capture_optimizer)
-        monkeypatch.setattr(
-            playlist_ordering, 'order_playlist',
-            lambda ids, **kwargs: list(ids),
-        )
-        songs = [
-            {'item_id': f'track-{i:03d}', 'title': f'Track {i:03d}', 'artist': f'Artist {i:03d}'}
-            for i in range(80)
-        ]
-
-        response = _run_pipeline_with_pool(
-            monkeypatch, songs, {
-                'n': 30, 'selection_mode': 'LLM_RERANK',
-                'userInput': 'Create a 30 minute playlist',
-            }, filter_applied=False,
-            plan_result_extra={
-                'intent': {'anchors': [], 'count': {'mode': 'total', 'value': 30},
-                           'duration_seconds': 1800, 'constraints': {}, 'playlist_intent': 'similarity_mix'},
-                'requested_final_count': 30,
-                'effective_final_target': 30,
-                'target_duration_seconds': 1800,
-            },
-        )
-
-        assert optimizer_calls == [(30, 30)]
-        assert len(response['query_results']) == 30
-        assert 'Duration optimizer input: 30 candidates' in response['message']
 
     def test_request_without_n_falls_back_to_the_configured_default(self, monkeypatch):
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_DEFAULT_N_RESULTS', 50)

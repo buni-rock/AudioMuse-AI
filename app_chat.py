@@ -963,6 +963,7 @@ def _run_chat_pipeline(data, log_messages):
     composer_failure_category = None
     composer_failure_reason = None
     candidate_duration_rows = None
+    composer_required_ids = []
     if is_llm_compose and all_songs:
         log_messages.append("Composing final playlist...")
         yield
@@ -973,6 +974,7 @@ def _run_chat_pipeline(data, log_messages):
             candidate_duration_rows = _fetch_pool_features(
                 [song['item_id'] for song in all_songs]
             )
+            composer_candidate_universe = list(all_songs)
 
             def expand_composer_candidates(intent, current_pool):
                 """Fetch wider canonical seed neighborhoods after LLM2A interprets intent."""
@@ -1018,6 +1020,7 @@ def _run_chat_pipeline(data, log_messages):
                 if len(expanded) <= len(current_pool):
                     log_messages.append('Adaptive retrieval: no new available tracks')
                     return None
+                composer_candidate_universe[:] = expanded
                 retained = {str(song['item_id']) for song in expanded}
                 for neighborhood in result.get('seed_neighborhoods') or []:
                     label = str(neighborhood.get('label') or 'seed')
@@ -1095,6 +1098,12 @@ def _run_chat_pipeline(data, log_messages):
                 d for d in composition_result.get('anchor_decisions', [])
                 if isinstance(d, dict) and d.get('include') is True
             ]
+            song_anchors = [a for a in resolved_anchors if isinstance(a, dict) and a.get('type') == 'song']
+            anchor_by_ref = {f'A{index:03d}': anchor for index, anchor in enumerate(song_anchors, 1)}
+            composer_required_ids = [
+                str(anchor_by_ref[d['id']]['resolved_track']['item_id'])
+                for d in include_decisions if d.get('id') in anchor_by_ref
+            ]
             log_messages.append(
                 f"Composer anchors preserved: {len(include_decisions)}/{len(composition_result.get('anchor_decisions', []))}"
             )
@@ -1106,14 +1115,7 @@ def _run_chat_pipeline(data, log_messages):
             composer_requested_target = target_song_count
             if duration_target is not None:
                 from tasks.playlist_curation import finalize_composer_duration
-                song_anchors = [a for a in resolved_anchors if isinstance(a, dict) and a.get('type') == 'song']
-                anchor_by_ref = {
-                    f'A{index:03d}': anchor for index, anchor in enumerate(song_anchors, 1)
-                }
-                required_ids = [
-                    anchor_by_ref[d['id']]['resolved_track']['item_id']
-                    for d in include_decisions if d.get('id') in anchor_by_ref
-                ]
+                required_ids = composer_required_ids
                 preferred_count = len(all_songs)
                 duration_rows = candidate_duration_rows
                 tolerance = config.INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS
@@ -1123,6 +1125,44 @@ def _run_chat_pipeline(data, log_messages):
                     tolerance_seconds=tolerance,
                     preferred_count=composition_result.get('preferred_final_count'),
                 )
+                if not composer_duration_diagnostics.get('within_tolerance'):
+                    from tasks.playlist_curation import is_alternate_recording
+                    excluded_anchor_ids = {
+                        str(anchor_by_ref[d['id']]['resolved_track']['item_id'])
+                        for d in composition_result.get('anchor_decisions', [])
+                        if isinstance(d, dict) and d.get('include') is False
+                        and d.get('id') in anchor_by_ref
+                    }
+                    preferred_pool = list(composition_result.get('playlist') or [])
+                    preferred_ids = {str(song['item_id']) for song in preferred_pool}
+                    broader = preferred_pool
+                    seen = set(preferred_ids)
+                    for song in composer_candidate_universe:
+                        item_id = str(song.get('item_id'))
+                        if item_id in seen or item_id in excluded_anchor_ids:
+                            continue
+                        if (not composition_result.get('allow_nonstandard_versions', False)
+                                and item_id not in required_ids and is_alternate_recording(song)):
+                            continue
+                        broader.append(song)
+                        seen.add(item_id)
+                    if len(broader) > len(all_songs):
+                        log_messages.append(
+                            f"Duration fallback: preferred set missed tolerance; "
+                            f"searching {len(broader)} eligible library candidates"
+                        )
+                        fallback, fallback_seconds, fallback_diagnostics = finalize_composer_duration(
+                            broader, duration_rows, duration_target,
+                            target_count=target_song_count, required_ids=required_ids,
+                            tolerance_seconds=tolerance,
+                            preferred_count=composition_result.get('preferred_final_count'),
+                        )
+                        if fallback_diagnostics.get('within_tolerance'):
+                            all_songs, actual_duration_seconds = fallback, fallback_seconds
+                            composer_duration_diagnostics = fallback_diagnostics
+                            log_messages.append("Duration fallback: tolerance met using broader candidate universe")
+                        else:
+                            log_messages.append("Duration fallback: no eligible subset met tolerance")
                 details = composer_duration_diagnostics
                 log_messages.extend([
                     'Duration optimizer:',
@@ -1592,7 +1632,14 @@ def _run_chat_pipeline(data, log_messages):
             1 for track_id in mandatory_by_id
             if any(str(song.get('item_id')) == track_id for song in final_query_results_list)
         )
-        log_messages.append(f"Mandatory tracks present in final playlist: {present_mandatory}/{len(mandatory_by_id)}")
+        if is_llm_compose:
+            final_ids = {str(song.get('item_id')) for song in final_query_results_list}
+            log_messages.append(
+                f"Required anchors in final playlist: "
+                f"{sum(item_id in final_ids for item_id in composer_required_ids)}/{len(composer_required_ids)}"
+            )
+        else:
+            log_messages.append(f"Mandatory tracks present in final playlist: {present_mandatory}/{len(mandatory_by_id)}")
         if family_suppressed:
             log_messages.append(
                 f"Final unique song families: {len({song_family_key(s) for s in final_query_results_list if song_family_key(s)})}"

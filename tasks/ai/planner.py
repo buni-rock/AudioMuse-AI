@@ -2547,7 +2547,8 @@ def _resolve_intent_anchors(intent: Dict, tool_calls: List[Dict], log_messages: 
         if anchor.get('role') == 'exclusion':
             excluded.append(track)
             continue
-        seeds.append({'type': 'song', 'title': track['title'], 'artist': track['artist']})
+        seeds.append({'type': 'song', 'title': track['title'], 'artist': track['artist'],
+                      'track_id': str(track['item_id'])})
         if anchor.get('include_in_final') and anchor.get('role') != 'reference_only':
             mandatory.append(track)
     excluded_ids = {str(track['item_id']) for track in excluded}
@@ -2566,7 +2567,8 @@ def _resolve_intent_anchors(intent: Dict, tool_calls: List[Dict], log_messages: 
         if len(song_seeds) == 2 and len(seeds) == 2 and {a.get('role') for a in journey} == {'start', 'destination'}:
             args['seeds'] = [
                 {'type': 'song', 'title': anchor['resolved_track']['title'],
-                 'artist': anchor['resolved_track']['artist']}
+                 'artist': anchor['resolved_track']['artist'],
+                 'track_id': str(anchor['resolved_track']['item_id'])}
                 for role in ('start', 'destination')
                 for anchor in journey if anchor.get('role') == role
             ]
@@ -2604,6 +2606,7 @@ def _assert_canonical_seed_search_args(arguments: Dict, intent: Dict) -> None:
         identity = (
             str(resolved.get('title') or '').strip().casefold(),
             str(resolved.get('artist') or '').strip().casefold(),
+            str(resolved.get('track_id') or ''),
         )
         canonical.append(identity)
         anchor_records.append((anchor, identity))
@@ -2613,6 +2616,7 @@ def _assert_canonical_seed_search_args(arguments: Dict, intent: Dict) -> None:
             actual.append((
                 str(seed.get('title') or '').strip().casefold(),
                 str(seed.get('artist') or '').strip().casefold(),
+                str(seed.get('track_id') or ''),
             ))
     if sorted(actual) == sorted(canonical):
         return
@@ -2627,11 +2631,12 @@ def _assert_canonical_seed_search_args(arguments: Dict, intent: Dict) -> None:
     resolved_artist = str(resolved_identity.get('artist') or 'unknown')
     extra_identities = [identity for identity in actual if identity not in canonical]
     actual_identity = extra_identities[0] if extra_identities else ('unknown', 'unknown')
-    actual_identity_text = f"{actual_identity[0]} / {actual_identity[1]}"
+    actual_identity_text = f"{actual_identity[0]} / {actual_identity[1]} / ID {actual_identity[2]}"
     raise ValueError(
         "Canonical anchor mismatch: "
         f"user reference: {user_reference[0]} / {user_reference[1]}; "
-        f"resolved: {resolved_title} / {resolved_artist}; tool seed: {actual_identity_text}"
+        f"resolved: {resolved_title} / {resolved_artist} / ID {resolved_identity.get('track_id')}; "
+        f"tool seed: {actual_identity_text}"
     )
 
 
@@ -2921,6 +2926,7 @@ def plan_and_execute_once(
                     'type': 'song',
                     'title': str(track.get('title') or anchor.get('title') or '').strip(),
                     'artist': str(track.get('artist') or track.get('author') or anchor.get('artist') or '').strip(),
+                    'track_id': str(track['item_id']),
                 })
             elif anchor.get('type') == 'artist':
                 name = str(anchor.get('resolved_artist') or anchor.get('name') or anchor.get('artist') or '').strip()

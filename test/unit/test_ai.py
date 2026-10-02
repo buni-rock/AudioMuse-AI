@@ -15,7 +15,7 @@ Main Features:
 * Playlist-name sanitizing, unicode normalization, and think-tag stripping.
 * Streaming chunk assembly, rate-limit backoff, and parameter fallbacks.
 * URL-based OpenAI-vs-Ollama format detection and API-error handling.
-* An Ollama /api/chat URL is sent to /api/generate for plain text generation.
+* Ollama text generation uses the native /api/chat transport.
 """
 
 import os
@@ -34,6 +34,9 @@ def _ensure_namespace_pkg(name: str, sub_path: str) -> None:
     pkg = types.ModuleType(name)
     pkg.__path__ = [os.path.join(_REPO_ROOT, sub_path)]
     sys.modules[name] = pkg
+    parent, _, child = name.rpartition('.')
+    if parent in sys.modules:
+        setattr(sys.modules[parent], child, pkg)
 
 
 def _load_submodule(name: str, relpath: str):
@@ -43,6 +46,9 @@ def _load_submodule(name: str, relpath: str):
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
+    parent, _, child = name.rpartition('.')
+    if parent in sys.modules:
+        setattr(sys.modules[parent], child, mod)
     return mod
 
 
@@ -239,19 +245,9 @@ class TestGetOpenAICompatiblePlaylistName:
         assert result == "Sunset Vibes"
         assert mock_sleep.called
 
-    @patch('tasks.ai.providers.openai.requests.post')
+    @patch('tasks.ai.providers.openai._ollama_chat_request')
     def test_ollama_format_success(self, mock_post):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = Mock()
-
-        chunks = [
-            b'{"response":"Morning","done":false}\n',
-            b'{"response":" Calm","done":false}\n',
-            b'{"response":"","done":true}\n',
-        ]
-        mock_response.iter_lines.return_value = chunks
-        mock_post.return_value = mock_response
+        mock_post.return_value = {'message': {'content': 'Morning Calm'}, 'done_reason': 'stop'}
 
         result = get_openai_compatible_playlist_name(
             server_url="http://localhost:11434/api/generate",
@@ -261,16 +257,12 @@ class TestGetOpenAICompatiblePlaylistName:
         )
 
         assert result == "Morning Calm"
+        assert mock_post.call_args[0][0] == 'http://localhost:11434/api/chat'
 
-    @patch('tasks.ai.providers.openai.requests.post')
+    @patch('tasks.ai.providers.openai._ollama_chat_request')
     def test_handles_think_tags(self, mock_post):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = Mock()
-
-        chunks = [b'{"response":"<think>reasoning here</think>Final Name","done":true}\n']
-        mock_response.iter_lines.return_value = chunks
-        mock_post.return_value = mock_response
+        mock_post.return_value = {'message': {'thinking': 'reasoning here', 'content': 'Final Name'},
+                                  'done_reason': 'stop'}
 
         result = get_openai_compatible_playlist_name(
             server_url="http://localhost:11434/api/generate",
@@ -293,15 +285,9 @@ class TestGetOpenAICompatiblePlaylistName:
         assert "Error" in result
         assert "unavailable" in result
 
-    @patch('tasks.ai.providers.openai.requests.post')
-    def test_handles_invalid_json(self, mock_post):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = Mock()
-
-        chunks = [b'invalid json\n', b'{"response":"Valid","done":true}\n']
-        mock_response.iter_lines.return_value = chunks
-        mock_post.return_value = mock_response
+    @patch('tasks.ai.providers.openai._ollama_chat_request')
+    def test_handles_native_ollama_chat_envelope(self, mock_post):
+        mock_post.return_value = {'message': {'content': 'Valid'}, 'done_reason': 'stop'}
 
         result = get_openai_compatible_playlist_name(
             server_url="http://localhost:11434/api/generate",
@@ -380,18 +366,10 @@ class TestGetOpenAICompatiblePlaylistName:
         assert result == "Quiet Storm"
         assert mock_sleep.call_count == 1
 
-    @patch('tasks.ai.providers.openai.requests.post')
+    @patch('tasks.ai.providers.openai._ollama_chat_request')
     @patch('tasks.ai.providers.openai.time.sleep')
     def test_authenticated_ollama_url_uses_ollama_format(self, mock_sleep, mock_post):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.raise_for_status = Mock()
-        mock_response.iter_lines.return_value = [
-            b'{"response":"Quiet","done":false}\n',
-            b'{"response":" Storm","done":false}\n',
-            b'{"response":"","done":true}\n',
-        ]
-        mock_post.return_value = mock_response
+        mock_post.return_value = {'message': {'content': 'Quiet Storm'}, 'done_reason': 'stop'}
 
         result = get_openai_compatible_playlist_name(
             server_url="http://ollama-proxy.example.com:11434/api/generate",
@@ -401,9 +379,9 @@ class TestGetOpenAICompatiblePlaylistName:
         )
 
         assert result == "Quiet Storm"
-        sent_body = json.loads(mock_post.call_args[1]['data'])
-        assert 'prompt' in sent_body
-        assert 'messages' not in sent_body
+        sent_body = mock_post.call_args[0][2]
+        assert sent_body['messages'][-1]['content'] == 'prompt'
+        assert mock_post.call_args[0][0] == 'http://ollama-proxy.example.com:11434/api/chat'
 
     @patch('tasks.ai.providers.openai.requests.post')
     @patch('tasks.ai.providers.openai.time.sleep')
@@ -779,12 +757,9 @@ class TestGetOpenAICompatiblePlaylistName:
 
 
 class TestGetOllamaPlaylistName:
-    @patch('tasks.ai.providers.openai.requests.post')
+    @patch('tasks.ai.providers.openai._ollama_chat_request')
     def test_calls_with_ollama_format_url(self, mock_post):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.iter_lines.return_value = [b'{"response":"Test Playlist","done":true}']
-        mock_post.return_value = mock_response
+        mock_post.return_value = {'message': {'content': 'Test Playlist'}, 'done_reason': 'stop'}
 
         result = get_openai_compatible_playlist_name(
             server_url="http://localhost:11434/api/generate",
@@ -795,12 +770,9 @@ class TestGetOllamaPlaylistName:
 
         assert result == "Test Playlist"
 
-    @patch('tasks.ai.providers.openai.requests.post')
-    def test_chat_endpoint_url_is_sent_to_the_generate_endpoint(self, mock_post):
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.iter_lines.return_value = [b'{"response":"Test Playlist","done":true}']
-        mock_post.return_value = mock_response
+    @patch('tasks.ai.providers.openai._ollama_chat_request')
+    def test_chat_endpoint_url_is_sent_to_the_chat_endpoint(self, mock_post):
+        mock_post.return_value = {'message': {'content': 'Test Playlist'}, 'done_reason': 'stop'}
 
         result = get_openai_compatible_playlist_name(
             server_url="http://localhost:11434/API/Chat",
@@ -810,8 +782,8 @@ class TestGetOllamaPlaylistName:
         )
 
         assert result == "Test Playlist"
-        assert mock_post.call_args[0][0] == "http://localhost:11434/api/generate"
-        assert json.loads(mock_post.call_args[1]['data'])['prompt'] == "test prompt"
+        assert mock_post.call_args[0][0] == "http://localhost:11434/API/Chat"
+        assert mock_post.call_args[0][2]['messages'][-1]['content'] == "test prompt"
 
     def test_ollama_endpoints_derive_both_paths_from_any_form(self):
         assert ai_openai._ollama_endpoints("http://h:11434/api/chat") == (

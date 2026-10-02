@@ -1123,6 +1123,7 @@ def compose_playlist_with_llm(
             if (_normalized_content_text(label_artist) == artist
                     and _normalized_content_text(label_title) == title):
                 positive_neighborhoods.add(index)
+    phase_b_input_count = len(numeric_records)
     if not intent.get("allow_nonstandard_versions", False):
         numeric_records = [
             row for row in numeric_records
@@ -1131,6 +1132,13 @@ def compose_playlist_with_llm(
         candidate_durations = [
             row["duration_seconds"] for row in numeric_records if "duration_seconds" in row
         ]
+    if log_messages is not None:
+        log_messages.append(
+            f"Phase B eligibility: {phase_b_input_count} shortlisted; "
+            f"{phase_b_input_count - len(numeric_records)} nonstandard versions removed; "
+            f"0 duplicates removed at this stage; 0 unavailable removed at this stage; "
+            f"{len(numeric_records)} supplied"
+        )
     eligible_refs = {row["id"] for row in numeric_records}
     available_count = len(eligible_refs - excluded_refs)
     if target_duration is not None:
@@ -1213,10 +1221,25 @@ def compose_playlist_with_llm(
             requested_minima = balance.get("minimum_neighborhood_tracks") if isinstance(balance, dict) else None
             raw_policy = balance.get("artist_mix") if isinstance(balance, dict) else None
             if (balance_parse_error or not isinstance(requested_minima, dict)
-                    or not set(balance).issubset({"minimum_neighborhood_tracks", "artist_mix"})
                     or set(requested_minima) != {str(index) for index in positive_neighborhoods}
                     or any(type(value) is not int or value < 1 for value in requested_minima.values())):
-                return failed("SCHEMA_MISMATCH", "Composer musical balance plan was invalid.")
+                if log_messages is not None:
+                    log_messages.append(
+                        f"Compose Phase B balance: invalid soft musical plan "
+                        f"(keys={sorted(balance) if isinstance(balance, dict) else type(balance).__name__}); "
+                        f"{'retrying' if not attempt else 'continuing without seed minima'}"
+                    )
+                if attempt:
+                    neighborhood_minima = {}
+                    artist_policy = None
+                    break
+                balance_prompt += (
+                    "\n\nREPAIR: Return a JSON object with minimum_neighborhood_tracks "
+                    "containing exactly one positive integer entry for each listed seed ID, "
+                    "and artist_mix with positive integer max_tracks_per_artist and "
+                    "minimum_distinct_artists. Return no prose."
+                )
+                continue
             neighborhood_minima = {int(key): value for key, value in requested_minima.items()}
             artist_policy = None
             if (isinstance(raw_policy, dict)
@@ -1239,7 +1262,12 @@ def compose_playlist_with_llm(
                 break
             if attempt:
                 if excess > 0 or over_available:
-                    return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Composer musical balance plan exceeds available candidates.")
+                    if log_messages is not None:
+                        log_messages.append(
+                            "Compose Phase B balance: infeasible soft minima after repair; "
+                            "continuing without seed minima"
+                        )
+                    neighborhood_minima = {}
                 artist_policy = None  # Keep the valid playlist plan if its soft artist goal is infeasible.
                 break
             balance_prompt += (
@@ -1329,7 +1357,7 @@ def compose_playlist_with_llm(
         ]
         chosen = set(refs)
 
-        def select_exact_group(phase, label, rows, requested):
+        def select_exact_group(phase, label, rows, requested, *, allow_partial=False):
             selected_ids = []
             for attempt in range(4 if artist_cap is not None else 2):
                 missing = requested - len(selected_ids)
@@ -1417,7 +1445,9 @@ def compose_playlist_with_llm(
                         f"validated {len(selected_ids)}/{requested}; "
                         f"sample={json.dumps(proposed[:5])}"
                     )
-            return selected_ids if len(selected_ids) == requested else None
+            if len(selected_ids) == requested or allow_partial:
+                return selected_ids
+            return None
 
         for index, quota in sorted(neighborhood_minima.items()):
             neighborhood_rows = [
@@ -1427,7 +1457,7 @@ def compose_playlist_with_llm(
             ]
             group_ids = select_exact_group(
                 f"Phase B neighborhood {index}", neighborhood_labels[index - 1],
-                neighborhood_rows, quota,
+                neighborhood_rows, quota, allow_partial=True,
             )
             if group_ids is None:
                 return failed(
@@ -1437,9 +1467,19 @@ def compose_playlist_with_llm(
             refs.extend(group_ids)
             chosen.update(group_ids)
             if log_messages is not None:
+                if len(group_ids) < quota:
+                    log_messages.append(
+                        f"Compose Phase B neighborhood {index}: LLM2 selected {len(group_ids)}/{quota}; "
+                        "unfilled slots transferred to the global musical selection"
+                    )
                 log_messages.append(
                     f"Compose Phase B neighborhood {index}: {len(group_ids)} model-selected tracks"
                 )
+            if len(group_ids) < quota:
+                # This is a soft musical target chosen by LLM2. Preserve the
+                # actual model selections while the unfilled slots remain
+                # available to LLM2's global selection.
+                neighborhood_minima[index] = max(1, len(group_ids))
         remaining_slots = target_count - len(refs)
         if remaining_slots < 0:
             return failed("COMPOSER_SELECTION_SIZE_MISMATCH", "Musical balance plan exceeded the final track count.")
@@ -2030,6 +2070,7 @@ def compose_playlist_with_llm(
     return {
         "playlist": authoritative,
         "requested_output": {"target_count": target_count, "target_duration_seconds": target_duration},
+        "allow_nonstandard_versions": intent.get("allow_nonstandard_versions", False),
         "anchor_decisions": [{"id": key, "include": decisions[key]} for key in sorted(decisions)],
         "shortfall_reason": shortfall,
         "candidate_count": len(records),

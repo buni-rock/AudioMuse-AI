@@ -811,6 +811,16 @@ def _seed_profile(seeds: List[Dict]) -> Optional[Dict]:
 
 def _journey_end_row(db_conn, seed: Dict, log_messages: List[str]):
     if (seed.get('type') or '').lower() == 'song':
+        seed_id = str(seed.get('track_id') or '').strip()
+        if seed_id:
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute(
+                    "SELECT item_id, title, author, album FROM public.score WHERE item_id = %s",
+                    (seed_id,),
+                )
+                row = cur.fetchone()
+            log_messages.append(f"Journey canonical seed ID: {seed_id}")
+            return row
         return _resolve_song_row(
             db_conn, (seed.get('title') or '').strip(), (seed.get('artist') or '').strip(), log_messages
         )
@@ -864,7 +874,8 @@ def _journey_sync(start_seed: Dict, end_seed: Dict, length: int) -> Dict:
     return {"songs": songs, "message": "\n".join(log_messages)}
 
 
-def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int) -> Dict:
+def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int,
+                              *, seed_id: str = "") -> Dict:
     from tasks.ivf_manager import find_nearest_neighbors_by_id
 
     get_songs = int(get_songs) if get_songs is not None else 100
@@ -884,9 +895,20 @@ def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int)
                 "message": "ERROR: song_similarity requires an artist name! Both title and artist are required.",
             }
 
-        log_messages.append(f"Looking up song in database: '{song_title}' by '{song_artist}'")
-
-        seed = _resolve_song_row(db_conn, song_title, song_artist, log_messages)
+        if seed_id:
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute(
+                    "SELECT item_id, title, author, album FROM public.score WHERE item_id = %s",
+                    (seed_id,),
+                )
+                seed = cur.fetchone()
+            log_messages.append(f"Using canonical AudioMuse seed ID: {seed_id}")
+            if not seed:
+                return {"songs": [], "message": "\n".join(log_messages) +
+                        "\nCanonical seed ID is unavailable in the library"}
+        else:
+            log_messages.append(f"Looking up song in database: '{song_title}' by '{song_artist}'")
+            seed = _resolve_song_row(db_conn, song_title, song_artist, log_messages)
 
         if not seed:
             return {

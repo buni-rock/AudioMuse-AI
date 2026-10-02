@@ -374,6 +374,48 @@ def test_composer_rejects_required_anchor_unavailable_on_server(monkeypatch):
     assert 'Missing' in result['error']['reason']
 
 
+def test_composer_continues_when_soft_balance_plan_is_malformed_twice(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': key, 'title': key, 'artist': artist}
+        for key, artist in [('seed-a', 'A'), ('seed-b', 'B'),
+                            ('related-a', 'C'), ('related-b', 'D')]
+    ]
+    balance_calls = []
+
+    def generate(prompt, _config, **_kwargs):
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({'anchor_decisions': {'A001': True, 'A002': True},
+                               'target_count': 4, 'target_duration_seconds': None})
+        if prompt.startswith('Plan musical representation'):
+            balance_calls.append(prompt)
+            return json.dumps({'minimum_neighborhood_tracks': {'1': 'many'},
+                               'artist_mix': {'max_tracks_per_artist': 2}})
+        if prompt.startswith('Compose an ordered playlist selection'):
+            rows = json.loads(prompt.split('Available candidates: ', 1)[1])
+            return json.dumps({'playlist_ids': [row['id'] for row in rows]})
+        raise AssertionError(prompt[:90])
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    logs = []
+    result, sent = compose_playlist_with_llm(
+        'Make a four-track discovery playlist around these two songs',
+        songs, {'provider': 'OLLAMA'},
+        seed_provenance={'A / seed-a': ['related-a'],
+                         'B / seed-b': ['related-b']},
+        resolved_anchors=[{'type': 'song', 'resolved_track': songs[0]},
+                          {'type': 'song', 'resolved_track': songs[1]}],
+        log_messages=logs,
+    )
+    assert sent == 4
+    assert len(balance_calls) == 2
+    assert len(result['playlist']) == 4
+    assert not result.get('error')
+    assert any('continuing without seed minima' in line for line in logs)
+
+
 def test_composer_artist_mix_limits_concentration_without_losing_anchors(monkeypatch):
     import tasks.ai.api as api
     from tasks.playlist_curation import compose_playlist_with_llm
@@ -487,6 +529,53 @@ def test_composer_retries_malformed_global_fill_without_losing_playlist(monkeypa
     assert len(global_calls) == 2
     assert len(order_calls) == 2
     assert any('model ordering unavailable; preserving LLM2 selections' in line for line in logs)
+
+
+def test_composer_moves_unfilled_soft_seed_slots_to_llm_global_fill(monkeypatch):
+    import tasks.ai.api as api
+    from tasks.playlist_curation import compose_playlist_with_llm
+
+    songs = [
+        {'item_id': key, 'title': key, 'artist': artist}
+        for key, artist in [
+            ('a0', 'A'), ('b0', 'B'), ('a1', 'C'), ('a2', 'D'),
+            ('b1', 'E'), ('b2', 'F'), ('b3', 'G'), ('global', 'H'),
+        ]
+    ]
+    neighborhood_two_calls = []
+    logs = []
+
+    def generate(prompt, _config, **_kwargs):
+        if prompt.startswith('Interpret the ORIGINAL'):
+            return json.dumps({'anchor_decisions': {'A001': True, 'A002': True},
+                               'target_count': 6, 'target_duration_seconds': None})
+        if prompt.startswith('Plan musical representation'):
+            return json.dumps({'minimum_neighborhood_tracks': {'1': 2, '2': 2}})
+        if prompt.startswith('Choose musically suitable real-library tracks'):
+            rows = json.loads(prompt.split('Eligible candidates: ', 1)[1])
+            if 'Seed neighborhood: B / b0' in prompt:
+                neighborhood_two_calls.append(prompt)
+                return json.dumps({'playlist_ids': [rows[0]['id']]}) if len(neighborhood_two_calls) == 1 else json.dumps({'playlist_ids': [999]})
+            count = int(prompt.split('Missing track choices: ', 1)[1].split('\n', 1)[0])
+            return json.dumps({'playlist_ids': [row['id'] for row in rows[:count]]})
+        if prompt.startswith('Order exactly these LLM2-selected library tracks'):
+            rows = json.loads(prompt.split('Selected tracks: ', 1)[1])
+            return json.dumps({'playlist_ids': [row['id'] for row in rows]})
+        raise AssertionError(prompt[:90])
+
+    monkeypatch.setattr(api, 'generate_text', generate)
+    result, _ = compose_playlist_with_llm(
+        'Mix these two songs into six tracks', songs, {'provider': 'OLLAMA'},
+        seed_provenance={'A / a0': ['a1', 'a2'],
+                         'B / b0': ['b1', 'b2', 'b3']},
+        resolved_anchors=[{'type': 'song', 'resolved_track': songs[0]},
+                          {'type': 'song', 'resolved_track': songs[1]}],
+        log_messages=logs,
+    )
+    assert not result.get('error')
+    assert len(result['playlist']) == 6
+    assert {'a0', 'b0'}.issubset({song['item_id'] for song in result['playlist']})
+    assert any('unfilled slots transferred to the global musical selection' in line for line in logs)
 
 
 def test_compose_truncated_selection_attempts_only_one_targeted_fill(monkeypatch, caplog):
@@ -1475,8 +1564,8 @@ def test_title_only_seed_dispatch_resolves_track_before_similarity_search(monkey
     )
     called = {}
 
-    def similarity(title, artist, count):
-        called.update(title=title, artist=artist, count=count)
+    def similarity(title, artist, count, *, seed_id=""):
+        called.update(title=title, artist=artist, count=count, seed_id=seed_id)
         return {"songs": [{"item_id": "neighbor-opaque"}], "message": "similarity results"}
 
     monkeypatch.setattr(tools, "_song_similarity_api_sync", similarity)
@@ -1486,8 +1575,29 @@ def test_title_only_seed_dispatch_resolves_track_before_similarity_search(monkey
     )
     assert called["title"] == "Dark Chest Of Wonders"
     assert called["artist"] == "Nightwish"
+    assert called["seed_id"] == "seed-opaque"
     assert result["songs"][0]["item_id"] == "neighbor-opaque"
     assert "Seed ID: seed-opaque" in result["message"]
+
+
+def test_canonical_song_seed_reaches_audiomuse_by_physical_id(monkeypatch):
+    from tasks.ai import tools
+
+    calls = []
+
+    def similarity(title, artist, count, *, seed_id=""):
+        calls.append((title, artist, count, seed_id))
+        return {"songs": [{"item_id": "related"}], "message": "canonical lookup"}
+
+    monkeypatch.setattr(tools, "_song_similarity_api_sync", similarity)
+    result = tools._dispatch_seed_search({
+        "seeds": [{"type": "song", "title": "Harvest", "artist": "Nightwish",
+                   "track_id": "fp_47d67f301b070bf71a772b977c02f506f0abf6041f57179e43f"}],
+        "get_songs": 50,
+    }, {})
+    assert calls == [("Harvest", "Nightwish", 50,
+                      "fp_47d67f301b070bf71a772b977c02f506f0abf6041f57179e43f")]
+    assert result["songs"][0]["item_id"] == "related"
 
 
 def test_seed_search_to_curated_duration_pipeline_keeps_named_seed(monkeypatch):

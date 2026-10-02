@@ -1105,7 +1105,8 @@ class TestZeroResultReplan:
         p = _plan()
         calls = []
 
-        def fake_ai(user_message, tools, ai_config, log_messages, library_context=None):
+        def fake_ai(user_message, tools, ai_config, log_messages, library_context=None,
+                    **_kwargs):
             calls.append(user_message)
             if len(calls) == 1:
                 semantic, call = (
@@ -1169,13 +1170,15 @@ def _example_calls(example_text):
     return json.loads(example_text.split('\n', 1)[1])['tool_calls']
 
 
-def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None, resolved_seed=None, intent=None):
+def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None, resolved_seed=None,
+              intent=None, retrieval_only=False):
     import tasks.ai.tools as tools_mod
     import tasks.ai.tool_impl as impl_mod
 
     seen = []
 
-    def fake_ai(user_message, tools, ai_config, log_messages, library_context=None):
+    def fake_ai(user_message, tools, ai_config, log_messages, library_context=None,
+                **_kwargs):
         if callable(tool_calls):
             response = tool_calls(user_message)
         else:
@@ -1220,7 +1223,7 @@ def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None, resolved_se
     logs = []
     result = _drive(p.plan_and_execute_once(
         request, [], {'provider': 'NONE'}, logs, raw_user_request=raw_request,
-        resolved_seed=resolved_seed,
+        resolved_seed=resolved_seed, retrieval_only=retrieval_only,
     ))
     return result, seen, logs
 
@@ -1279,6 +1282,31 @@ def test_structured_multi_song_intent_resolves_anchors_and_additional_count(monk
     assert any('Requested final total: 64' in line for line in logs)
     assert any(line.startswith('Planner wall-clock:') for line in logs)
     assert any(line.startswith('Retrieval wall-clock:') for line in logs)
+
+
+def test_retrieval_only_rebuild_preserves_canonical_physical_seed_id(monkeypatch):
+    p = _plan()
+    import tasks.ai.tool_impl as impl
+    monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, artist_hint=None: {
+        'item_id': 'canonical-harvest-id', 'title': 'Harvest',
+        'author': 'Nightwish', 'album': 'Human Nature',
+    })
+    intent = {'anchors': [{
+        'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+        'role': 'reference_only', 'include_in_final': False,
+    }], 'count': None, 'duration_seconds': None, 'constraints': {},
+        'playlist_intent': 'similarity_mix'}
+    _, executed, logs = _run_plan(
+        p, monkeypatch, 'Use Harvest by Nightwish as a seed',
+        [{'name': 'seed_search', 'arguments': {'seeds': [
+            {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+        ]}}], intent=intent, retrieval_only=True,
+    )
+    assert executed[0][1]['seeds'] == [{
+        'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+        'track_id': 'canonical-harvest-id',
+    }]
+    assert any('Canonical AudioMuse retrieval seed arguments rebuilt: 1' in line for line in logs)
 
 
 class TestSeedArtistDoesNotBecomeFilter:
@@ -1628,18 +1656,20 @@ class TestRetrievalBudget:
         )
         return seen[0]
 
-    def test_budget_over_fetches_twice_the_target_so_dedup_and_diversity_have_slack(
+    def test_budget_uses_target_within_retrieval_capacity(
         self, monkeypatch
     ):
-        assert self._budget_for(monkeypatch, 200) == 400
-        assert self._budget_for(monkeypatch, 500) == 1000
+        import config
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES', 600)
+        assert self._budget_for(monkeypatch, 200) == 200
+        assert self._budget_for(monkeypatch, 500) == 500
 
-    def test_budget_keeps_its_200_floor_for_short_playlists(self, monkeypatch):
-        assert self._budget_for(monkeypatch, 10) == 200
-        assert self._budget_for(monkeypatch, 50) == 200
+    def test_budget_has_no_obsolete_200_floor_for_short_playlists(self, monkeypatch):
+        assert self._budget_for(monkeypatch, 10) == 10
+        assert self._budget_for(monkeypatch, 50) == 50
 
-    def test_budget_at_the_legacy_100_target_is_unchanged(self, monkeypatch):
-        assert self._budget_for(monkeypatch, 100) == 200
+    def test_budget_at_100_tracks_is_100(self, monkeypatch):
+        assert self._budget_for(monkeypatch, 100) == 100
 
 
 def test_planner_roles_distinguish_reference_and_excluded_song_anchors(monkeypatch):
@@ -1657,7 +1687,7 @@ def test_planner_roles_distinguish_reference_and_excluded_song_anchors(monkeypat
     mandatory = _plan()._resolve_intent_anchors(intent, calls, logs)
     assert mandatory == []
     assert calls[0]['arguments']['seeds'] == [
-        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'}
+        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish', 'track_id': 'harvest-id'}
     ]
     assert [track['item_id'] for track in intent['excluded_tracks']] == ['gls-id']
 def test_harvest_reference_flows_as_one_canonical_seed_and_composer_anchor(monkeypatch):
@@ -1688,7 +1718,7 @@ def test_harvest_reference_flows_as_one_canonical_seed_and_composer_anchor(monke
         'title': 'Harvest', 'artist': 'Nightwish', 'track_id': 'harvest-id',
     }
     assert calls[0]['arguments']['seeds'] == [
-        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish', 'track_id': 'harvest-id'},
     ]
     planner._assert_canonical_seed_search_args(calls[0]['arguments'], intent)
     assert 'Resolved anchor A001: Harvest / Nightwish track_id=harvest-id' in logs

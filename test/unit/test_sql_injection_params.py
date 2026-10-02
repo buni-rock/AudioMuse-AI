@@ -156,3 +156,53 @@ class TestToolImplInClauseParameterized:
         assert list(params) == similar_ids
         assert 'id-a' not in sql
         assert 'id-b' not in sql
+
+    def test_song_similarity_uses_canonical_id_without_title_lookup(self):
+        tool_impl = self._load_tool_impl()
+        canonical_id = 'fp_47d67f301b070bf71a772b977c02f506f0abf6041f57179e43f'
+        cur = MagicMock()
+        cur.__enter__ = lambda self: self
+        cur.__exit__ = lambda self, *a: None
+        cur.fetchone.return_value = {
+            'item_id': canonical_id, 'title': 'Harvest',
+            'author': 'Nightwish', 'album': 'Human Nature',
+        }
+        cur.fetchall.return_value = [{
+            'item_id': 'neighbor', 'title': 'Neighbor', 'author': 'Artist', 'album': '',
+        }]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        fake_vm = types.ModuleType('tasks.ivf_manager')
+        fake_vm.find_nearest_neighbors_by_id = MagicMock(return_value=[
+            {'item_id': canonical_id}, {'item_id': 'neighbor'},
+        ])
+        with (patch.object(tool_impl, 'get_db_connection', return_value=conn),
+              patch.dict(sys.modules, {'tasks.ivf_manager': fake_vm})):
+            result = tool_impl._song_similarity_api_sync(
+                'Harvest', 'Nightwish', 2, seed_id=canonical_id,
+            )
+        lookup_sql, lookup_params = cur.execute.call_args_list[0][0]
+        assert 'WHERE item_id = %s' in lookup_sql
+        assert lookup_params == (canonical_id,)
+        fake_vm.find_nearest_neighbors_by_id.assert_called_once_with(
+            canonical_id, n=3, eliminate_duplicates=False, radius_similarity=False,
+        )
+        assert result['songs'][0]['item_id'] == 'neighbor'
+
+    def test_journey_song_endpoint_uses_canonical_id(self):
+        tool_impl = self._load_tool_impl()
+        cur = MagicMock()
+        cur.__enter__ = lambda self: self
+        cur.__exit__ = lambda self, *a: None
+        cur.fetchone.return_value = {'item_id': 'canonical-id', 'title': 'Harvest'}
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        logs = []
+        row = tool_impl._journey_end_row(conn, {
+            'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+            'track_id': 'canonical-id',
+        }, logs)
+        assert row['item_id'] == 'canonical-id'
+        sql, params = cur.execute.call_args[0]
+        assert 'WHERE item_id = %s' in sql
+        assert params == ('canonical-id',)

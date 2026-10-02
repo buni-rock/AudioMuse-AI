@@ -151,6 +151,7 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
         if stype == "song":
             title = (seed.get("title") or seed.get("song_title") or "").strip()
             artist = (seed.get("artist") or seed.get("song_artist") or "").strip()
+            seed_id = str(seed.get("track_id") or "").strip()
             if not title:
                 messages.append("seed_search: skipping song seed with no title")
                 continue
@@ -161,6 +162,7 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
                     continue
                 title = resolved.get("title") or title
                 artist = resolved.get("author") or resolved.get("artist") or ""
+                seed_id = str(resolved.get("item_id") or "").strip()
                 messages.append(
                     f"Seed resolved: true; Seed ID: {resolved.get('item_id')}; "
                     f"Seed title: {title}; Seed artist: {artist}"
@@ -168,7 +170,8 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
             if not artist:
                 messages.append(f"seed_search: resolved seed has no artist: {title}")
                 continue
-            res = _song_similarity_api_sync(title, artist, per_seed_budget)
+            res = (_song_similarity_api_sync(title, artist, per_seed_budget, seed_id=seed_id)
+                   if seed_id else _song_similarity_api_sync(title, artist, per_seed_budget))
         elif stype == "artist":
             name = (seed.get("name") or seed.get("artist") or seed.get("id") or "").strip()
             if not name:

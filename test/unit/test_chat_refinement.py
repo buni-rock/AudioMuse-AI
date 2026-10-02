@@ -305,6 +305,7 @@ class TestSeedNormalization:
         assert plan.primaries == [
             {'name': 'seed_search', 'arguments': {'seeds': [{
                 'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish',
+                'track_id': 'fp-authoritative',
             }], 'blend_mode': 'union'}},
             {'name': 'text_match', 'arguments': {'query': 'female vocals'}},
         ]
@@ -400,7 +401,7 @@ class TestPlanRepairs:
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {i: {'mood_vector': 'rock:0.7'} for i in ids})
         out = planner._backfill_genre_matches({'genres': ['rock']}, pool, feats, {}, 5, [])
         assert [s['item_id'] for s in out] == ['p1', 'p2', 'x1']
-        assert calls[0]['genres'] == ['rock'] and calls[0]['get_songs'] == 200
+        assert calls[0]['genres'] == ['rock'] and calls[0]['get_songs'] == 5
 
     def test_songs_whose_main_style_is_the_genre_lead(self, monkeypatch):
         songs = [{'item_id': 'x'}, {'item_id': 'y'}, {'item_id': 'z'}]
@@ -671,13 +672,15 @@ class TestSeedModes:
         canonical = []
         for anchor in intent['canonical_retrieval_anchors']:
             track = anchor['resolved_track']
-            canonical.append({'type': 'song', 'title': track['title'], 'artist': track['artist']})
+            canonical.append({'type': 'song', 'title': track['title'], 'artist': track['artist'],
+                              'track_id': str(track['item_id'])})
         calls[0]['arguments']['seeds'] = canonical
 
         paradise_seed = next(seed for seed in calls[0]['arguments']['seeds'] if seed['title'].startswith('Paradise'))
         assert paradise_seed == {
             'type': 'song', 'title': 'Paradise (What About Us?) (Feat. Tarja)',
             'artist': 'Within Temptation',
+            'track_id': 'paradise-id',
         }
         planner._assert_canonical_seed_search_args(calls[0]['arguments'], plan.intent)
         with pytest.raises(ValueError, match='Canonical anchor mismatch'):
