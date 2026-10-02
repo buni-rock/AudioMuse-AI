@@ -704,7 +704,7 @@ def check_auth_needed(jwt_secret):
         return None
 
     # Not authenticated
-    if request.path.startswith('/api/'):
+    if wants_json_error(request.path):
         return json_error(ERR_UNAUTHORIZED, "Unauthorized")
     return redirect(url_for('login_page'))
 

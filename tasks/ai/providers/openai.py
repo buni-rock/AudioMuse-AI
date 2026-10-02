@@ -26,11 +26,15 @@ import os
 import re
 import time
 from typing import Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import requests
 
 import config
+from tasks.ai.json_response import (
+    ollama_response_shape, parse_json_response, response_text_and_thinking,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,7 @@ _OLLAMA_CHAT_PATH = "/api/chat"
 _ZEROABLE_ARGS = ("tempo_min", "tempo_max", "energy_min", "min_rating")
 
 _MODELS_REJECTING_REASONING = set()
+_OLLAMA_TEXT_THINK_SETTINGS = {}
 
 
 def _tool_function_specs(tools: List[Dict]) -> List[Dict]:
@@ -86,6 +91,18 @@ def _build_openai_headers(api_key: str, server_url: str) -> Dict[str, str]:
     return headers
 
 
+def _safe_endpoint(url: str) -> str:
+    """Remove credentials and query values before an endpoint enters logs."""
+    try:
+        parts = urlsplit(str(url))
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except Exception:
+        return "<invalid endpoint>"
+
+
 def generate_text(
     server_url: str,
     model_name: str,
@@ -95,8 +112,16 @@ def generate_text(
     skip_delay: bool = False,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    structured_format: Optional[Dict | str] = None,
+    system_prompt: Optional[str] = None,
 ) -> str:
     is_ollama_format = _is_ollama_format_url(server_url)
+    if is_ollama_format:
+        return generate_text_ollama_chat(
+            server_url, model_name, full_prompt, temperature=temperature,
+            max_tokens=max_tokens, structured_format=structured_format,
+            system_prompt=system_prompt,
+        )
     is_openai_format = not is_ollama_format
     provider_label = "Ollama" if is_ollama_format else "OpenAI/OpenRouter"
     if is_ollama_format:
@@ -127,6 +152,8 @@ def generate_text(
             "options": {"num_predict": out_tokens, "temperature": temp},
             "think": False,
         }
+        if structured_format is not None:
+            payload["format"] = structured_format
 
     max_retries = 3
     base_delay = 5
@@ -147,7 +174,7 @@ def generate_text(
             logger.debug(
                 "Starting API call for model '%s' at '%s' (format: %s). Attempt %d/%d",
                 model_name,
-                server_url,
+                _safe_endpoint(server_url) if is_ollama_format else "<configured endpoint>",
                 "OpenAI" if is_openai_format else "Ollama",
                 attempt + 1,
                 max_retries + 1,
@@ -156,8 +183,15 @@ def generate_text(
             response = requests.post(
                 server_url, headers=headers, data=json.dumps(payload), stream=True, timeout=960
             )
+            if is_ollama_format:
+                logger.debug(
+                    "Ollama text request endpoint=%s model=%s HTTP status=%s structured=%s",
+                    _safe_endpoint(server_url), model_name, response.status_code,
+                    structured_format is not None,
+                )
             response.raise_for_status()
             full_raw_response_content = ""
+            full_thinking_content = ""
             raw_sse_lines = []
 
             for line in response.iter_lines():
@@ -192,8 +226,10 @@ def generate_text(
                             elif finish_reason in ("stop", "tool_calls", "content_filter", "error"):
                                 break
                     else:
-                        if "response" in chunk:
+                        if isinstance(chunk.get("response"), str):
                             full_raw_response_content += chunk["response"]
+                        if isinstance(chunk.get("thinking"), str):
+                            full_thinking_content += chunk["thinking"]
                         if chunk.get("done"):
                             break
                 except json.JSONDecodeError:
@@ -206,6 +242,11 @@ def generate_text(
                 if end_tag in extracted_text:
                     extracted_text = extracted_text.split(end_tag, 1)[-1].strip()
 
+            if is_ollama_format:
+                logger.debug(
+                    "Ollama streamed response shape: chunks=%d content_length=%d thinking_length=%d",
+                    len(raw_sse_lines), len(extracted_text), len(full_thinking_content),
+                )
             if extracted_text:
                 logger.info(
                     "%s API returned non-empty content (length=%d chars).",
@@ -299,6 +340,321 @@ def generate_text(
             return "Error: AI service is currently unavailable."
 
     return "Error: Max retries exceeded."
+
+
+class SelectionStreamGuard:
+    """Decode completed JSON array values, including values split across chunks."""
+    def __init__(self):
+        self.text = ""
+        self.position = None
+        self.refs = []
+        self.seen = set()
+        self.repeated = 0
+        self.repetition = False
+        self.closed = False
+
+    def feed(self, text):
+        self.text += text
+        if self.position is None:
+            match = re.search(r'"playlist_ids"\s*:\s*\[', self.text)
+            if not match:
+                return
+            self.position = match.end()
+        decoder = json.JSONDecoder()
+        while not self.closed:
+            pos = self.position
+            while pos < len(self.text) and self.text[pos].isspace():
+                pos += 1
+            if pos >= len(self.text):
+                return
+            if self.text[pos] == ']':
+                self.closed = True
+                return
+            try:
+                value, end = decoder.raw_decode(self.text, pos)
+            except ValueError:
+                return
+            delimiter = end
+            while delimiter < len(self.text) and self.text[delimiter].isspace():
+                delimiter += 1
+            # A numeric token may still be arriving (e.g. 1 then 23).
+            if delimiter >= len(self.text) or self.text[delimiter] not in ',]':
+                return
+            if type(value) in (int, str):
+                key = (type(value), value)
+                self.repeated = self.repeated + 1 if key in self.seen else 0
+                self.seen.add(key)
+                self.refs.append(value)
+                if self.repeated >= 4:
+                    self.repetition = True
+                    return
+            self.position = delimiter + 1
+            if self.text[delimiter] == ']':
+                self.closed = True
+
+
+def _ollama_selection_stream(chat_url, model_name, payload, *, timeout, operation):
+    """Close the HTTP stream promptly when selection references degenerate."""
+    guard = SelectionStreamGuard()
+    thinking = []
+    final = {}
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", chat_url, json={**payload, "stream": True}) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                if chunk.get("error"):
+                    raise RuntimeError(str(chunk["error"]))
+                message = chunk.get("message") or {}
+                guard.feed(message.get("content") or "")
+                thinking.append(message.get("thinking") or "")
+                if guard.repetition:
+                    final = {"done_reason": "COMPOSER_REPETITION"}
+                    break
+                if chunk.get("done"):
+                    final = chunk
+                    break
+    if guard.repetition:
+        # This is a recovered prefix, never a fabricated complete model answer.
+        content = json.dumps({"playlist_ids": guard.refs})
+    elif final.get("done_reason") == "length" and guard.refs:
+        content = json.dumps({"playlist_ids": guard.refs})
+    else:
+        content = guard.text
+    return {**final, "message": {"role": "assistant", "content": content,
+                                  "thinking": "".join(thinking)}}
+
+
+def generate_text_ollama_chat(
+    server_url: str, model_name: str, full_prompt: str, *,
+    temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+    structured_format: Optional[Dict | str] = None, system_prompt: Optional[str] = None,
+    think: Optional[bool | str] = None,
+    num_ctx: Optional[int] = None,
+    call_metadata: Optional[Dict] = None,
+    timeout: Optional[float] = None,
+    allow_think_fallbacks: bool = True,
+    selection_stream: bool = False,
+) -> str:
+    """Generate Ollama text through the shared native /api/chat transport."""
+    chat_url, _ = _ollama_endpoints(server_url)
+    timeout = (
+        None if timeout == 0
+        else float(timeout) if timeout is not None
+        else config.AI_REQUEST_TIMEOUT_SECONDS
+    )
+    payload = {
+        "model": model_name,
+        "messages": ([{"role": "system", "content": system_prompt}] if system_prompt else [])
+        + [{"role": "user", "content": full_prompt}],
+        "stream": False,
+        "think": (
+            bool(think) if think is not None
+            else False if "qwen" in (model_name or "").lower()
+            else None
+        ),
+        "options": {
+            "temperature": 0.7 if temperature is None else float(temperature),
+            "num_predict": 8000 if max_tokens is None else int(max_tokens),
+        },
+    }
+    if num_ctx is not None:
+        payload["options"]["num_ctx"] = int(num_ctx)
+    payload = {key: value for key, value in payload.items() if value is not None}
+    if structured_format is not None:
+        payload["format"] = structured_format
+    endpoint = _safe_endpoint(chat_url)
+    logger.info("Ollama text call started: provider=OLLAMA model=%s endpoint=%s timeout=%s", model_name, endpoint, f"{timeout:g}s" if timeout is not None else "unlimited")
+    try:
+        cache_key = (chat_url, model_name)
+        cached_setting = (
+            _OLLAMA_TEXT_THINK_SETTINGS.get(cache_key)
+            if think is not None and allow_think_fallbacks else None
+        )
+        initial_setting = cached_setting if cached_setting is not None else payload.get("think", "omitted")
+        think_settings = [initial_setting]
+        # Some reasoning-capable models return an empty final channel when
+        # thinking is disabled; others spend the output budget in reasoning
+        # when thinking is enabled. Retry empty responses with supported
+        # Ollama modes, while never treating reasoning text as the answer.
+        if think is not None and allow_think_fallbacks:
+            think_settings.extend(["low", "omitted", "medium"])
+        seen_settings = set()
+        last_details = None
+        for setting in think_settings:
+            marker = repr(setting)
+            if marker in seen_settings:
+                continue
+            seen_settings.add(marker)
+            request_payload = dict(payload)
+            if setting == "omitted":
+                request_payload.pop("think", None)
+            else:
+                request_payload["think"] = setting
+            transport = _ollama_selection_stream if selection_stream else _ollama_chat_request
+            envelope = transport(
+                chat_url, model_name, request_payload, timeout=timeout, operation="text",
+            )
+            content, thinking = response_text_and_thinking(envelope)
+            shape = ollama_response_shape(envelope)
+            if call_metadata is not None:
+                prompt_eval_count = envelope.get("prompt_eval_count") if isinstance(envelope, dict) else None
+                prompt_eval_duration = envelope.get("prompt_eval_duration") if isinstance(envelope, dict) else None
+                eval_count = envelope.get("eval_count") if isinstance(envelope, dict) else None
+                eval_duration = envelope.get("eval_duration") if isinstance(envelope, dict) else None
+                total_duration = envelope.get("total_duration") if isinstance(envelope, dict) else None
+                load_duration = envelope.get("load_duration") if isinstance(envelope, dict) else None
+                call_metadata.update({
+                    "http_status": 200,
+                    "response_type": type(envelope).__name__,
+                    "think_requested": think is False,
+                    "think_accepted": think is False,
+                    "done_reason": shape.get("done_reason"),
+                    "assistant_content_present": bool(content.strip()),
+                    "assistant_content_length": len(content),
+                    "thinking_present": bool(thinking.strip()),
+                    "thinking_length": len(thinking),
+                    "tool_calls_present": bool(shape.get("tool_calls", 0)),
+                    "structured_format_requested": structured_format is not None,
+                    "structured_format_mode": (
+                        "json" if structured_format == "json"
+                        else "schema" if isinstance(structured_format, dict)
+                        else "none"
+                    ),
+                    "prompt_eval_count": prompt_eval_count,
+                    "prompt_eval_duration": prompt_eval_duration,
+                    "eval_count": eval_count,
+                    "eval_duration": eval_duration,
+                    "tokens_per_second": (
+                        eval_count / (eval_duration / 1_000_000_000)
+                        if isinstance(eval_count, (int, float)) and isinstance(eval_duration, (int, float)) and eval_duration > 0
+                        else None
+                    ),
+                    "total_duration": total_duration,
+                    "load_duration": load_duration,
+                })
+                logger.info(
+                    "Ollama composer generation telemetry: prompt_eval_count=%s prompt_eval_duration=%s "
+                    "eval_count=%s eval_duration=%s tokens_per_second=%s total_duration=%s load_duration=%s",
+                    prompt_eval_count, prompt_eval_duration, eval_count, eval_duration,
+                    call_metadata["tokens_per_second"], total_duration, load_duration,
+                )
+            logger.info(
+                "Ollama text response diagnostics: HTTP status=200 response_type=%s "
+                "assistant_content_present=%s assistant_content_length=%d thinking_present=%s "
+                "thinking_length=%d tool_calls_present=%s done_reason=%s structured_format_requested=%s "
+                "think_requested=%s think_accepted=%s",
+                type(envelope).__name__, "yes" if content else "no", len(content),
+                "yes" if thinking else "no", len(thinking),
+                "yes" if shape.get("tool_calls", 0) else "no",
+                shape.get("done_reason") or "unknown", "yes" if structured_format is not None else "no",
+                "false" if think is False else "not requested", "yes" if think is False else "unknown",
+            )
+            if isinstance(content, str) and content.strip():
+                if think is not None:
+                    _OLLAMA_TEXT_THINK_SETTINGS[cache_key] = setting
+                if setting != initial_setting:
+                    logger.info("Ollama text response recovered with think=%s", setting)
+                return content.strip()
+            think_setting = request_payload.get("think", "omitted")
+            last_details = (
+                thinking, shape, think_setting,
+            )
+            logger.warning(
+                "Ollama returned empty assistant content: model=%s thinking_present=%s "
+                "thinking_length=%s tool_calls=%s done_reason=%s structured_format_requested=%s "
+                "think_setting=%s",
+                model_name, "yes" if thinking else "no", len(thinking),
+                shape.get("tool_calls", 0), shape.get("done_reason") or "unknown",
+                "yes" if structured_format is not None else "no", think_setting,
+            )
+        thinking, shape, think_setting = last_details
+        return (
+            "Error: Ollama returned empty assistant content. "
+            f"Model: {model_name}; thinking_present: {'yes' if thinking else 'no'}; "
+            f"thinking_length: {len(thinking)}; tool_calls: {shape.get('tool_calls', 0)}; "
+            f"done_reason: {shape.get('done_reason') or 'unknown'}; structured_format_requested: "
+            f"{'yes' if structured_format is not None else 'no'}; think_setting: {think_setting}."
+        )
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if call_metadata is not None:
+            call_metadata.update({"http_status": status, "exception_type": type(exc).__name__})
+        exception_message = str(exc)
+        exception_message = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", exception_message)
+        exception_message = re.sub(r"(?i)(api[\s_-]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", exception_message)
+        exception_message = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[REDACTED]", exception_message)
+        logger.error(
+            "Ollama text call failed: provider=OLLAMA model=%s endpoint=%s HTTP status=%s timeout=%s exception=%s: %s",
+            model_name, endpoint, status, f"{timeout:g}s" if timeout is not None else "unlimited", type(exc).__name__, exception_message,
+            exc_info=True,
+        )
+        return f"Error: {type(exc).__name__}" + (f" HTTP {status}" if status else "") + f": {exception_message}"
+
+
+def _ollama_chat_request(
+    server_url: str, model_name: str, payload: Dict, *, timeout: int,
+    operation: str,
+) -> Dict:
+    """Shared non-streaming Ollama /api/chat request used by planner and curator."""
+    chat_url, _ = _ollama_endpoints(server_url)
+    endpoint = _safe_endpoint(chat_url)
+    message_roles = [m.get("role") for m in payload.get("messages", []) if isinstance(m, dict)]
+    options = payload.get("options") if isinstance(payload.get("options"), dict) else {}
+    format_value = payload.get("format")
+    if isinstance(format_value, dict):
+        format_shape = {
+            "type": "schema",
+            "top_level_keys": sorted(format_value),
+            "properties": sorted((format_value.get("properties") or {}).keys()),
+            "required": format_value.get("required", []),
+            "property_shapes": {
+                key: {
+                    field: value.get(field)
+                    for field in ("type", "items", "minItems", "maxItems", "uniqueItems")
+                    if field in value
+                }
+                for key, value in (format_value.get("properties") or {}).items()
+                if isinstance(value, dict)
+            },
+        }
+    else:
+        format_shape = {"type": "json" if format_value == "json" else "none"}
+    logger.info(
+        "Ollama %s request: provider=OLLAMA model=%s endpoint=%s method=POST timeout=%ss "
+        "fields=%s roles=%s message_content_lengths=%s stream=%s think=%s tools=%d "
+        "format_shape=%s options=%s num_ctx=%s",
+        operation, model_name, endpoint, timeout, sorted(payload), message_roles,
+        [len(m.get("content", "")) for m in payload.get("messages", []) if isinstance(m, dict) and isinstance(m.get("content", ""), str)],
+        payload.get("stream"), payload.get("think", "omitted"),
+        len(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else 0,
+        format_shape, options, options.get("num_ctx", "omitted"),
+    )
+    with httpx.Client(timeout=timeout) as client:
+        response = client.post(chat_url, json=payload)
+        logger.info("Ollama %s HTTP status=%s endpoint=%s model=%s", operation, response.status_code, endpoint, model_name)
+        try:
+            response.raise_for_status()
+        except Exception:
+            try:
+                body = response.json()
+                shape = (type(body).__name__, sorted(body) if isinstance(body, dict) else None)
+            except Exception:
+                shape = ("non-json", None)
+            logger.error("Ollama %s error response shape=%s", operation, shape)
+            raise
+        envelope = response.json()
+    logger.info(
+        "Ollama %s response envelope: type=%s keys=%s",
+        operation, type(envelope).__name__, sorted(envelope) if isinstance(envelope, dict) else [],
+    )
+    logger.info(
+        "Ollama %s response diagnostics: %s",
+        operation, json.dumps(ollama_response_shape(envelope), sort_keys=True),
+    )
+    return envelope
 
 
 def call_with_tools(
@@ -395,10 +751,6 @@ def call_with_tools(
                                 "arguments": json.loads(tc["function"]["arguments"]),
                             }
                         )
-
-        if len(tool_calls) > 4:
-            log_messages.append(f"OpenAI returned {len(tool_calls)} tool calls; capping to first 4")
-            tool_calls = tool_calls[:4]
 
         if not tool_calls:
             text_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -525,63 +877,57 @@ def _tool_calls_from_parsed(parsed, log_messages: List[str]):
     return None, {"error": "Ollama response missing 'tool_calls' field"}
 
 
-def _parse_ollama_tool_response(
-    response_text: str,
-    log_messages: List[str],
-    tools: List[Dict],
-) -> Dict:
-    """Parse Ollama's structured JSON response, validate tool names, and clean args.
-
-    Returns ``{"tool_calls": [...], "reasoning": "..."}`` on success or
-    ``{"error": "..."}`` with an exact failure reason for the retry feedback loop.
-    """
-    cleaned = ""
+def _parse_ollama_tool_response(response_text, log_messages: List[str], tools: List[Dict]) -> Dict:
+    """Parse wrappers/prose/fenced JSON and validate Ollama planner tool calls."""
     known_names = {t.get("name") for t in tools if t.get("name")}
-    try:
-        cleaned = _strip_thinking(response_text.strip())
-        log_messages.append(f"Ollama raw response (first 300 chars): {cleaned[:300]}")
-        cleaned = _extract_json_fence(cleaned)
+    logger.debug("Ollama planner final response text length=%d", len(response_text or ""))
+    parsed, extracted, thinking, parse_error = parse_json_response(response_text)
+    logger.debug(
+        "Ollama planner parsed response: content_length=%d thinking_present=%s thinking_length=%d",
+        len(extracted), bool(thinking.strip()), len(thinking),
+    )
+    log_messages.append(
+        f"Ollama planner response parsed: thinking={'present' if thinking.strip() else 'absent'}"
+    )
+    if parse_error:
+        reason = f"invalid JSON: {parse_error}"
+        logger.warning("Ollama planner response rejected: %s", reason)
+        log_messages.append(f"Ollama planner response rejected: {reason}")
+        return {"error": reason}
 
-        if (
-            cleaned.startswith("{")
-            and '"tool_calls"' not in cleaned
-            and '"properties"' in cleaned
-        ):
-            log_messages.append("WARN: Ollama returned the schema instead of tool calls")
-            return {"error": "Ollama returned schema definition instead of tool calls"}
+    if isinstance(parsed, dict) and "response" in parsed and isinstance(parsed["response"], str):
+        parsed, extracted, nested_thinking, parse_error = parse_json_response(parsed["response"])
+        thinking = "\n".join(x for x in (thinking, nested_thinking) if x)
+        if parse_error:
+            reason = f"invalid nested response JSON: {parse_error}"
+            log_messages.append(f"Ollama planner response rejected: {reason}")
+            return {"error": reason}
 
-        parsed = json.loads(cleaned)
-
+    logger.debug(
+        "Ollama planner parsed JSON shape: type=%s keys=%s",
+        type(parsed).__name__, sorted(parsed) if isinstance(parsed, dict) else None,
+    )
+    if isinstance(parsed, dict):
+        reasoning = parsed.get("reasoning") or parsed.get("thinking")
+    else:
         reasoning = None
-        if isinstance(parsed, dict):
-            r = parsed.get("reasoning")
-            if isinstance(r, str) and r.strip():
-                reasoning = r.strip()
-
-        tool_calls, error = _tool_calls_from_parsed(parsed, log_messages)
-        if error:
-            return error
-        if not isinstance(tool_calls, list):
-            tool_calls = [tool_calls]
-
-        result = _validate_tool_calls(tool_calls, known_names, log_messages)
-        if "tool_calls" in result and reasoning:
-            result["reasoning"] = reasoning
-        return result
-
-    except json.JSONDecodeError:
-        logger.exception("JSON decode error while parsing Ollama tool response")
-        log_messages.append("X: Failed to parse Ollama JSON response.")
-        log_messages.append(f"Attempted to parse: {cleaned[:300]}")
-        return {
-            "error": "Failed to parse Ollama JSON response.",
-            "raw_response": response_text[:200],
-        }
-    except Exception:
-        logger.exception("Failed to parse Ollama response")
-        log_messages.append("Failed to parse Ollama response.")
-        log_messages.append(f"Response was: {response_text[:200]}")
-        return {"error": "Failed to parse Ollama tool calls", "raw_response": response_text}
+    tool_calls, error = _tool_calls_from_parsed(parsed, log_messages)
+    if error:
+        reason = error.get("error", "unexpected planner JSON shape")
+        logger.warning("Ollama planner response rejected: %s", reason)
+        log_messages.append(f"Ollama planner response rejected: {reason}")
+        return {"error": reason}
+    if not isinstance(tool_calls, list):
+        tool_calls = [tool_calls]
+    result = _validate_tool_calls(tool_calls, known_names, log_messages)
+    if "tool_calls" not in result:
+        reason = result.get("error", "tool-call validation failed")
+        logger.warning("Ollama planner validation failed: %s", reason)
+        log_messages.append(f"Ollama planner validation failed: {reason}")
+        return {"error": reason}
+    if isinstance(reasoning, str) and reasoning.strip():
+        result["reasoning"] = reasoning.strip()
+    return result
 
 
 def _coerce_ollama_tool_args(raw_args, name: str, log_messages: List[str]) -> Dict:
@@ -637,21 +983,33 @@ def _try_native_ollama_tool_call(
     if "qwen" in (model_name or "").lower():
         payload["think"] = False
 
+    expected = [{"name": t.get("name"), "parameters": t.get("inputSchema")} for t in tools]
     log_messages.append("Attempting native Ollama /api/chat tool-calling...")
-    with httpx.Client(timeout=timeout) as client:
-        response = client.post(chat_url, json=payload)
-        response.raise_for_status()
-        result = response.json()
+    logger.debug("Ollama planner expected tool schema=%s", expected)
+    result = _ollama_chat_request(
+        chat_url, model_name, payload, timeout=timeout, operation="planner",
+    )
 
+    logger.debug("Ollama planner native response shape=%s", json.dumps(ollama_response_shape(result), sort_keys=True))
     message = result.get("message", {})
+    if not isinstance(message, dict):
+        message = {}
+    thinking = message.get("thinking") or result.get("thinking") or result.get("reasoning") or ""
+    if thinking:
+        logger.debug("Ollama planner native separate thinking present; length=%d", len(thinking))
+        log_messages.append("Ollama native response included separate thinking/reasoning content")
     raw_tool_calls = message.get("tool_calls") or []
 
     if not raw_tool_calls:
         content = message.get("content", "")
+        logger.debug("Ollama planner native final content length=%d", len(content) if isinstance(content, str) else 0)
         log_messages.append(
-            f"Native tool-calling returned 0 tool calls; "
-            f"model responded with text (first 150 chars): {content[:150]}"
+            f"Native tool-calling returned 0 tool calls; response content length={len(content)}"
         )
+        if content:
+            parsed_content = _parse_ollama_tool_response(content, log_messages, tools)
+            if "tool_calls" in parsed_content:
+                return parsed_content
         return None
 
     tool_calls: List[Dict] = []
@@ -687,6 +1045,10 @@ def _try_structured_ollama_call(
     from tasks.ai.prompts import build_tool_calls_schema  # noqa: E402
 
     schema = build_tool_calls_schema(tools)
+    logger.debug(
+        "Ollama planner expected structured schema=%s",
+        json.dumps(schema, ensure_ascii=False, sort_keys=True),
+    )
     payload = {
         "model": model_name,
         "prompt": prompt,
@@ -701,15 +1063,51 @@ def _try_structured_ollama_call(
             "num_predict": config.AI_TOOLCALL_NUM_PREDICT,
         },
     }
+    logger.debug("Ollama planner endpoint=%s model=%s path=structured", _safe_endpoint(generate_url), model_name)
     with httpx.Client(timeout=timeout) as client:
         response = client.post(generate_url, json=payload)
+        logger.debug("Ollama planner structured HTTP status=%s endpoint=%s model=%s", response.status_code, _safe_endpoint(generate_url), model_name)
         response.raise_for_status()
         result = response.json()
 
-    if "response" not in result:
-        return {"error": "Invalid Ollama response"}
+    logger.debug("Ollama planner structured response shape=%s", json.dumps(ollama_response_shape(result), sort_keys=True))
+    response_text, thinking = response_text_and_thinking(result)
+    if not response_text:
+        reason = f"Ollama response had no response/content field; wrapper keys={sorted(result) if isinstance(result, dict) else type(result).__name__}"
+        log_messages.append(f"Ollama planner response rejected: {reason}")
+        return {"error": reason}
+    logger.debug(
+        "Ollama planner extracted final content: length=%d thinking_present=%s thinking_length=%d",
+        len(response_text), bool(thinking), len(thinking),
+    )
+    parsed_result = _parse_ollama_tool_response(response_text, log_messages, tools)
+    return parsed_result
 
-    return _parse_ollama_tool_response(result["response"], log_messages, tools)
+
+def _ollama_planner_http_error(exc: Exception, model_name: str) -> tuple[str, bool]:
+    """Return a useful server error and whether another request is futile."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    message = ""
+    if response is not None:
+        try:
+            body = response.json()
+            if isinstance(body, dict) and isinstance(body.get("error"), str):
+                message = body["error"].strip()[:300]
+        except (ValueError, TypeError):
+            pass
+    if "llama-server process has terminated" in message.lower():
+        if "signal: killed" in message.lower():
+            return (
+                f"Ollama could not run {model_name}: its model process was killed by the server "
+                "(likely insufficient available memory). Free memory on the Ollama host "
+                "or select a smaller model.",
+                True,
+            )
+        return f"Ollama could not run {model_name}: {message}", True
+    if message:
+        return f"Ollama HTTP {status}: {message}", False
+    return f"{type(exc).__name__}" + (f" (HTTP {status})" if status else ""), False
 
 
 def call_with_tools_ollama(
@@ -735,6 +1133,12 @@ def call_with_tools_ollama(
     chat_url, generate_url = _ollama_endpoints(ollama_url)
 
     timeout = config.AI_REQUEST_TIMEOUT_SECONDS
+    logger.debug(
+        "Ollama planner configured endpoint=%s model=%s expected_tool_schema=%s",
+        _safe_endpoint(ollama_url), model_name,
+        json.dumps([{"name": t.get("name"), "parameters": t.get("inputSchema")} for t in tools], ensure_ascii=False),
+    )
+    log_messages.append(f"Ollama planner model: {model_name}; endpoint: {_safe_endpoint(ollama_url)}")
     log_messages.append(f"Using timeout: {timeout} seconds for Ollama request")
 
     if not is_generate_url:
@@ -746,11 +1150,13 @@ def call_with_tools_ollama(
             if result is not None and "tool_calls" in result:
                 return result
             log_messages.append("Native path returned no tool calls; falling back to format=schema")
-        except Exception:
-            logger.warning(
-                "Native Ollama tool-calling failed; falling back to structured output", exc_info=True
-            )
-            log_messages.append("Native /api/chat tool-calling failed; falling back to format=schema")
+        except Exception as exc:
+            reason, terminal = _ollama_planner_http_error(exc, model_name)
+            if terminal:
+                log_messages.append(f"Ollama planner unavailable: {reason}")
+                return {"error": reason}
+            logger.warning("Native Ollama tool-calling failed (%s); trying structured output", reason)
+            log_messages.append(f"Native /api/chat failed: {reason}; trying format=schema")
 
     log_messages.append("Using Ollama structured-output (format=schema) path")
     try:
@@ -793,6 +1199,8 @@ def call_with_tools_ollama(
         return {
             "error": f"Ollama timed out after {timeout} seconds. Increase AI_REQUEST_TIMEOUT_SECONDS for slower hardware or larger models."
         }
-    except Exception:
-        logger.exception("Error calling Ollama with tools")
-        return {"error": "Ollama service is currently unavailable."}
+    except Exception as exc:
+        reason, _ = _ollama_planner_http_error(exc, model_name)
+        logger.error("Error calling Ollama with tools (%s)", reason)
+        log_messages.append(f"Ollama planner request failed: {reason}")
+        return {"error": reason}

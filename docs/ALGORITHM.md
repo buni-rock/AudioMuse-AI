@@ -2091,15 +2091,40 @@ re-rank on top of that would fight the brainstorm.
 
 #### Streaming and playlist creation
 
-The playlist length comes from the request's `n` (the chat page's "Number of
-songs" box), defaulting to `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`. A count written
-in the request ("15 songs") wins over the box. A time budget ("an hour of")
-sizes the list and then trims it by the tracks' real durations. The pool the
-tools fill is ten times the length, with a floor of 1000, so dedup and the artist
-diversity cap still leave enough to select from. A per-artist cap written in the
-request replaces the default cap and is kept even when the list comes out
-shorter. A journey keeps its path order and is never reordered.
+In `LLM_COMPOSE`, LLM1 is a retrieval planner only. Its schema contains human-
+readable song, artist, and album references plus a retrieval-size hint; it
+cannot return final membership, count semantics, duration, exclusions, version
+policy, artist limits, or order. Explicit song/artist pairs are preserved from
+the user's text before library resolution. The library resolver remains
+authoritative for matching references to real tracks and internal IDs. The
+requested/UI retrieval size is applied independently to each seed neighborhood,
+then candidate IDs are merged, deduplicated, and annotated with per-seed
+provenance.
 
+LLM Compose uses two internal calls. Interpretation receives the exact original
+request, UI default, and resolved anchors; it returns anchor inclusion decisions,
+the final target count, and optional duration. Selection receives that intent,
+the original request, and the broad merged candidate universe as compact
+title/artist/album records with request-local numeric references. It returns
+only the final ordered references and an optional shortfall reason. Application
+code removes invalid or duplicate references while preserving selection order,
+enforces required anchors, trims a validated surplus from the tail, and makes a
+targeted fill call for a shortage. It retries full selection only for malformed
+JSON, and does not apply
+native ranking, an unconditional artist cap, or song-family suppression to the
+composed result. `INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES` is the explicit
+context-capacity limit; balanced reduction is applied only when that configured
+capacity is reached, and `0` sends the full pool. Ollama context is explicit
+through `INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE`; output tokens and provider
+timeout are configured by `COMPOSER_MAX_OUTPUT_TOKENS` and
+`INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS` for Ollama (`0` disables the
+Ollama request timeout; other providers keep their own timeout behavior).
+
+The progress display measures retrieval planning, candidate retrieval,
+composition and validation as separate stages. Native mode remains a separate
+baseline and omits the composer stage. Configured retrieval, composer-context,
+output-token and application maximums are logged capacity limits; they do not
+silently turn additional-count requests into smaller playlists.
 `POST /chat/api/chatPlaylist` returns the final result in one response.
 `POST /chat/api/chatPlaylistStream` streams the same run as Server-Sent Events, so
 the page can show each step as it happens. Optionally
@@ -2142,11 +2167,18 @@ failures return a generic message; the real error only reaches the container log
 - `AI_TOOLCALL_TEMPERATURE`: sampling temperature for the tool-calling request.
   Do not set it to 0 with Qwen-family models, greedy decoding degrades their tool
   calls.
-- `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`, `INSTANT_PLAYLIST_MAX_N_RESULTS`: how
-  many songs the playlist aims for when the caller sends no `n`, and the ceiling
-  the chat page puts on its own "Number of songs" box. The maximum is
-  frontend-only: the API enforces the default and a floor of 1, never the cap.
-- `MAX_SONGS_PER_ARTIST_PLAYLIST`: diversity cap inside an instant playlist.
+- `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`, `INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS`,
+  `INSTANT_PLAYLIST_MAX_N_RESULTS`: native API default, chat UI default, and
+  ceiling for the chat page's "Number of songs" box.
+- `INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES`,
+  `INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE`,
+  `COMPOSER_MAX_OUTPUT_TOKENS`,
+  `INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS`: configured candidate context,
+  Ollama model context, response limit, and Ollama request timeout for LLM Compose.
+- `INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES`,
+  `INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES`: technical limits for
+  candidate collection and duration arithmetic.
+- `MAX_SONGS_PER_ARTIST_PLAYLIST`: Native mode diversity cap inside an instant playlist.
 - `PLAYLIST_ENERGY_ARC`: enable the energy arc when ordering.
 - `AI_BRAINSTORM_SOUND_DESCRIPTIONS_MAX`, `AI_BRAINSTORM_SEED_ARTISTS_MAX`,
   `AI_BRAINSTORM_USE_ARTIST_SEEDS`, `AI_BRAINSTORM_SIMILAR_ARTISTS_PER_SEED`,

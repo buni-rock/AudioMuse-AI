@@ -23,9 +23,11 @@ Main Features:
 """
 
 import datetime
+import difflib
 import json
 import logging
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -76,7 +78,7 @@ SCORED_FILTER_KEYS = ('genres', 'voices', 'moods', 'other_features')
 _ENERGY_BUCKET_RANGE = {'low': (0.0, 0.33), 'medium': (0.33, 0.66), 'high': (0.66, 1.0)}
 _TEMPO_BUCKET_RANGE = {'slow': (None, 90), 'medium': (90, 140), 'fast': (140, None)}
 
-COMPOSITION_POOL_TARGET = 10000
+COMPOSITION_POOL_TARGET = config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES
 
 
 FILTER_LIST_KEYS = (
@@ -153,6 +155,10 @@ class ToolPlan:
     primaries: List[Dict] = field(default_factory=list)
     filter: Optional[Dict] = None
     notes: List[str] = field(default_factory=list)
+    intent: Optional[Dict] = None
+    mandatory_tracks: List[Dict] = field(default_factory=list)
+    requested_final_count: Optional[int] = None
+    effective_final_target: Optional[int] = None
 
 
 _DECADE_NUM = r"((?:19|20)?(?:[3-9]0|00|10|20))"
@@ -248,7 +254,7 @@ _LONG_TRACKS_RE = re.compile(
 _TOTAL_LENGTH_RE = re.compile(
     r"\b(\d{1,3}(?:[.,]\d+)?|an?|one|two|three|four|five|half\s+an?)[\s-]*"
     r"(hours?|hrs?|minutes?|mins?)(?:\s+(?:of|long|worth)\b|"
-    r"(?:[\s-]+[a-z]+)?\s+(?:playlist|mix|set|session)\b)",
+    r"(?:[\s-]+[a-z]+)?\s+(?:playlist|mix|set|session)\b|(?=\s*[.!?,;]|$))",
     re.IGNORECASE,
 )
 _MAX_PER_ARTIST_RE = re.compile(
@@ -699,6 +705,7 @@ def _sound_words(text: str) -> List[str]:
 
 
 def extract_hints(text: str, library_year_max: Optional[int] = None) -> Dict:
+    """Deprecated legacy NLP helper; production request semantics use planner.intent."""
     if not text or not isinstance(text, str):
         return {}
 
@@ -1169,16 +1176,218 @@ def _shape_result(result: Dict, hints: Dict, log_messages: List[str], plan: 'Too
         result['songs'] = _demote_holidays(result['songs'], log_messages)
     result['max_per_artist'] = hints.get('max_per_artist')
     result['keep_order'] = _journey_call(plan) is not None
+    if plan.intent is not None:
+        result['intent'] = plan.intent
+        result['canonical_retrieval_anchors'] = plan.intent.get('canonical_retrieval_anchors') or []
+        result['mandatory_tracks'] = list(plan.mandatory_tracks)
+        result['excluded_tracks'] = list(plan.intent.get('excluded_tracks') or [])
+        result['requested_final_count'] = plan.requested_final_count
+        result['effective_final_target'] = plan.effective_final_target
+        result['target_duration_seconds'] = plan.intent.get('duration_seconds')
     return result
 
 
-def requested_playlist_shape(text: str) -> Dict:
-    hints: Dict = {}
-    notes: List[str] = []
-    if text and isinstance(text, str):
-        _duration_hints(text, hints, notes)
-        _playlist_shape_hints(text, hints, notes)
-    return {k: hints[k] for k in ('song_count', 'total_seconds', 'max_per_artist') if hints.get(k)}
+_NAMED_SEED_CUES = (
+    re.compile(r"\bstarting\s+from\s+", re.IGNORECASE),
+    re.compile(r"\bstart(?:ing)?\s+with\s+", re.IGNORECASE),
+    re.compile(r"\bsimilar(?:\s+songs?)?\s+to\s+", re.IGNORECASE),
+    re.compile(r"\bsongs?\s+like\s+", re.IGNORECASE),
+    re.compile(r"\btracks?\s+like\s+", re.IGNORECASE),
+    re.compile(r"\bbased\s+on\s+", re.IGNORECASE),
+)
+_SEED_HARD_BOUNDARY_RE = re.compile(r"[,!?;\n]|\.(?=\s|$)|\s+(?:songs?|tracks?|and|with|that|which|but)\b", re.IGNORECASE)
+_SEED_CONTEXT_BOUNDARY_RE = re.compile(r"\s+(?:the\s+)?playlist\b", re.IGNORECASE)
+_SEED_FOR_BOUNDARY_RE = re.compile(r"\s+for\s+(?:(?:me|the|my|a|this)\b)", re.IGNORECASE)
+_SEED_BY_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
+_SEED_QUOTED_RE = re.compile(r"[\"'`]([^\"'`]{2,200})[\"'`]")
+_SEED_AS_BOUNDARY_RE = re.compile(r"\s+as\s+(?:a\s+)?seed\b", re.IGNORECASE)
+
+
+def _trim_seed_text(value: str, *, artist: bool = False) -> str:
+    value = value.strip().strip(" \t\r\n\"'`.,:;!?()[]{}")
+    boundaries = [
+        _SEED_HARD_BOUNDARY_RE,
+        _SEED_CONTEXT_BOUNDARY_RE,
+        _SEED_FOR_BOUNDARY_RE,
+        _SEED_AS_BOUNDARY_RE,
+    ]
+    matches = [m for pattern in boundaries if (m := pattern.search(value))]
+    if artist and (m := _SEED_BY_RE.search(value)):
+        matches.append(m)
+    if matches:
+        value = value[:min(m.start() for m in matches)]
+    return value.strip().strip(" \t\r\n\"'`.,:;!?()[]{}")
+
+
+def extract_named_song_seed_details(text: str) -> Optional[Dict[str, str]]:
+    """Extract a named song from explicit wording, avoiding generic "like" matches."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    possessive_seed = re.search(
+        r"\b(?:use|uses|using)\s+(.+?)['’]s\s+(?:(?:song|track)\s+)?(.+?)\s+as\s+(?:(?:a|the)\s+)?seed\b",
+        text,
+        re.IGNORECASE,
+    )
+    if possessive_seed:
+        artist = _trim_seed_text(possessive_seed.group(1), artist=True)
+        title = _trim_seed_text(possessive_seed.group(2))
+        if artist and title:
+            return {"title": title, "artist": artist}
+
+    # Prefer an explicitly named seed over later generic wording such as
+    # "similar to the seed" in the same request.
+    used_song = re.search(
+        r"\b(?:use|uses|using)\s+.*?\bsong\s+(.+?)\s+as\s+(?:a\s+)?seed\b",
+        text,
+        re.IGNORECASE,
+    )
+    if used_song:
+        title = _trim_seed_text(used_song.group(1))
+        if title:
+            return {"title": title}
+
+    capture = None
+    for cue in _NAMED_SEED_CUES:
+        match = cue.search(text)
+        if match:
+            capture = text[match.end():].strip()
+            break
+
+    if capture is None:
+        # Quoted titles are a safe final explicit form; don't infer from prose like
+        # "I would like you to build...".
+        quoted = _SEED_QUOTED_RE.search(text)
+        if not quoted:
+            return None
+        capture = quoted.group(1).strip()
+        title = _trim_seed_text(capture)
+        return {"title": title} if title else None
+
+    # A quoted title immediately after a cue takes precedence over delimiters in
+    # the title itself. Parse a trailing "by Artist" when it follows the quote.
+    quoted = _SEED_QUOTED_RE.match(capture)
+    if quoted:
+        title = quoted.group(1).strip()
+        remainder = capture[quoted.end():]
+        leading_by = re.match(r"\s+by\s+", remainder, re.IGNORECASE)
+        if leading_by:
+            remainder = remainder[leading_by.end():]
+    else:
+        by_match = _SEED_BY_RE.search(capture)
+        title_source = capture[:by_match.start()] if by_match else capture
+        title = _trim_seed_text(title_source)
+        remainder = capture[by_match.end():] if by_match else ""
+
+    if not title:
+        return None
+    details = {"title": title}
+    if remainder:
+        artist = _trim_seed_text(remainder, artist=True)
+        if artist:
+            details["artist"] = artist
+    return details
+
+
+def extract_explicit_song_mentions(text: str) -> List[Dict[str, str]]:
+    """Extract explicit human-readable song/artist references, not playlist semantics."""
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    mentions: List[Dict[str, str]] = []
+
+    def add(title: str, artist: str = "", start: int = -1):
+        # This is entity-fidelity extraction, not seed-intent parsing. In
+        # particular, conjunctions such as "and" are valid title text.
+        edge_punctuation = " \t\r\n\"'`.,:;!?()[]{}"
+        title = str(title or "").strip().strip(edge_punctuation)
+        artist = str(artist or "").strip().strip(edge_punctuation) if artist else ""
+        if not title or len(title) > 200:
+            return
+        key = (re.sub(r"\W+", "", title.casefold()), re.sub(r"\W+", "", artist.casefold()))
+        if not key[0] or any(m["_key"] == key for m in mentions):
+            return
+        mentions.append({"title": title, "artist": artist, "_key": key, "_start": start})
+
+    # Preserve verbatim entity pairs in common bulleted/song-list forms. This
+    # only identifies literal references; LLM2 still decides inclusion and all
+    # final playlist meaning.
+    for match in re.finditer(
+        r"(?:^|\n)\s*[-*•]\s*([^\n,!?;]+?)\s+(?:from|by)\s+([^\n,!?;]+)",
+        text,
+        re.IGNORECASE,
+    ):
+        add(match.group(1), match.group(2), match.start(1))
+
+    seed = extract_named_song_seed_details(text)
+    if seed:
+        add(seed.get("title", ""), seed.get("artist", ""), text.casefold().find(seed.get("title", "").casefold()))
+
+    patterns = (
+        re.compile(r"\b(?:i\s+)?(?:really\s+)?love\s+([^,.!?;\n]+?)\s+(?:from|by)\s+([^,.!?;\n]+)", re.I),
+        re.compile(r"\b(?:i\s+)?(?:really\s+)?love\s+([^,.!?;\n]+)", re.I),
+        re.compile(r"\b(?:songs?|tracks?)\s+(?:similar|like)\s+to\s+([^,.!?;\n]+?)\s+by\s+([^,.!?;\n]+)", re.I),
+        re.compile(r"\b(?:around|using|use|start(?:ing)?\s+from)\s+([^,.!?;\n]+?)\s+by\s+([^,.!?;\n]+)", re.I),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            if len(match.groups()) == 1 and re.search(r"\s+(?:from|by)\s+", match.group(1), re.I):
+                continue
+            add(match.group(1), match.group(2) if len(match.groups()) > 1 else "", match.start(1))
+
+    # Song lists commonly put an artist on every item. Split only on list
+    # separators so each title/artist pair remains independently resolvable.
+    for segment in re.split(r",\s*|\s+and\s+", text, flags=re.I):
+        segment = re.sub(r"^and\s+", "", segment.strip(), flags=re.I).rstrip(" .!?;")
+        match = re.search(r"\b(.+?)\s+by\s+([^,.!?;\n]+)$", segment, re.I)
+        if match:
+            title = match.group(1)
+            title = re.sub(r"^.*\b(?:around|use|using|include|mix|combine)\s+", "", title, flags=re.I)
+            add(title, match.group(2), text.find(match.group(1)))
+
+    use_list = re.search(r"\b(?:use|mix|combine|include)\s+(.+?)\s+as\s+(?:the\s+)?seeds?\b", text, re.I)
+    if use_list:
+        for part in re.split(r",\s*|\s+and\s+", use_list.group(1), flags=re.I):
+            possessive = re.match(r"(.+?)['’]s\s+(?:(?:song|track)\s+)?(.+)$", part.strip(), re.I)
+            if possessive:
+                add(possessive.group(2), possessive.group(1), use_list.start(1))
+            elif part.strip():
+                add(part, "", use_list.start(1) + use_list.group(1).find(part))
+
+    reference_only = re.search(
+        r"\b(?:use|using|take)\s+(.+?)\s+only\s+as\s+(?:a\s+)?reference\b", text, re.I
+    )
+    if reference_only:
+        add(reference_only.group(1), "", reference_only.start(1))
+
+    # Quoted title references are unambiguous; an optional trailing artist is
+    # captured when provided.
+    for match in re.finditer(r"[\"'`]([^\"'`]{2,200})[\"'`](?:\s+by\s+([^,.!?;\n]+))?", text, re.I):
+        add(match.group(1), match.group(2) or "", match.start(1))
+
+    # Requests such as “Mix Harvest and Mother Earth” explicitly name each
+    # title even without artist attribution.
+    mix = re.search(r"\b(?:mix|combine|include)\s+(.+?)(?:[.!?;\n]|$)", text, re.I)
+    if mix:
+        clause = mix.group(1)
+        for part in re.split(r"\s*,\s*|\s+and\s+", clause, flags=re.I):
+            part = re.sub(r"\s+(?:by|from)\s+.+$", "", part, flags=re.I).strip()
+            if part and len(part.split()) <= 8:
+                add(part, "", mix.start(1) + clause.find(part))
+
+    # A reference-only instruction and explicit omission both override the
+    # default anchor rule. Keep the reference available to the planner.
+    for mention in mentions:
+        title = mention["title"]
+        escaped = re.escape(title)
+        mention["excluded"] = bool(re.search(
+            rf"\b(?:do\s+not|don['’]?t|never)\s+(?:include|add|play)\s+(?:the\s+song\s+)?{escaped}\b"
+            rf"|\b{escaped}\b[^.!?\n]{{0,40}}\bonly\s+as\s+(?:a\s+)?reference\b",
+            text, re.I,
+        ))
+        mention.pop("_key", None)
+        mention.pop("_start", None)
+    return mentions
 
 
 def _synthesize_rescue_plan(
@@ -1186,15 +1395,10 @@ def _synthesize_rescue_plan(
     hints: Dict,
     log_messages: List[str],
 ) -> 'ToolPlan':
-    from tasks.ai.tools import _YEAR_ONLY_RE
-
     plan = ToolPlan()
-    _apply_hint_backstop(plan, hints, log_messages)
 
     query = (raw_request or '').strip()
-    year_only = bool(query) and bool(_YEAR_ONLY_RE.match(query))
-
-    if query and not year_only:
+    if query:
         if config.CLAP_ENABLED:
             plan.primaries.append(
                 {'name': 'text_match', 'arguments': {'query': query, 'mode': 'audio'}}
@@ -1634,6 +1838,7 @@ def _seed_label(seed: Dict) -> str:
 
 
 def _is_journey_request(seeds: List[Dict], text: str) -> bool:
+    """Deprecated phrase heuristic; planner anchor roles now define journeys."""
     if len(seeds) != 2 or not text:
         return False
     if _JOURNEY_WORD_RE.search(text):
@@ -1673,6 +1878,73 @@ def _prepare_journey(plan: 'ToolPlan', target_song_count: Optional[int], log_mes
     plan.filter = None
 
 
+def _normalize_seed_object(seed, log_messages: List[str], *, source: str = "seed") -> Optional[Dict]:
+    """Normalize common LLM seed aliases into the seed_search internal shape."""
+    logger.debug("Raw %s object: %r", source, seed)
+    if not isinstance(seed, dict):
+        reason = "seed must be an object"
+        logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+        log_messages.append(f"   seed normalization failed: {reason}")
+        return None
+
+    raw_kind = seed.get("type") or seed.get("kind") or seed.get("seed_type") or seed.get("seed_kind")
+    kind = str(raw_kind or "").strip().lower()
+    if kind in {"track", "song_seed"}:
+        kind = "song"
+    elif kind in {"performer", "musician", "artist_seed"}:
+        kind = "artist"
+    if not kind:
+        if any(seed.get(key) for key in ("title", "song_title", "song")):
+            kind = "song"
+        elif any(seed.get(key) for key in ("artist_name", "name", "artist")):
+            kind = "artist"
+
+    if kind == "song":
+        title = next((seed.get(key) for key in ("title", "song_title", "song", "name")
+                      if isinstance(seed.get(key), str) and seed.get(key).strip()), "").strip()
+        artist = next((seed.get(key) for key in ("artist", "song_artist", "artist_name")
+                       if isinstance(seed.get(key), str) and seed.get(key).strip()), "").strip()
+        if not title:
+            reason = "song seed has no title (accepted aliases: title, song_title, song, name)"
+            logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+            log_messages.append(f"   seed normalization failed: {reason}")
+            return None
+        if not artist:
+            try:
+                from tasks.ai.tool_impl import resolve_song_by_title
+                resolved = resolve_song_by_title(title)
+            except Exception:
+                logger.exception("Seed title resolution failed during normalization: %s", title)
+                resolved = None
+            if resolved:
+                title = str(resolved.get("title") or title).strip()
+                artist = str(resolved.get("author") or resolved.get("artist") or "").strip()
+        if not artist:
+            reason = f"song title could not be resolved to a library artist: {title}"
+            logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+            log_messages.append(f"   seed normalization failed: {reason}")
+            return None
+        normalized = {"type": "song", "title": title, "artist": artist}
+    elif kind == "artist":
+        name = next((seed.get(key) for key in ("name", "artist", "artist_name", "id")
+                     if isinstance(seed.get(key), str) and seed.get(key).strip()), "").strip()
+        if not name:
+            reason = "artist seed has no name (accepted aliases: name, artist, artist_name, id)"
+            logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+            log_messages.append(f"   seed normalization failed: {reason}")
+            return None
+        normalized = {"type": "artist", "name": name}
+    else:
+        reason = f"unknown seed type {kind!r}"
+        logger.debug("Seed normalization failed: %s; raw=%r", reason, seed)
+        log_messages.append(f"   seed normalization failed: {reason}")
+        return None
+
+    logger.debug("Normalized %s object: %r", source, normalized)
+    log_messages.append(f"   seed normalized: {normalized}")
+    return normalized
+
+
 def validate_plan_args(
     tool_calls: List[Dict],
     *,
@@ -1694,37 +1966,15 @@ def validate_plan_args(
             seeds_raw = args.get('seeds') or []
             cleaned_seeds: List[Dict] = []
             for s in seeds_raw:
-                if not isinstance(s, dict):
-                    continue
-                stype = (s.get('type') or '').lower()
-                if stype == 'song':
-                    title = (s.get('title') or s.get('song_title') or '').strip()
-                    artist = (s.get('artist') or s.get('song_artist') or '').strip()
-                    if not title or not artist:
-                        log_messages.append(f"   skip malformed song seed {s}")
-                        continue
-                    cleaned_seeds.append({'type': 'song', 'title': title, 'artist': artist})
-                elif stype == 'artist':
-                    nm = (s.get('name') or s.get('artist') or s.get('id') or '').strip()
-                    if not nm:
-                        log_messages.append(f"   skip malformed artist seed {s}")
-                        continue
-                    cleaned_seeds.append({'type': 'artist', 'name': nm})
-                else:
-                    log_messages.append(f"   skip unknown seed type '{stype}'")
+                normalized = _normalize_seed_object(s, log_messages)
+                if normalized:
+                    cleaned_seeds.append(normalized)
             if not cleaned_seeds:
                 log_messages.append(f"   skip {name}: no usable seeds")
                 continue
             args['seeds'] = cleaned_seeds
 
             blend = (args.get('blend_mode') or 'union').lower()
-            journey_ok = blend != 'subtract' or not args.get('subtract')
-            if blend != 'journey' and journey_ok and _is_journey_request(cleaned_seeds, request_text):
-                log_messages.append(
-                    f"   coerce blend_mode '{blend}' -> 'journey' (the request goes from one seed to the other)"
-                )
-                blend = 'journey'
-                args.pop('subtract', None)
             if blend == 'journey' and len(cleaned_seeds) != 2:
                 log_messages.append("   coerce blend_mode 'journey' -> 'union' (a journey needs exactly 2 seeds)")
                 blend = 'union'
@@ -1735,18 +1985,9 @@ def validate_plan_args(
                 sub_raw = args.get('subtract') or []
                 cleaned_sub: List[Dict] = []
                 for s in sub_raw:
-                    if not isinstance(s, dict):
-                        continue
-                    stype = (s.get('type') or '').lower()
-                    if stype == 'artist':
-                        nm = (s.get('name') or s.get('artist') or s.get('id') or '').strip()
-                        if nm:
-                            cleaned_sub.append({'type': 'artist', 'name': nm})
-                    elif stype == 'song':
-                        title = (s.get('title') or '').strip()
-                        artist = (s.get('artist') or '').strip()
-                        if title and artist:
-                            cleaned_sub.append({'type': 'song', 'title': title, 'artist': artist})
+                    normalized = _normalize_seed_object(s, log_messages, source="subtract seed")
+                    if normalized:
+                        cleaned_sub.append(normalized)
                 seed_keys = {_seed_identity(s) for s in cleaned_seeds}
                 self_subtracted = [
                     s for s in cleaned_sub if _seed_identity(s) in seed_keys
@@ -1873,6 +2114,13 @@ def validate_and_normalize_plan(tool_calls: List[Dict]) -> ToolPlan:
 MAX_TOOL_CALLS = config.AI_MAX_TOOL_CALLS
 
 
+def _retrieval_budget(target_song_count):
+    """Use the requested retrieval size directly; each seed gets its own window."""
+    target = max(1, int(target_song_count or config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS))
+    maximum = max(1, int(getattr(config, "INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES", 300)))
+    return min(maximum, target)
+
+
 def dedupe_and_cap_calls(
     tool_calls: List[Dict],
     log_messages: Optional[List[str]] = None,
@@ -1995,16 +2243,414 @@ def call_ai_for_plan(
     ai_config: Dict,
     log_messages: List[str],
     library_context: Optional[Dict] = None,
+    retrieval_only: bool = False,
 ) -> Dict:
     from tasks.ai.api import call_with_tools as _call_with_tools
+    from .prompts import build_playlist_plan_tool
 
+    # The model returns one envelope containing semantic intent and the
+    # retrieval plan. This keeps interpretation and tool choice in the same
+    # planner response while conventional code validates and executes it.
+    plan_tool = build_playlist_plan_tool(tools, retrieval_only=retrieval_only)
     return _call_with_tools(
         user_message=user_message,
-        tools=tools,
+        tools=[plan_tool],
         ai_config=ai_config,
         log_messages=log_messages,
         library_context=library_context,
     )
+
+
+def _unpack_planner_response(raw: Dict, log_messages: List[str]):
+    """Return (intent, retrieval calls) from the planner's single envelope."""
+    calls = raw.get('tool_calls', []) or []
+    envelope = next((
+        call for call in calls
+        if isinstance(call, dict) and call.get('name') == 'submit_playlist_plan'
+    ), None)
+    if envelope is None:
+        # A backend plan without semantic intent cannot be safely reconciled
+        # with inclusion, exclusion, count, or anchor requirements.
+        raise ValueError('Planner response omitted structured semantic intent')
+    args = envelope.get('arguments') or {}
+    intent = args.get('intent')
+    nested_calls = args.get('tool_calls')
+    if not isinstance(intent, dict) or not isinstance(nested_calls, list):
+        raise ValueError('Planner envelope must contain intent and tool_calls')
+    if len(calls) != 1:
+        log_messages.append(f'Planner emitted {len(calls)} envelope calls; using the first valid plan')
+    return intent, nested_calls
+
+
+def _validate_semantic_intent(raw_intent: Dict, log_messages: List[str]) -> Dict:
+    """Normalize planner-owned semantics without interpreting natural language."""
+    if not isinstance(raw_intent, dict):
+        raise ValueError('Planner semantic intent must be an object')
+    anchors = raw_intent.get('anchors', [])
+    if not isinstance(anchors, list):
+        raise ValueError('Planner intent anchors must be a list')
+    clean = []
+    allowed_roles = {
+        'anchor', 'mandatory', 'include', 'reference_only', 'exclusion',
+        'preferred_artist', 'style_reference', 'start', 'destination',
+    }
+    for anchor in anchors[:100]:
+        if not isinstance(anchor, dict) or anchor.get('type') not in {'song', 'artist', 'album'}:
+            continue
+        item = dict(anchor)
+        for key in ('title', 'artist', 'name', 'album', 'role'):
+            if item.get(key) is not None:
+                item[key] = str(item[key]).strip()
+        if item['type'] == 'song' and not item.get('title'):
+            continue
+        if item['type'] in {'artist', 'album'} and not any(item.get(k) for k in ('name', 'artist', 'album')):
+            continue
+        if item.get('role') not in allowed_roles:
+            if item.get('role'):
+                log_messages.append(f"Unsupported planner anchor role normalized: {item['role']!r} -> 'anchor'")
+            item['role'] = 'anchor'
+        default_include = item['role'] in {'anchor', 'mandatory', 'include', 'start', 'destination'}
+        include_flag = item.get('include_in_final')
+        item['include_in_final'] = include_flag if isinstance(include_flag, bool) else default_include
+        if item['role'] in {'reference_only', 'exclusion'}:
+            item['include_in_final'] = False
+        clean.append(item)
+    count = raw_intent.get('count')
+    if not isinstance(count, dict) or count.get('mode') not in {'total', 'additional'} or type(count.get('value')) is not int or count['value'] < 1:
+        count = None
+    duration = raw_intent.get('duration_seconds')
+    if type(duration) is not int or duration <= 0:
+        duration = None
+    constraints = raw_intent.get('constraints')
+    if not isinstance(constraints, dict):
+        constraints = {}
+    else:
+        constraints = dict(constraints)
+    for key in ('genres', 'moods', 'voices', 'other_features', 'exclude_artists', 'exclude_genres', 'instruments'):
+        if key in constraints:
+            value = constraints[key]
+            constraints[key] = [str(item).strip() for item in value if str(item).strip()] if isinstance(value, list) else []
+    for key in ('year_min', 'year_max', 'tempo_min', 'tempo_max', 'min_rating', 'duration_min', 'duration_max', 'added_within_days', 'max_per_artist'):
+        if key in constraints and constraints[key] is not None:
+            if type(constraints[key]) is not int or constraints[key] <= 0:
+                constraints.pop(key)
+    for key in ('energy_min', 'energy_max'):
+        if key in constraints and constraints[key] is not None:
+            if type(constraints[key]) not in (int, float) or not 0 <= float(constraints[key]) <= 1:
+                constraints.pop(key)
+            else:
+                constraints[key] = float(constraints[key])
+    if 'allow_multiple_versions' in constraints and constraints['allow_multiple_versions'] is not None and not isinstance(constraints['allow_multiple_versions'], bool):
+        constraints.pop('allow_multiple_versions')
+    for key in ('artist', 'album', 'key', 'scale'):
+        if key in constraints and constraints[key] is not None:
+            constraints[key] = str(constraints[key]).strip() or None
+    hint = raw_intent.get('retrieval_size_hint')
+    try:
+        hint = int(hint) if hint is not None else None
+    except (TypeError, ValueError):
+        hint = None
+    return {
+        'anchors': clean, 'count': count, 'duration_seconds': duration,
+        'constraints': constraints,
+        'playlist_intent': str(raw_intent.get('playlist_intent') or 'similarity_mix'),
+        'activity': _optional_intent_text(raw_intent.get('activity')),
+        'lyrical_theme': _optional_intent_text(raw_intent.get('lyrical_theme')),
+        'transition_intent': _optional_intent_text(raw_intent.get('transition_intent')),
+        'ordering_intent': _optional_intent_text(raw_intent.get('ordering_intent')),
+        'diversity_intent': _optional_intent_text(raw_intent.get('diversity_intent')),
+        'similarity_intent': _optional_intent_text(raw_intent.get('similarity_intent')),
+        'retrieval_size_hint': hint if hint and hint > 0 else None,
+    }
+
+
+def _optional_intent_text(value):
+    return str(value).strip() if isinstance(value, str) and value.strip() else None
+
+
+def _preserve_explicit_song_references(intent: Dict, raw_request: str, log_messages: List[str]):
+    """Keep verbatim user-supplied song/artist pairs authoritative for resolution."""
+    mentions = extract_explicit_song_mentions(raw_request)
+    if not mentions:
+        return intent
+
+    def norm(value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    anchors = intent.setdefault('anchors', [])
+    matched = set()
+    preserved_anchors = []
+    for anchor in anchors:
+        if not isinstance(anchor, dict) or anchor.get('type') != 'song':
+            preserved_anchors.append(anchor)
+            continue
+        title = norm(anchor.get('title'))
+        title_core = norm(re.split(r"[\(\[\{]", str(anchor.get('title') or ""), maxsplit=1)[0])
+        artist = norm(anchor.get('artist'))
+        candidates = []
+        for index, mention in enumerate(mentions):
+            mention_title = norm(mention.get('title'))
+            mention_core = norm(re.split(r"[\(\[\{]", str(mention.get('title') or ""), maxsplit=1)[0])
+            if not title or not mention_title:
+                continue
+            ratio = difflib.SequenceMatcher(None, title, mention_title).ratio()
+            same_artist = bool(artist and artist == norm(mention.get('artist')))
+            prefix_mutation = (
+                same_artist and min(len(title), len(mention_title)) >= 4
+                and (title.startswith(mention_title) or mention_title.startswith(title))
+            )
+            if title == mention_title or title_core == mention_core or ratio >= 0.82 or prefix_mutation:
+                candidates.append((index, mention, ratio, same_artist))
+        if not candidates:
+            if mentions:
+                log_messages.append(
+                    f"Unverified planner song reference dropped; explicit user references are authoritative: "
+                    f"{anchor.get('title') or 'unknown'}"
+                )
+                continue
+            preserved_anchors.append(anchor)
+            continue
+        candidates.sort(key=lambda item: (not item[3], -item[2], item[0]))
+        index, mention, _ratio, _artist_match = candidates[0]
+        anchor['title'] = mention['title']
+        if mention.get('artist'):
+            anchor['artist'] = mention['artist']
+        anchor['user_reference_title'] = mention['title']
+        anchor['user_reference_artist'] = mention.get('artist') or ''
+        preserved_anchors.append(anchor)
+        matched.add(index)
+        log_messages.append(
+            f"Explicit song reference preserved for library resolution: "
+            f"{mention['title']} / {mention.get('artist') or 'artist unspecified'}"
+        )
+
+    intent['anchors'] = preserved_anchors
+    for index, mention in enumerate(mentions):
+        if index in matched:
+            continue
+        preserved_anchors.append({
+            'type': 'song', 'title': mention['title'], 'artist': mention.get('artist', ''),
+            'role': 'anchor', 'include_in_final': True,
+            'user_reference_title': mention['title'],
+            'user_reference_artist': mention.get('artist', ''),
+        })
+        log_messages.append(
+            f"Explicit song reference added to retrieval anchors: "
+            f"{mention['title']} / {mention.get('artist') or 'artist unspecified'}"
+        )
+    return intent
+
+
+def _validate_retrieval_artist_filters(tool_calls: List[Dict], intent: Dict, raw_request: str, log_messages: List[str]):
+    """Do not turn a song anchor's identifying artist into a global filter."""
+    from tasks.ai.tool_impl import _normalize_for_match
+
+    anchor_artists = set()
+    for anchor in intent.get('anchors', []):
+        if not isinstance(anchor, dict):
+            continue
+        for key in ('artist', 'name'):
+            value = anchor.get(key)
+            if value:
+                if anchor.get('type') == 'song' and key == 'artist':
+                    anchor_artists.add(_normalize_for_match(value))
+    for call in list(tool_calls):
+        if not isinstance(call, dict) or call.get('name') != FILTER_NAME:
+            continue
+        args = call.get('arguments') or {}
+        artist = args.get('artist')
+        if not artist:
+            continue
+        normalized = _normalize_for_match(artist)
+        if normalized in anchor_artists:
+            log_messages.append(
+                f"Planner retrieval artist filter removed: {artist!r} only identifies a song retrieval anchor"
+            )
+            args.pop('artist', None)
+        elif not _named_in_request(str(artist), raw_request):
+            log_messages.append(
+                f"Planner retrieval artist filter removed: {artist!r} is not named in the user request"
+            )
+            args.pop('artist', None)
+        if not _has_filter_content(args):
+            tool_calls.remove(call)
+
+
+def _resolve_intent_anchors(intent: Dict, tool_calls: List[Dict], log_messages: List[str]):
+    """Resolve LLM1 retrieval references and merge them into seed searches."""
+    from tasks.ai.tool_impl import resolve_song_by_title
+    resolved, seeds, mandatory, excluded = [], [], [], []
+    for anchor in intent.get('anchors', []):
+        if anchor.get('type') == 'artist':
+            name = str(anchor.get('name') or anchor.get('artist') or '').strip()
+            if not name:
+                continue
+            resolved.append({**anchor, 'resolved_artist': name})
+            if anchor.get('role') == 'exclusion':
+                constraints = intent.setdefault('constraints', {})
+                exclusions = constraints.setdefault('exclude_artists', [])
+                if name not in exclusions:
+                    exclusions.append(name)
+            else:
+                seeds.append({'type': 'artist', 'name': name})
+            continue
+        if anchor.get('type') != 'song':
+            continue
+        title, artist = anchor.get('title', '').strip(), anchor.get('artist', '').strip()
+        try:
+            row = resolve_song_by_title(title, artist or None)
+        except Exception:
+            logger.exception('Could not resolve planner song anchor')
+            row = None
+        if not row or not row.get('item_id'):
+            log_messages.append(f"Unresolved planner song anchor: {title}")
+            continue
+        track = {
+            'item_id': row['item_id'], 'title': row.get('title') or title,
+            'artist': row.get('author') or row.get('artist') or artist,
+            'album': row.get('album') or '',
+        }
+        resolved_anchor = {
+            **anchor,
+            'user_reference': {
+                'title': str(anchor.get('user_reference_title') or title).strip(),
+                'artist': str(anchor.get('user_reference_artist') or artist).strip(),
+            },
+            'resolved': {
+                'title': track['title'], 'artist': track['artist'],
+                'track_id': str(track['item_id']),
+            },
+            # Keep this alias for existing playlist-composition consumers.
+            'resolved_track': track,
+        }
+        resolved.append(resolved_anchor)
+        log_messages.append(
+            f"Resolved anchor A{sum(a.get('type') == 'song' for a in resolved):03d}: "
+            f"{track['title']} / {track['artist']} track_id={track['item_id']}"
+        )
+        if anchor.get('role') == 'exclusion':
+            excluded.append(track)
+            continue
+        seeds.append({'type': 'song', 'title': track['title'], 'artist': track['artist'],
+                      'track_id': str(track['item_id'])})
+        if anchor.get('include_in_final') and anchor.get('role') != 'reference_only':
+            mandatory.append(track)
+    excluded_ids = {str(track['item_id']) for track in excluded}
+    if excluded_ids & {str(track['item_id']) for track in mandatory}:
+        raise ValueError('Planner intent both includes and excludes the same resolved song')
+    calls = [c for c in tool_calls if isinstance(c, dict) and c.get('name') == 'seed_search']
+    if seeds:
+        if not calls:
+            calls = [{'name': 'seed_search', 'arguments': {'seeds': [], 'blend_mode': 'union'}}]
+            tool_calls.insert(0, calls[0])
+        call = calls[0]
+        args = call.setdefault('arguments', {})
+        args['seeds'] = seeds
+        song_seeds = [seed for seed in seeds if seed.get('type') == 'song']
+        journey = [a for a in resolved if a.get('type') == 'song' and a.get('role') in {'start', 'destination'}]
+        if len(song_seeds) == 2 and len(seeds) == 2 and {a.get('role') for a in journey} == {'start', 'destination'}:
+            args['seeds'] = [
+                {'type': 'song', 'title': anchor['resolved_track']['title'],
+                 'artist': anchor['resolved_track']['artist'],
+                 'track_id': str(anchor['resolved_track']['item_id'])}
+                for role in ('start', 'destination')
+                for anchor in journey if anchor.get('role') == role
+            ]
+            args['blend_mode'] = 'journey'
+            args.pop('subtract', None)
+        else:
+            args['blend_mode'] = 'union'
+        if len(calls) > 1:
+            tool_calls[:] = [c for c in tool_calls if c is call or not (isinstance(c, dict) and c.get('name') == 'seed_search')]
+            log_messages.append(f'Planner partial seed searches merged: {len(calls)} -> 1')
+    else:
+        for call in calls:
+            if (call.get('arguments') or {}).get('seeds'):
+                raise ValueError('Planner seed_search contains entities missing from planner.intent.anchors')
+    intent['resolved_anchors'] = resolved
+    intent['mandatory_tracks'] = mandatory
+    intent['excluded_tracks'] = excluded
+    song_anchor_count = sum(a.get('type') == 'song' for a in intent.get('anchors', []))
+    log_messages.append(f"Resolved retrieval anchors: {sum(a.get('type') == 'song' and bool(a.get('resolved_track')) for a in resolved)}/{song_anchor_count}")
+    intent['retrieval_anchors'] = resolved
+    intent['canonical_retrieval_anchors'] = resolved
+    if excluded:
+        log_messages.append(f"Resolved excluded songs: {len(excluded)}")
+    return mandatory
+
+
+def _assert_canonical_seed_search_args(arguments: Dict, intent: Dict) -> None:
+    """Reject any seed_search arguments that drift from resolved library identity."""
+    canonical = []
+    anchor_records = []
+    for anchor in intent.get('canonical_retrieval_anchors', []):
+        if not isinstance(anchor, dict) or anchor.get('type') != 'song':
+            continue
+        resolved = anchor.get('resolved') or {}
+        identity = (
+            str(resolved.get('title') or '').strip().casefold(),
+            str(resolved.get('artist') or '').strip().casefold(),
+            str(resolved.get('track_id') or ''),
+        )
+        canonical.append(identity)
+        anchor_records.append((anchor, identity))
+    actual = []
+    for seed in (arguments or {}).get('seeds') or []:
+        if isinstance(seed, dict) and seed.get('type') == 'song':
+            actual.append((
+                str(seed.get('title') or '').strip().casefold(),
+                str(seed.get('artist') or '').strip().casefold(),
+                str(seed.get('track_id') or ''),
+            ))
+    if sorted(actual) == sorted(canonical):
+        return
+    mismatch_anchor = next((anchor for anchor, identity in anchor_records if identity not in actual), {})
+    user_ref = mismatch_anchor.get('user_reference') or {}
+    resolved_identity = mismatch_anchor.get('resolved') or {}
+    user_reference = (
+        str(user_ref.get('title') or 'unknown'),
+        str(user_ref.get('artist') or 'unknown'),
+    )
+    resolved_title = str(resolved_identity.get('title') or 'unknown')
+    resolved_artist = str(resolved_identity.get('artist') or 'unknown')
+    extra_identities = [identity for identity in actual if identity not in canonical]
+    actual_identity = extra_identities[0] if extra_identities else ('unknown', 'unknown')
+    actual_identity_text = f"{actual_identity[0]} / {actual_identity[1]} / ID {actual_identity[2]}"
+    raise ValueError(
+        "Canonical anchor mismatch: "
+        f"user reference: {user_reference[0]} / {user_reference[1]}; "
+        f"resolved: {resolved_title} / {resolved_artist} / ID {resolved_identity.get('track_id')}; "
+        f"tool seed: {actual_identity_text}"
+    )
+
+
+def _validate_intent_tool_consistency(tool_calls: List[Dict], intent: Dict, log_messages: List[str]):
+    """Keep retrieval filters aligned with the planner's structured constraints."""
+    raw_constraints = intent.get('constraints') or {}
+    constraints = {key: raw_constraints[key] for key in FILTER_ALL_KEYS if key in raw_constraints and raw_constraints[key] not in (None, '', [], {})}
+    filters = [call for call in tool_calls if isinstance(call, dict) and call.get('name') == FILTER_NAME]
+    if not constraints:
+        for call in filters:
+            args = call.get('arguments') or {}
+            if _has_filter_content(args):
+                if args.get('artist'):
+                    log_messages.append(
+                        f"Planner artist filter ignored: {args['artist']!r} is already part of a song seed or was not an explicit user constraint in planner.intent.constraints."
+                    )
+                tool_calls.remove(call)
+        return
+    if filters:
+        for call in filters:
+            args = call.get('arguments') or {}
+            retrieval_size = args.get('get_songs')
+            args.clear()
+            args.update(constraints)
+            if retrieval_size is not None:
+                args['get_songs'] = retrieval_size
+            call['arguments'] = args
+    else:
+        at = next((i for i, call in enumerate(tool_calls) if isinstance(call, dict) and call.get('name') == 'seed_search'), -1)
+        tool_calls.insert(at + 1, {'name': FILTER_NAME, 'arguments': dict(constraints)})
 
 
 _GROUNDING_FILTER_KEYS = (
@@ -2075,10 +2721,11 @@ def _finish_plan(
     log_messages: List[str],
     *,
     library_context: Optional[Dict] = None,
-    collection_cap: int = 1000,
+    collection_cap: int = config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES,
     target_song_count: Optional[int] = None,
     raw_request: str = '',
     allow_rescue: bool = True,
+    retrieval_only: bool = False,
 ):
     for u in hints.get('unsupported', []):
         if u not in plan.notes:
@@ -2088,6 +2735,7 @@ def _finish_plan(
         isinstance(p, dict) and p.get('name') == 'knowledge_lookup' for p in plan.primaries
     )
 
+    retrieval_started = time.monotonic()
     exec_result = yield from _execute_plan(
         plan,
         ai_config,
@@ -2096,28 +2744,17 @@ def _finish_plan(
         collection_cap=collection_cap,
         target_song_count=target_song_count,
         has_knowledge=has_knowledge,
+        retrieval_only=retrieval_only,
     )
+    log_messages.append(f"Retrieval wall-clock: {time.monotonic() - retrieval_started:.1f}s")
 
-    if not exec_result['songs'] and allow_rescue:
-        rescue = _synthesize_rescue_plan(raw_request, hints, log_messages)
-        if rescue.primaries or rescue.filter is not None:
-            rescue.notes = list(plan.notes) + rescue.notes
-            return (
-                yield from _finish_plan(
-                    rescue, hints, ai_config, log_messages,
-                    library_context=library_context,
-                    collection_cap=collection_cap,
-                    target_song_count=target_song_count,
-                    raw_request=raw_request,
-                    allow_rescue=False,
-                )
-            )
 
     history = exec_result['tools_used_history']
     summary = exec_result['tool_execution_summary']
     return _shape_result({
         "songs": exec_result['songs'],
         "song_sources": exec_result['song_sources'],
+        "seed_provenance": exec_result.get('seed_provenance', {}),
         "tools_used_history": history,
         "tool_execution_summary": summary,
         "detected_min_rating": exec_result['detected_min_rating'],
@@ -2135,10 +2772,13 @@ def plan_and_execute_once(
     *,
     library_context: Optional[Dict] = None,
     user_wants_rating: bool = False,
-    collection_cap: int = 1000,
+    collection_cap: int = config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES,
     target_song_count: Optional[int] = None,
     replan_feedback: Optional[str] = None,
     raw_user_request: Optional[str] = None,
+    resolved_seed: Optional[Dict] = None,
+    max_final_count: Optional[int] = None,
+    retrieval_only: bool = False,
 ):
     log_messages.append("\n--- AI Decision ---")
 
@@ -2148,46 +2788,94 @@ def plan_and_execute_once(
         f"   tools offered: {', '.join(t.get('name', '') for t in tools)}"
     )
 
-    hints = extract_hints(
-        raw_request, (library_context or {}).get('year_max') if library_context else None
-    )
-    hints_block = format_hints_block(hints)
-    if hints_block:
-        for n in hints.get('notes', []):
-            log_messages.append(f"   pre-extract: {n}")
-        user_message = f"{user_message}\n\n{hints_block}"
+    # Request semantics come from the structured planner response. Do not
+    # pre-interpret songs, counts, inclusion/exclusion, or constraints here.
+    hints: Dict = {}
     if replan_feedback:
         user_message = f"{user_message}\n\n{replan_feedback}"
-
     yield
 
-    raw = call_ai_for_plan(user_message, tools, ai_config, log_messages, library_context)
+    planner_started = time.monotonic()
+    raw = call_ai_for_plan(
+        user_message, tools, ai_config, log_messages, library_context,
+        retrieval_only=retrieval_only,
+    )
     if 'error' in raw:
-        log_messages.append(
-            "   the AI planner did not answer; matching your words directly instead"
-        )
-        plan = _synthesize_rescue_plan(raw_request, hints, log_messages)
-        plan.notes.append(
-            "the AI planner was unreachable, so this playlist comes from a direct "
-            "match of your request instead of a tool plan"
-        )
-        return (
-            yield from _finish_plan(
-                plan, hints, ai_config, log_messages,
-                library_context=library_context,
-                collection_cap=collection_cap,
-                target_song_count=target_song_count,
-                raw_request=raw_request,
-                allow_rescue=False,
-            )
-        )
+        planner_wall_clock = time.monotonic() - planner_started
+        rejection_reason = str(raw.get('error') or 'provider returned no usable plan')
+        logger.warning("AI planner returned no usable plan: %s", rejection_reason)
+        log_messages.append(f"Planner wall-clock: {planner_wall_clock:.1f}s")
+        log_messages.append(f"   AI planner response rejected: {rejection_reason}")
+        return {"error": rejection_reason, "songs": []}
 
     reasoning = raw.get('reasoning')
     if isinstance(reasoning, str) and reasoning.strip():
         log_messages.append(f"AI reasoning: {reasoning.strip()}")
 
-    raw_calls = raw.get('tool_calls', []) or []
-    log_messages.append(f"AI emitted {len(raw_calls)} tool call(s)")
+    planner_wall_clock = None
+    retrieval_started = None
+    try:
+        semantic_intent, raw_calls = _unpack_planner_response(raw, log_messages)
+        semantic_intent = _validate_semantic_intent(semantic_intent, log_messages)
+        if retrieval_only:
+            semantic_intent = {
+                'anchors': semantic_intent['anchors'],
+            }
+            semantic_intent = _preserve_explicit_song_references(semantic_intent, raw_request, log_messages)
+        planner_wall_clock = time.monotonic() - planner_started
+        retrieval_hint = semantic_intent.get('retrieval_size_hint')
+        log_messages.append(f"LLM1 song retrieval anchors: {sum(a.get('type')=='song' for a in semantic_intent['anchors'])}")
+        retrieval_started = time.monotonic()
+        mandatory = _resolve_intent_anchors(semantic_intent, raw_calls, log_messages)
+        if retrieval_only:
+            _validate_retrieval_artist_filters(raw_calls, semantic_intent, raw_request, log_messages)
+        else:
+            _validate_intent_tool_consistency(raw_calls, semantic_intent, log_messages)
+        count_spec = None if retrieval_only else semantic_intent.get('count')
+        included_songs = 0 if retrieval_only else sum(
+            1 for anchor in semantic_intent.get('anchors', [])
+            if anchor.get('type') == 'song' and anchor.get('include_in_final')
+            and anchor.get('role') not in {'reference_only', 'exclusion'}
+        )
+        requested_final_count = (
+            count_spec['value'] + (included_songs if count_spec['mode'] == 'additional' else 0)
+        ) if count_spec else None
+        if retrieval_only:
+            seed_count = max(1, sum(
+                anchor.get('type') in {'song', 'artist', 'album'}
+                for anchor in semantic_intent.get('anchors', [])
+            ))
+            composer_window = int(config.INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES or collection_cap)
+            retrieval_size = max(1, min(collection_cap, composer_window) // seed_count)
+        else:
+            retrieval_target = max(
+                int(retrieval_hint or 0), int(requested_final_count or target_song_count or config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS)
+            )
+            retrieval_size = min(collection_cap, _retrieval_budget(retrieval_target))
+        semantic_intent['effective_retrieval_budget'] = retrieval_size
+        log_messages.append(f"Effective per-seed retrieval budget: {retrieval_size}")
+        for call in raw_calls:
+            if isinstance(call,dict) and call.get('name') in {'seed_search','text_match','knowledge_lookup',FILTER_NAME}:
+                args=call.setdefault('arguments',{}); args['get_songs']=retrieval_size
+                if call.get('name')=='seed_search': args['blend_mode']='union'
+        if count_spec:
+            log_messages.append(f"Requested count mode: {count_spec['mode']}")
+        if requested_final_count is not None:
+            log_messages.append(f"Requested final total: {requested_final_count}")
+        if requested_final_count is not None and max_final_count is not None:
+            requested_final_count = min(requested_final_count, max_final_count)
+        if requested_final_count is not None:
+            target_song_count = requested_final_count
+        plan_notes=ToolPlan(intent=semantic_intent, mandatory_tracks=mandatory, requested_final_count=requested_final_count, effective_final_target=requested_final_count)
+    except (TypeError,ValueError) as exc:
+        log_messages.append(f"Planner retrieval response rejected: {exc}")
+        semantic_intent,raw_calls,plan_notes=None,[],None
+
+    if planner_wall_clock is None:
+        planner_wall_clock = time.monotonic() - planner_started
+    log_messages.append(f"Planner wall-clock: {planner_wall_clock:.1f}s")
+
+    log_messages.append(f"Planner tool calls produced: {len(raw_calls)}")
 
     yield
 
@@ -2199,8 +2887,60 @@ def plan_and_execute_once(
         log_messages=log_messages,
         request_text=raw_request,
     )
-
-    plan = validate_and_normalize_plan(raw_calls)
+    validated_plan = validate_and_normalize_plan(raw_calls)
+    if plan_notes is not None:
+        plan = validated_plan
+        plan.intent = semantic_intent
+        plan.mandatory_tracks = plan_notes.mandatory_tracks
+        plan.requested_final_count = plan_notes.requested_final_count
+        plan.effective_final_target = plan_notes.effective_final_target
+    else:
+        plan = validated_plan
+    if retrieval_only and plan.intent is not None:
+        # The resolved collection is the sole authority for downstream seed
+        # arguments. Rebuild after all LLM tool-call normalization so an
+        # original mutated seed can never reach AudioMuse.
+        canonical_seeds = []
+        for anchor in plan.intent.get('canonical_retrieval_anchors', []):
+            if not isinstance(anchor, dict):
+                continue
+            track = anchor.get('resolved_track') or {}
+            if anchor.get('type') == 'song' and track.get('item_id') is not None:
+                canonical_seeds.append({
+                    'type': 'song',
+                    'title': str(track.get('title') or anchor.get('title') or '').strip(),
+                    'artist': str(track.get('artist') or track.get('author') or anchor.get('artist') or '').strip(),
+                    'track_id': str(track['item_id']),
+                })
+            elif anchor.get('type') == 'artist':
+                name = str(anchor.get('resolved_artist') or anchor.get('name') or anchor.get('artist') or '').strip()
+                if name:
+                    canonical_seeds.append({'type': 'artist', 'name': name})
+        canonical_seeds = _dedupe_seed_list(canonical_seeds)[0]
+        if canonical_seeds:
+            seed_call = next((call for call in plan.primaries if call.get('name') == 'seed_search'), None)
+            if seed_call is None:
+                seed_call = {'name': 'seed_search', 'arguments': {}}
+                plan.primaries.insert(0, seed_call)
+            seed_call['arguments'] = {
+                'seeds': canonical_seeds,
+                'blend_mode': 'union',
+                'get_songs': int(plan.intent.get('effective_retrieval_budget') or _retrieval_budget(target_song_count)),
+            }
+            plan.primaries = [
+                call for call in plan.primaries
+                if call is seed_call or call.get('name') != 'seed_search'
+            ]
+            log_messages.append(f"Canonical AudioMuse retrieval seed arguments rebuilt: {len(canonical_seeds)}")
+    accepted_operations = len(plan.primaries) + (1 if plan.filter is not None else 0)
+    log_messages.append(f"Planner tool calls accepted: {accepted_operations}")
+    selected_tools = [p.get('name') for p in plan.primaries]
+    if plan.filter is not None:
+        selected_tools.append(FILTER_NAME)
+    log_messages.append(f"Selected retrieval tools: {', '.join(selected_tools) or 'none'}")
+    if plan.intent is not None:
+        song_count=sum(a.get('type')=='song' for a in plan.intent.get('anchors',[]))
+        log_messages.append(f"Planner retrieval summary: {song_count} song anchors; size hint={plan.intent.get('effective_retrieval_budget') or target_song_count}")
     for note in plan.notes:
         log_messages.append(f"   plan: {note}")
 
@@ -2208,23 +2948,17 @@ def plan_and_execute_once(
         if replan_feedback is None:
             log_messages.append("\nEMPTY PLAN -> replanning once with feedback")
             replan = yield from plan_and_execute_once(
-                original_user_message,
-                tools,
-                ai_config,
-                log_messages,
-                library_context=library_context,
-                user_wants_rating=user_wants_rating,
-                collection_cap=collection_cap,
-                target_song_count=target_song_count,
-                replan_feedback=_EMPTY_PLAN_FEEDBACK,
-                raw_user_request=raw_request,
+                original_user_message, tools, ai_config, log_messages,
+                library_context=library_context, user_wants_rating=user_wants_rating,
+                collection_cap=collection_cap, target_song_count=target_song_count,
+                max_final_count=max_final_count, replan_feedback=_EMPTY_PLAN_FEEDBACK,
+                raw_user_request=raw_request, resolved_seed=resolved_seed,
+                retrieval_only=retrieval_only,
             )
             if isinstance(replan, dict) and replan.get('songs'):
                 return replan
-            log_messages.append(
-                "   replan produced no usable plan either; matching your words directly"
-            )
-        plan = _synthesize_rescue_plan(raw_request, hints, log_messages)
+        return {"error": "The planner did not produce any retrieval operations.", "songs": []}
+    if plan.intent is None:
         return (
             yield from _finish_plan(
                 plan, hints, ai_config, log_messages,
@@ -2233,6 +2967,7 @@ def plan_and_execute_once(
                 target_song_count=target_song_count,
                 raw_request=raw_request,
                 allow_rescue=False,
+                retrieval_only=retrieval_only,
             )
         )
 
@@ -2265,15 +3000,17 @@ def plan_and_execute_once(
         isinstance(p, dict) and p.get('name') == 'knowledge_lookup' for p in plan.primaries
     )
 
-    _strip_unrequested_filter_args(plan, hints, raw_request, log_messages)
-    _strip_contradictory_exclusions(plan, hints, raw_request, log_messages)
+    if plan.intent is None:
+        _strip_unrequested_filter_args(plan, hints, raw_request, log_messages)
+        _strip_contradictory_exclusions(plan, hints, raw_request, log_messages)
     _strip_unrated_filter(plan, library_context, log_messages)
-    _apply_hint_backstop(plan, hints, log_messages)
-    _apply_seed_relative(plan, raw_request, hints, log_messages)
-    _backstop_album(plan, raw_request, log_messages)
-    _add_sound_primary(plan, hints, {t.get('name') for t in tools}, log_messages)
-    _apply_instruments(plan, hints, {t.get('name') for t in tools}, log_messages)
-    _prepare_journey(plan, target_song_count, log_messages)
+    if plan.intent is None:
+        _apply_hint_backstop(plan, hints, log_messages)
+        _apply_seed_relative(plan, raw_request, hints, log_messages)
+        _backstop_album(plan, raw_request, log_messages)
+        _add_sound_primary(plan, hints, {t.get('name') for t in tools}, log_messages)
+        _apply_instruments(plan, hints, {t.get('name') for t in tools}, log_messages)
+        _prepare_journey(plan, target_song_count, log_messages)
 
     for u in hints.get('unsupported', []):
         plan.notes.append(u)
@@ -2281,6 +3018,8 @@ def plan_and_execute_once(
     if plan.filter is not None and has_knowledge:
         _ground_knowledge_lookup(plan, log_messages)
 
+    if retrieval_started is None:
+        retrieval_started = time.monotonic()
     exec_result = yield from _execute_plan(
         plan,
         ai_config,
@@ -2289,6 +3028,11 @@ def plan_and_execute_once(
         collection_cap=collection_cap,
         target_song_count=target_song_count,
         has_knowledge=has_knowledge,
+        retrieval_only=retrieval_only,
+    )
+    log_messages.append(f"Retrieval wall-clock: {time.monotonic() - retrieval_started:.1f}s")
+    log_messages.append(
+        f"Planner tool calls executed: {len(exec_result['tools_used_history'])}"
     )
     all_songs = exec_result['songs']
     tools_used_history = exec_result['tools_used_history']
@@ -2321,29 +3065,18 @@ def plan_and_execute_once(
             target_song_count=target_song_count,
             replan_feedback=feedback,
             raw_user_request=raw_request,
+            resolved_seed=resolved_seed,
+            retrieval_only=retrieval_only,
         )
         if isinstance(replan, dict) and replan.get('songs'):
             return replan
         log_messages.append("   replan attempt failed; matching your words directly")
 
-    if not all_songs:
-        rescue = _synthesize_rescue_plan(raw_request, hints, log_messages)
-        if rescue.primaries or rescue.filter is not None:
-            rescue.notes = list(plan.notes) + rescue.notes
-            return (
-                yield from _finish_plan(
-                    rescue, hints, ai_config, log_messages,
-                    library_context=library_context,
-                    collection_cap=collection_cap,
-                    target_song_count=target_song_count,
-                    raw_request=raw_request,
-                    allow_rescue=False,
-                )
-            )
 
     return _shape_result({
         "songs": all_songs,
         "song_sources": exec_result['song_sources'],
+        "seed_provenance": exec_result.get('seed_provenance', {}),
         "tools_used_history": tools_used_history,
         "tool_execution_summary": tool_execution_summary,
         "detected_min_rating": exec_result['detected_min_rating'],
@@ -2351,9 +3084,6 @@ def plan_and_execute_once(
         "executed_query_str": f"MCP single-pass ({len(tools_used_history)} tools): {' -> '.join(tool_execution_summary)}",
         "filter_applied": plan.filter is not None,
     }, hints, log_messages, plan)
-
-
-BACKFILL_POOL_FACTOR = 4
 
 
 def _backfill_genre_matches(
@@ -2373,7 +3103,7 @@ def _backfill_genre_matches(
     if full >= target_song_count:
         return pool_songs
     args = {k: v for k, v in filt.items() if k in FILTER_ALL_KEYS}
-    args['get_songs'] = max(200, target_song_count * BACKFILL_POOL_FACTOR)
+    args['get_songs'] = _retrieval_budget(target_song_count)
     res = execute_mcp_tool('search_database', args, ai_config)
     pooled = {s.get('item_id') for s in pool_songs}
     extra = [s for s in res.get('songs') or [] if s.get('item_id') and s['item_id'] not in pooled]
@@ -2507,9 +3237,10 @@ def _execute_plan(
     log_messages: List[str],
     *,
     library_context: Optional[Dict] = None,
-    collection_cap: int = 1000,
+    collection_cap: int = config.INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES,
     target_song_count: Optional[int] = None,
     has_knowledge: bool = False,
+    retrieval_only: bool = False,
 ):
     from tasks.ai.tools import execute_mcp_tool
     from tasks.ai.tool_impl import _fetch_pool_features
@@ -2528,6 +3259,7 @@ def _execute_plan(
     ids_seen: set = set()
     keys_seen: set = set()
     song_sources: Dict[str, int] = {}
+    seed_provenance: Dict[str, List[str]] = {}
     tools_used_history: List[Dict] = []
     tool_execution_summary: List[str] = []
     tool_call_counter = 0
@@ -2603,13 +3335,21 @@ def _execute_plan(
         return f"{name}({body}, +{n_added})" if body else f"{name}(+{n_added})"
 
     if plan.primaries and plan.filter:
-        pool_target = COMPOSITION_POOL_TARGET
+        requested_primary_budget = max(
+            (int((call.get('arguments') or {}).get('get_songs') or _retrieval_budget(target_song_count))
+             for call in plan.primaries),
+            default=_retrieval_budget(target_song_count),
+        )
+        pool_target = min(
+            collection_cap,
+            requested_primary_budget if retrieval_only else COMPOSITION_POOL_TARGET,
+        )
         db_total = library_context.get('total_songs', 0) if library_context else 0
         if db_total and db_total < pool_target:
             pool_target = db_total
         log_messages.append(
             f"\n--- Composition: {len(plan.primaries)} primary call(s) + 1 filter "
-            f"(re-rank pool target {pool_target}) ---"
+            f"({'retrieval budget' if retrieval_only else 're-rank pool target'} {pool_target}) ---"
         )
         pool_songs: List[Dict] = []
         pool_ids: set = set()
@@ -2618,21 +3358,49 @@ def _execute_plan(
         for tc in plan.primaries:
             tn = tc.get('name')
             ta = dict(tc.get('arguments', {}) or {})
-            ta['get_songs'] = pool_target
+            ta['get_songs'] = min(
+                pool_target,
+                int(ta.get('get_songs') or pool_target) if retrieval_only else pool_target,
+            )
             if tn == 'text_match' and ta.get('mode', 'audio') == 'audio' and plan.filter.get('instruments'):
                 ta['steering'] = _steering_for(plan.filter, INSTRUMENT_STEER_WEIGHT)
+            resolved_track = ta.pop('_resolved_track', None)
             pretty = {k: v for k, v in ta.items() if k != 'get_songs'}
             log_messages.append(f"\nPRIMARY: {tn}")
             try:
                 log_messages.append(f"   Arguments: {json.dumps(pretty, indent=2, default=str)}")
             except TypeError:
                 log_messages.append(f"   Arguments: {pretty}")
+            if tn == 'seed_search' and retrieval_only and plan.intent is not None:
+                _assert_canonical_seed_search_args(ta, plan.intent)
+                for index, anchor in enumerate(
+                    (a for a in plan.intent.get('canonical_retrieval_anchors', [])
+                     if isinstance(a, dict) and a.get('type') == 'song'), 1
+                ):
+                    identity = anchor['resolved']
+                    log_messages.append(
+                        f"AudioMuse seed A{index:03d}: {identity['title']} / {identity['artist']}"
+                    )
             res = execute_mcp_tool(tn, ta, ai_config)
             if 'error' in res:
                 log_messages.append(f"   error {tn}: {res['error']}")
                 primary_logs.append((tn, ta, 0, True, res.get('error', '')))
                 continue
             songs = res.get('songs', [])
+            for neighborhood in res.get('seed_neighborhoods', []) or []:
+                label = str(neighborhood.get('label') or 'seed')
+                bucket = seed_provenance.setdefault(label, [])
+                for song in neighborhood.get('songs', []):
+                    item_id = song.get('item_id')
+                    if item_id is not None and str(item_id) not in bucket:
+                        bucket.append(str(item_id))
+            if tn == 'seed_search':
+                log_messages.append(f"seed_search retrieved: {len(songs)}")
+                if not songs and resolved_track and resolved_track.get('item_id'):
+                    songs = [resolved_track]
+                    log_messages.append(
+                        'seed_search returned 0; resolved retrieval-reference fallback used'
+                    )
             if res.get('message'):
                 for line in res['message'].split('\n'):
                     if line.strip():
@@ -2710,6 +3478,14 @@ def _execute_plan(
             tool_call_counter += 1
         else:
             log_messages.append("   composition pool empty (no songs, or all excluded)")
+            if plan.filter is not None:
+                tools_used_history.append({
+                    'name': FILTER_NAME, 'args': dict(plan.filter), 'songs': 0,
+                    'error': True, 'call_index': tool_call_counter,
+                    'result_message': 'composition pool empty; filter ranking had no candidates',
+                })
+                tool_execution_summary.append(_summary(FILTER_NAME, plan.filter, 0))
+                tool_call_counter += 1
 
     else:
         all_calls: List[Dict] = list(plan.primaries)
@@ -2722,7 +3498,8 @@ def _execute_plan(
             tn = tc.get('name')
             ta = dict(tc.get('arguments', {}) or {})
             if 'get_songs' not in ta:
-                ta['get_songs'] = max(200, target_song_count * 2)
+                ta['get_songs'] = _retrieval_budget(target_song_count)
+            resolved_track = ta.pop('_resolved_track', None)
             pretty = {k: v for k, v in ta.items() if k != 'get_songs'}
             log_messages.append(f"\nTOOL: {tn}")
             try:
@@ -2741,6 +3518,16 @@ def _execute_plan(
                 if ta.get('genres') and not ta.get('album') and not ta.get('artist') and res.get('songs'):
                     res['songs'] = _genre_purity_sort(res['songs'], ta['genres'], log_messages)
             else:
+                if tn == 'seed_search' and retrieval_only and plan.intent is not None:
+                    _assert_canonical_seed_search_args(ta, plan.intent)
+                    for index, anchor in enumerate(
+                        (a for a in plan.intent.get('canonical_retrieval_anchors', [])
+                         if isinstance(a, dict) and a.get('type') == 'song'), 1
+                    ):
+                        identity = anchor['resolved']
+                        log_messages.append(
+                            f"AudioMuse seed A{index:03d}: {identity['title']} / {identity['artist']}"
+                        )
                 res = execute_mcp_tool(tn, ta, ai_config)
             if 'error' in res:
                 log_messages.append(f"   error: {res['error']}")
@@ -2758,6 +3545,20 @@ def _execute_plan(
                 tool_call_counter += 1
                 continue
             songs = res.get('songs', [])
+            for neighborhood in res.get('seed_neighborhoods', []) or []:
+                label = str(neighborhood.get('label') or 'seed')
+                bucket = seed_provenance.setdefault(label, [])
+                for song in neighborhood.get('songs', []):
+                    item_id = song.get('item_id')
+                    if item_id is not None and str(item_id) not in bucket:
+                        bucket.append(str(item_id))
+            if tn == 'seed_search':
+                log_messages.append(f"seed_search retrieved: {len(songs)}")
+                if not songs and resolved_track and resolved_track.get('item_id'):
+                    songs = [resolved_track]
+                    log_messages.append(
+                        'Mandatory seed_search returned 0; deterministic resolved title/artist fallback used'
+                    )
             if res.get('message'):
                 for line in res['message'].split('\n'):
                     if line.strip():
@@ -2786,8 +3587,9 @@ def _execute_plan(
             tool_call_counter += 1
             yield
             if len(all_songs) >= collection_cap:
-                log_messages.append(f"collection cap {collection_cap} reached, stopping")
-                break
+                log_messages.append(
+                    f"collection cap {collection_cap} reached; remaining accepted tools will still execute"
+                )
 
         if n_primaries_with_songs >= 2 and not has_knowledge:
             boosted = sum(1 for c in primary_hits.values() if c > 1)
@@ -2808,6 +3610,7 @@ def _execute_plan(
     return {
         "songs": all_songs,
         "song_sources": song_sources,
+        "seed_provenance": seed_provenance,
         "tools_used_history": tools_used_history,
         "tool_execution_summary": tool_execution_summary,
         "detected_min_rating": detected_min_rating,

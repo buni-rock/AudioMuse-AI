@@ -36,6 +36,7 @@ from tasks.ai.tool_impl import (
     _lyrics_search_sync,
     _song_alchemy_sync,
     _song_similarity_api_sync,
+    resolve_song_by_title,
     _text_search_sync,
 )
 from tasks.mcp_helper import get_db_connection as _get_db_connection
@@ -118,7 +119,7 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
         return {"songs": [], "message": "seed_search: no seeds provided"}
 
     blend_mode = (tool_args.get("blend_mode") or "union").lower()
-    get_songs = int(tool_args.get("get_songs", 200) or 200)
+    get_songs = int(tool_args.get("get_songs", config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS) or config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS)
     subtract = tool_args.get("subtract") or []
 
     if blend_mode == "journey" and len(seeds) >= 2:
@@ -139,8 +140,9 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
             return _song_alchemy_sync(add_items, sub_items, get_songs)
 
     per_seed_songs: List[List[Dict]] = []
+    seed_neighborhoods: List[Dict] = []
     messages: List[str] = []
-    per_seed_budget = max(50, get_songs)
+    per_seed_budget = max(1, get_songs)
 
     for seed in seeds:
         if not isinstance(seed, dict):
@@ -149,10 +151,27 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
         if stype == "song":
             title = (seed.get("title") or seed.get("song_title") or "").strip()
             artist = (seed.get("artist") or seed.get("song_artist") or "").strip()
-            if not title or not artist:
-                messages.append(f"seed_search: skipping malformed song seed {seed}")
+            seed_id = str(seed.get("track_id") or "").strip()
+            if not title:
+                messages.append("seed_search: skipping song seed with no title")
                 continue
-            res = _song_similarity_api_sync(title, artist, per_seed_budget)
+            if not artist:
+                resolved = resolve_song_by_title(title)
+                if not resolved:
+                    messages.append(f"seed_search: title-only seed could not be resolved: {title}")
+                    continue
+                title = resolved.get("title") or title
+                artist = resolved.get("author") or resolved.get("artist") or ""
+                seed_id = str(resolved.get("item_id") or "").strip()
+                messages.append(
+                    f"Seed resolved: true; Seed ID: {resolved.get('item_id')}; "
+                    f"Seed title: {title}; Seed artist: {artist}"
+                )
+            if not artist:
+                messages.append(f"seed_search: resolved seed has no artist: {title}")
+                continue
+            res = (_song_similarity_api_sync(title, artist, per_seed_budget, seed_id=seed_id)
+                   if seed_id else _song_similarity_api_sync(title, artist, per_seed_budget))
         elif stype == "artist":
             name = (seed.get("name") or seed.get("artist") or seed.get("id") or "").strip()
             if not name:
@@ -165,7 +184,13 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
 
         if res.get("message"):
             messages.append(res["message"])
-        per_seed_songs.append(list(res.get("songs", []) or []))
+        neighborhood_songs = list(res.get("songs", []) or [])
+        per_seed_songs.append(neighborhood_songs)
+        if stype == "song":
+            label = f"{artist} / {title}"
+        else:
+            label = name
+        seed_neighborhoods.append({"label": label, "songs": neighborhood_songs})
 
     all_songs = _interleave_unique(per_seed_songs)
     if not all_songs:
@@ -175,6 +200,7 @@ def _dispatch_seed_search(tool_args: Dict, ai_config: Dict) -> Dict:
         }
     return {
         "songs": all_songs[: get_songs * len(seeds)],
+        "seed_neighborhoods": seed_neighborhoods,
         "message": f"seed_search(union) collected {len(all_songs)} unique songs across {len(seeds)} seed(s)\n"
         + "\n".join(messages),
     }
@@ -186,7 +212,7 @@ def _dispatch_text_match(tool_args: Dict, ai_config: Dict) -> Dict:
         return {"songs": [], "message": "text_match: empty query"}
 
     mode = (tool_args.get("mode") or _default_text_mode()).lower()
-    get_songs = int(tool_args.get("get_songs", 200) or 200)
+    get_songs = int(tool_args.get("get_songs", config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS) or config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS)
 
     if _YEAR_ONLY_RE.match(query):
         return {
@@ -284,7 +310,7 @@ def _dispatch_search_database(tool_args: Dict) -> Dict:
     def _do_query(name, fuzzy: bool = False) -> Dict:
         return _database_genre_query_sync(
             tool_args.get("genres"),
-            tool_args.get("get_songs", 200),
+            tool_args.get("get_songs", config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS),
             tool_args.get("moods"),
             tool_args.get("tempo_min"),
             tool_args.get("tempo_max"),
@@ -335,7 +361,7 @@ def execute_mcp_tool(tool_name: str, tool_args: Dict, ai_config: Dict) -> Dict:
             return _ai_brainstorm_sync(
                 request,
                 ai_config,
-                tool_args.get("get_songs", 200),
+                tool_args.get("get_songs", config.INSTANT_PLAYLIST_DEFAULT_N_RESULTS),
                 grounding_filter=tool_args.get("grounding_filter"),
                 gate_filter=tool_args.get("gate_filter"),
             )
@@ -374,7 +400,6 @@ def get_mcp_tools() -> List[Dict]:
                     "seeds": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 5,
                         "description": (
                             "Seed songs and/or artists the results should resemble. "
                             "Only names the user wants MORE of; never an excluded name."
@@ -413,7 +438,6 @@ def get_mcp_tools() -> List[Dict]:
                     },
                     "subtract": {
                         "type": "array",
-                        "maxItems": 5,
                         "description": "Items whose flavor to remove (only with blend_mode='subtract'). Same shape as seeds.",
                         "items": {
                             "type": "object",

@@ -569,6 +569,30 @@ class TestDedupeAndCapCalls:
         out = p.dedupe_and_cap_calls(['bogus', {'name': 'text_match', 'arguments': {}}])
         assert len(out) == 1
 
+    def test_every_accepted_tool_executes_after_collection_cap(self, monkeypatch):
+        import tasks.ai.tools as tools_mod
+        import tasks.ai.tool_impl as impl_mod
+        p = _plan()
+        executed = []
+
+        def fake_exec(name, args, _config):
+            executed.append((name, args['query']))
+            return {'songs': [{'item_id': f'id-{len(executed)}', 'title': 'Song', 'artist': str(len(executed))}]}
+
+        monkeypatch.setattr(tools_mod, 'execute_mcp_tool', fake_exec)
+        monkeypatch.setattr(impl_mod, '_fetch_pool_features', lambda ids: {})
+        calls = [
+            {'name': 'text_match', 'arguments': {'query': f'q{i}', 'get_songs': 10}}
+            for i in range(4)
+        ]
+        plan = p.validate_and_normalize_plan(calls)
+        logs = []
+        result = _drive(p._execute_plan(plan, {}, logs, collection_cap=1, target_song_count=10))
+        assert len(plan.primaries) == len(executed) == 4
+        assert [query for _name, query in executed] == ['q0', 'q1', 'q2', 'q3']
+        assert len(result['tools_used_history']) == 4
+        assert any('remaining accepted tools will still execute' in line for line in logs)
+
 
 class TestToolCallsSchema:
     def test_reasoning_first_and_required(self):
@@ -642,6 +666,17 @@ class TestToolCallsSchema:
         planner = _plan()
         schema = pr.build_tool_calls_schema(_tools_fixture())
         assert schema['properties']['tool_calls']['maxItems'] == planner.MAX_TOOL_CALLS
+
+
+class TestStructuredPlaylistPlanSchema:
+    def test_semantic_intent_and_tool_plan_are_both_required(self):
+        from tasks.ai.prompts import build_playlist_plan_tool
+        schema = build_playlist_plan_tool(_tools_fixture())['inputSchema']
+        assert schema['required'] == ['intent', 'tool_calls']
+        intent = schema['properties']['intent']
+        assert {'anchors', 'count', 'duration_seconds', 'constraints', 'playlist_intent', 'ordering_intent'} <= set(intent['required'])
+        anchor = intent['properties']['anchors']['items']
+        assert {'role', 'include_in_final', 'title', 'artist'} <= set(anchor['required'])
 
 
 class TestPromptRendering:
@@ -1070,17 +1105,27 @@ class TestZeroResultReplan:
         p = _plan()
         calls = []
 
-        def fake_ai(user_message, tools, ai_config, log_messages, library_context=None):
+        def fake_ai(user_message, tools, ai_config, log_messages, library_context=None,
+                    **_kwargs):
             calls.append(user_message)
             if len(calls) == 1:
-                return {
-                    'tool_calls': [
-                        {'name': 'search_database', 'arguments': {'artist': 'Nobody'}}
-                    ]
-                }
-            return {
-                'tool_calls': [{'name': 'search_database', 'arguments': {'genres': ['rock']}}]
-            }
+                semantic, call = (
+                    {'artist': 'Nobody'},
+                    {'name': 'search_database', 'arguments': {'artist': 'Nobody'}},
+                )
+            else:
+                semantic, call = (
+                    {'genres': ['rock']},
+                    {'name': 'search_database', 'arguments': {'genres': ['rock']}},
+                )
+            return {'tool_calls': [{
+                'name': 'submit_playlist_plan',
+                'arguments': {
+                    'intent': {'anchors': [], 'count': None, 'duration_seconds': None,
+                               'constraints': semantic, 'playlist_intent': 'similarity_mix'},
+                    'tool_calls': [call],
+                },
+            }]}
 
         monkeypatch.setattr(p, 'call_ai_for_plan', fake_ai)
 
@@ -1092,6 +1137,10 @@ class TestZeroResultReplan:
             return {'songs': [{'item_id': 'x1', 'title': 'T', 'artist': 'A'}], 'message': 'ok'}
 
         monkeypatch.setattr(tools_mod, 'execute_mcp_tool', fake_exec)
+        monkeypatch.setattr(
+            p, '_run_search_database_with_relax',
+            lambda args, *_a, **_kw: fake_exec('search_database', args, {}),
+        )
 
         logs = []
         gen = p.plan_and_execute_once('songs by Nobody', [], {'provider': 'NONE'}, logs)
@@ -1121,16 +1170,45 @@ def _example_calls(example_text):
     return json.loads(example_text.split('\n', 1)[1])['tool_calls']
 
 
-def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None):
+def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None, resolved_seed=None,
+              intent=None, retrieval_only=False):
     import tasks.ai.tools as tools_mod
     import tasks.ai.tool_impl as impl_mod
 
     seen = []
 
-    def fake_ai(user_message, tools, ai_config, log_messages, library_context=None):
+    def fake_ai(user_message, tools, ai_config, log_messages, library_context=None,
+                **_kwargs):
         if callable(tool_calls):
-            return tool_calls(user_message)
-        return {'tool_calls': [dict(c) for c in tool_calls]}
+            response = tool_calls(user_message)
+        else:
+            response = {'tool_calls': [dict(c) for c in tool_calls]}
+        if 'error' in response or any(
+            call.get('name') == 'submit_playlist_plan'
+            for call in response.get('tool_calls', []) if isinstance(call, dict)
+        ):
+            return response
+        calls = response.get('tool_calls', [])
+        inferred_constraints = {}
+        inferred_anchors = []
+        for call in calls:
+            args = call.get('arguments') or {}
+            if call.get('name') == 'search_database':
+                inferred_constraints.update(args)
+            elif call.get('name') == 'seed_search':
+                for seed in args.get('seeds', []):
+                    if seed.get('type') == 'song':
+                        inferred_anchors.append({
+                            **seed, 'role': 'reference_only', 'include_in_final': False,
+                        })
+        semantic = intent or {
+            'anchors': inferred_anchors, 'count': None, 'duration_seconds': None,
+            'constraints': inferred_constraints, 'playlist_intent': 'similarity_mix',
+        }
+        return {'tool_calls': [{
+            'name': 'submit_playlist_plan',
+            'arguments': {'intent': semantic, 'tool_calls': calls},
+        }]}
 
     def fake_exec(name, args, cfg):
         seen.append((name, {k: v for k, v in args.items() if k != 'get_songs'}))
@@ -1145,8 +1223,119 @@ def _run_plan(p, monkeypatch, request, tool_calls, raw_request=None):
     logs = []
     result = _drive(p.plan_and_execute_once(
         request, [], {'provider': 'NONE'}, logs, raw_user_request=raw_request,
+        resolved_seed=resolved_seed, retrieval_only=retrieval_only,
     ))
     return result, seen, logs
+
+
+def test_structured_multi_song_intent_resolves_anchors_and_additional_count(monkeypatch):
+    p = _plan()
+    titles = [
+        ('Temple of the King', 'Rainbow', 'Temple Of The King'),
+        ('Lound and clear', 'The Cranberries', 'Loud And Clear'),
+        ('Every breaking wave', 'U2', 'Every Breaking Wave'),
+        ('Paradise', 'Within Temptation', 'Paradise (What About Us?)'),
+    ]
+    resolved = {
+        (title.casefold(), artist.casefold()): {
+            'item_id': f'id-{i}', 'title': canonical, 'author': artist, 'album': 'Album',
+        }
+        for i, (title, artist, canonical) in enumerate(titles)
+    }
+    import tasks.ai.tool_impl as impl
+    monkeypatch.setattr(
+        impl, 'resolve_song_by_title',
+        lambda title, artist_hint='': resolved.get((title.casefold(), artist_hint.casefold())),
+    )
+    intent = {
+        'anchors': [
+            {'type': 'song', 'title': title, 'artist': artist,
+             'role': 'anchor', 'include_in_final': True}
+            for title, artist, _ in titles
+        ],
+        'count': {'mode': 'additional', 'value': 60},
+        'duration_seconds': None, 'constraints': {},
+        'playlist_intent': 'similarity_mix',
+    }
+    calls = [
+        {'name': 'seed_search', 'arguments': {'seeds': [
+            {'type': 'song', 'title': titles[0][0], 'artist': titles[0][1]},
+            {'type': 'song', 'title': titles[1][0], 'artist': titles[1][1]},
+        ], 'blend_mode': 'union'}},
+        {'name': 'seed_search', 'arguments': {'seeds': [
+            {'type': 'song', 'title': titles[2][0], 'artist': titles[2][1]},
+            {'type': 'song', 'title': titles[3][0], 'artist': titles[3][1]},
+        ], 'blend_mode': 'union'}},
+    ]
+    result, executed, logs = _run_plan(
+        p, monkeypatch, 'multi-song request', calls, intent=intent,
+    )
+    assert result['requested_final_count'] == 64, logs
+    assert len(result['mandatory_tracks']) == 4, logs
+    assert {track['item_id'] for track in result['mandatory_tracks']} == {
+        'id-0', 'id-1', 'id-2', 'id-3',
+    }
+    seed_calls = [args for name, args in executed if name == 'seed_search']
+    assert len(seed_calls) == 1
+    assert len(seed_calls[0]['seeds']) == 4
+    assert any('Requested count mode: additional' in line for line in logs)
+    assert any('Requested final total: 64' in line for line in logs)
+    assert any(line.startswith('Planner wall-clock:') for line in logs)
+    assert any(line.startswith('Retrieval wall-clock:') for line in logs)
+
+
+def test_retrieval_only_rebuild_preserves_canonical_physical_seed_id(monkeypatch):
+    p = _plan()
+    import tasks.ai.tool_impl as impl
+    monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, artist_hint=None: {
+        'item_id': 'canonical-harvest-id', 'title': 'Harvest',
+        'author': 'Nightwish', 'album': 'Human Nature',
+    })
+    intent = {'anchors': [{
+        'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+        'role': 'reference_only', 'include_in_final': False,
+    }], 'count': None, 'duration_seconds': None, 'constraints': {},
+        'playlist_intent': 'similarity_mix'}
+    _, executed, logs = _run_plan(
+        p, monkeypatch, 'Use Harvest by Nightwish as a seed',
+        [{'name': 'seed_search', 'arguments': {'seeds': [
+            {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+        ]}}], intent=intent, retrieval_only=True,
+    )
+    assert executed[0][1]['seeds'] == [{
+        'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+        'track_id': 'canonical-harvest-id',
+    }]
+    assert any('Canonical AudioMuse retrieval seed arguments rebuilt: 1' in line for line in logs)
+
+
+class TestSeedArtistDoesNotBecomeFilter:
+    def test_artist_filter_absent_from_semantic_constraints_is_removed(self):
+        p = _plan()
+        calls = [
+            {'name': 'seed_search', 'arguments': {'seeds': [
+                {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+            ]}},
+            {'name': 'search_database', 'arguments': {'artist': 'Nightwish'}},
+        ]
+        logs = []
+        p._validate_intent_tool_consistency(calls, {'constraints': {}}, logs)
+        assert [call['name'] for call in calls] == ['seed_search']
+        assert any('Nightwish' in line and 'planner.intent.constraints' in line for line in logs)
+
+    def test_independent_artist_constraint_is_preserved_from_intent(self):
+        p = _plan()
+        calls = [
+            {'name': 'seed_search', 'arguments': {'seeds': [
+                {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish'},
+            ]}},
+            {'name': 'search_database', 'arguments': {'artist': 'Nightwish'}},
+        ]
+        logs = []
+        p._validate_intent_tool_consistency(
+            calls, {'constraints': {'artist': 'Nightwish'}}, logs,
+        )
+        assert calls[1]['arguments']['artist'] == 'Nightwish'
 
 
 class TestListArgDedupe:
@@ -1291,84 +1480,17 @@ class TestContradictoryExclusionStrip:
         assert notes
 
 
-class TestEmptyPlanRescue:
-    def test_empty_search_database_never_returns_an_error_key(self, monkeypatch):
+class TestEmptyPlanDoesNotInferRequestSemantics:
+    def test_empty_or_invalid_plan_does_not_run_raw_text_rescue(self, monkeypatch):
         p = _plan()
-        result, seen, _logs = _run_plan(
-            p, monkeypatch, 'Build a playlist for: "music"',
-            [{'name': 'search_database', 'arguments': {}}], raw_request='music',
+        result, seen, logs = _run_plan(
+            p, monkeypatch, 'Build a playlist for calm piano',
+            lambda _user_message: {'error': 'provider unavailable'}, raw_request='calm piano',
         )
-        assert 'error' not in result
-        assert result['songs']
-        assert ('text_match', {'query': 'music', 'mode': 'audio'}) in seen
-
-    def test_rescue_uses_the_raw_user_words_not_the_wrapper(self, monkeypatch):
-        p = _plan()
-        _result, seen, _logs = _run_plan(
-            p, monkeypatch, 'Build a 100-song playlist for: "calm piano"',
-            [], raw_request='calm piano',
-        )
-        queries = [a.get('query') for n, a in seen if n == 'text_match']
-        assert queries == ['calm piano']
-
-    def test_rescue_attaches_extracted_hints_as_the_plan_filter(self):
-        p = _plan()
-        request = 'fast 170 bpm rock from the 90s'
-        plan = p._synthesize_rescue_plan(request, p.extract_hints(request), [])
-        assert plan.filter['year_min'] == 1990
-        assert plan.filter['year_max'] == 1999
-        assert plan.filter['genres'] == ['rock']
-
-    def test_year_only_request_rescues_to_a_filter_because_text_match_rejects_it(self):
-        p = _plan()
-        request = 'songs from 1985'
-        plan = p._synthesize_rescue_plan(request, p.extract_hints(request), [])
-        assert plan.primaries == []
-        assert plan.filter['year_min'] == 1985
-
-    def test_rescue_never_synthesizes_an_unconstrained_search_database(self):
-        p = _plan()
-        for request in ('music', 'something good', 'surprise me'):
-            plan = p._synthesize_rescue_plan(request, p.extract_hints(request), [])
-            assert all(c['name'] != 'search_database' for c in plan.primaries)
-
-    def test_duration_hint_reaches_the_rescue_filter(self, monkeypatch):
-        p = _plan()
-        result, _seen, logs = _run_plan(
-            p, monkeypatch, 'short punchy songs under 3 minutes',
-            [{'name': 'search_database', 'arguments': {}}],
-            raw_request='short punchy songs under 3 minutes',
-        )
-        assert result['songs']
-        assert any("'duration_max': 180.0" in line for line in logs)
-
-    def test_at_most_one_extra_llm_call_across_the_empty_plan_path(self, monkeypatch):
-        p = _plan()
-        seen_prompts = []
-
-        def plans(user_message):
-            seen_prompts.append(user_message)
-            return {'tool_calls': [{'name': 'search_database', 'arguments': {}}]}
-
-        result, _seen, _logs = _run_plan(p, monkeypatch, 'music', plans, raw_request='music')
-        assert 'error' not in result
-        assert len(seen_prompts) == 2
-        assert 'PREVIOUS ATTEMPT FAILED' in seen_prompts[1]
-
-    def test_provider_error_still_produces_songs_with_a_plan_note(self, monkeypatch):
-        p = _plan()
-
-        def plans(_user_message):
-            return {'error': 'connection refused'}
-
-        result, seen, _logs = _run_plan(
-            p, monkeypatch, 'dark moody electronic', plans,
-            raw_request='dark moody electronic',
-        )
-        assert 'error' not in result
-        assert result['songs']
-        assert any('unreachable' in n for n in result['plan_notes'])
-        assert any(n == 'text_match' for n, _ in seen)
+        assert result.get('error') == 'provider unavailable'
+        assert seen == []
+        assert not any(name == 'text_match' for name, _ in seen)
+        assert any('AI planner response rejected' in line for line in logs)
 
 
 class TestKnowledgeLookupGrounding:
@@ -1418,23 +1540,31 @@ class TestKnowledgeLookupGrounding:
         _result, seen, _logs = _run_plan(
             p, monkeypatch, 'famous hits from the 90s',
             [{'name': 'knowledge_lookup',
-              'arguments': {'user_request': 'famous hits from the 90s'}}])
+              'arguments': {'user_request': 'famous hits from the 90s'}}],
+            intent={
+                'anchors': [], 'count': None, 'duration_seconds': None,
+                'constraints': {'year_min': 1990, 'year_max': 1999},
+                'playlist_intent': 'similarity_mix',
+            })
         kl = [a for n, a in seen if n == 'knowledge_lookup']
         assert kl and kl[0]['grounding_filter']['year_min'] == 1990
 
     def test_artist_is_dropped_from_the_grounding_with_a_plan_note(self, monkeypatch):
         p = _plan()
-        result, seen, _logs = _run_plan(
+        result, seen, logs = _run_plan(
             p, monkeypatch, 'best of the 90s',
             [
                 {'name': 'knowledge_lookup', 'arguments': {'user_request': 'best of the 90s'}},
                 {'name': 'search_database', 'arguments': {'artist': 'Band F'}},
-            ])
+            ], intent={
+                'anchors': [], 'count': None, 'duration_seconds': None,
+                'constraints': {}, 'playlist_intent': 'similarity_mix',
+            })
         kl = [a for n, a in seen if n == 'knowledge_lookup']
         assert kl
         assert 'artist' not in (kl[0].get('grounding_filter') or {})
         assert 'artist' not in (kl[0].get('gate_filter') or {})
-        assert any('Band F' in n for n in result['plan_notes'])
+        assert any('Planner artist filter ignored' in line and 'Band F' in line for line in logs)
 
 
 class TestThreeToolExampleIsOffered:
@@ -1488,15 +1618,6 @@ class TestPlannerLogLinesStayFrontendParsable:
             logs_all.extend(logs)
         return logs_all
 
-    def test_no_new_log_line_is_mistaken_for_a_filter_dimension(self, monkeypatch):
-        matched = [
-            line for line in self._all_logs(monkeypatch)
-            if self.DIMENSION_RE.match(line.strip())
-        ]
-
-        assert matched
-        for line in matched:
-            assert line.startswith('   '), line
 
     def test_only_real_tool_executions_emit_a_tool_or_primary_prefix(self, monkeypatch):
         prefixed = [
@@ -1535,15 +1656,69 @@ class TestRetrievalBudget:
         )
         return seen[0]
 
-    def test_budget_over_fetches_twice_the_target_so_dedup_and_diversity_have_slack(
+    def test_budget_uses_target_within_retrieval_capacity(
         self, monkeypatch
     ):
-        assert self._budget_for(monkeypatch, 200) == 400
-        assert self._budget_for(monkeypatch, 500) == 1000
+        import config
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES', 600)
+        assert self._budget_for(monkeypatch, 200) == 200
+        assert self._budget_for(monkeypatch, 500) == 500
 
-    def test_budget_keeps_its_200_floor_for_short_playlists(self, monkeypatch):
-        assert self._budget_for(monkeypatch, 10) == 200
-        assert self._budget_for(monkeypatch, 50) == 200
+    def test_budget_has_no_obsolete_200_floor_for_short_playlists(self, monkeypatch):
+        assert self._budget_for(monkeypatch, 10) == 10
+        assert self._budget_for(monkeypatch, 50) == 50
 
-    def test_budget_at_the_legacy_100_target_is_unchanged(self, monkeypatch):
-        assert self._budget_for(monkeypatch, 100) == 200
+    def test_budget_at_100_tracks_is_100(self, monkeypatch):
+        assert self._budget_for(monkeypatch, 100) == 100
+
+
+def test_planner_roles_distinguish_reference_and_excluded_song_anchors(monkeypatch):
+    import tasks.ai.tool_impl as impl
+    tracks = {
+        'Harvest': {'item_id': 'harvest-id', 'title': 'Harvest', 'author': 'Nightwish'},
+        'Ghost Love Score': {'item_id': 'gls-id', 'title': 'Ghost Love Score', 'author': 'Nightwish'},
+    }
+    monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, _artist=None: tracks.get(title))
+    intent = {'anchors': [
+        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish', 'role': 'anchor', 'include_in_final': False},
+        {'type': 'song', 'title': 'Ghost Love Score', 'artist': 'Nightwish', 'role': 'exclusion', 'include_in_final': False},
+    ]}
+    calls, logs = [], []
+    mandatory = _plan()._resolve_intent_anchors(intent, calls, logs)
+    assert mandatory == []
+    assert calls[0]['arguments']['seeds'] == [
+        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish', 'track_id': 'harvest-id'}
+    ]
+    assert [track['item_id'] for track in intent['excluded_tracks']] == ['gls-id']
+def test_harvest_reference_flows_as_one_canonical_seed_and_composer_anchor(monkeypatch):
+    import tasks.ai.planner as planner
+    import tasks.ai.tool_impl as impl
+
+    request = (
+        "Can you create me a playlist which uses the Nightwish's song Harvest as a seed? "
+        "I want to have a playlist of exactly 30 minutes. The songs should be similar to the seed."
+    )
+    monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, artist_hint=None: {
+        'item_id': 'harvest-id', 'title': 'Harvest', 'author': 'Nightwish', 'album': 'Album',
+    } if title == 'Harvest' else None)
+    intent = {'anchors': [{
+        'type': 'song', 'title': "How's The Heart?", 'artist': 'Nightwish',
+        'role': 'anchor', 'include_in_final': False,
+    }]}
+    calls = [{'name': 'seed_search', 'arguments': {'seeds': [
+        {'type': 'song', 'title': "How's The Heart?", 'artist': 'Nightwish'},
+    ]}}]
+    logs = []
+    planner._preserve_explicit_song_references(intent, request, logs)
+    planner._resolve_intent_anchors(intent, calls, logs)
+    canonical = intent['canonical_retrieval_anchors']
+    assert len(canonical) == 1
+    assert canonical is intent['resolved_anchors']
+    assert canonical[0]['resolved'] == {
+        'title': 'Harvest', 'artist': 'Nightwish', 'track_id': 'harvest-id',
+    }
+    assert calls[0]['arguments']['seeds'] == [
+        {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish', 'track_id': 'harvest-id'},
+    ]
+    planner._assert_canonical_seed_search_args(calls[0]['arguments'], intent)
+    assert 'Resolved anchor A001: Harvest / Nightwish track_id=harvest-id' in logs

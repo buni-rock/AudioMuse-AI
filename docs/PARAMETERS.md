@@ -112,9 +112,18 @@ These are the default parameters used when launching analysis or clustering task
 | `CRON_RETRY_MAX_MINUTES`                    | Max minutes a scheduled run that was blocked by a running queue-guard task (analysis, clustering, cleaning, provider migration or any plugin task) waits in the retry list before it is recorded as skipped and not run. | `240`           |
 | `CRON_RETRY_INTERVAL_MINUTES`               | How often the cron manager re-attempts blocked scheduled runs while they are inside the retry window. Clamped to stay below `CRON_RETRY_MAX_MINUTES` so a misconfiguration cannot disable retries. | `10`            |
 | **Instant Playlist General**                |                                                                                                                           |                 |
-| `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`        | Number of songs the instant playlist aims for when the caller sends no count. It is both the value the chat page's "Number of songs" box starts on and the fallback for a direct API call. | `50`            |
-| `INSTANT_PLAYLIST_MAX_N_RESULTS`            | Maximum the chat page's "Number of songs" box accepts. Frontend-only: the `/chat/api/chatPlaylist` API enforces no upper bound, so an API caller can ask for more. | `200`           |
-| `MAX_SONGS_PER_ARTIST_PLAYLIST`             | Max songs from a single artist in the instant playlist (diversity enforcement).                                           | `5`             |
+| `INSTANT_PLAYLIST_DEFAULT_N_RESULTS`        | Number of songs a direct API call aims for when it sends no count. | `50`            |
+| `INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS` | Default song count shown in the chat page and supplied to LLM Compose when the request does not specify one. | `25` |
+| `INSTANT_PLAYLIST_MAX_N_RESULTS`            | Configured maximum final playlist size for chat requests, including LLM Compose. | `200`           |
+| `MAX_SONGS_PER_ARTIST_PLAYLIST`             | Native mode diversity cap. LLM Compose decides artist concentration from the request. | `5`             |
+| `INSTANT_PLAYLIST_SELECTION_MODE` | Default final selection mode: `NATIVE` or `LLM_COMPOSE` (`LLM_RERANK` and `LLM_CURATE` migrate to `LLM_COMPOSE`). | `NATIVE` |
+| `INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES` | Maximum compact candidate records sent to LLM Compose. Balanced reduction preserves seed neighborhoods; `0` sends the full collected candidate pool. | `300` |
+| `INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE` | Explicit Ollama context size for LLM Compose. | `32768` |
+| `COMPOSER_MAX_OUTPUT_TOKENS` | Temporary Composer generation ceiling for diagnosis, independent of UI song count. | `4096` |
+| `INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS` | Ollama Compose request timeout; `0` disables the timeout. Other providers keep their own timeout behavior. | `300` |
+| `INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES` | Technical candidate limit for duration optimization. | `100` |
+| `INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS` | Maximum final playlist duration error in seconds for a successful duration request. | `15` |
+| `INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES` | Technical collection limit across retrieval calls; requested per-seed budgets remain authoritative below this cap. | `600` |
 | `PLAYLIST_ENERGY_ARC`                       | Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down).                                       | `false`         |
 | **Similarity General**                      |                                                                                                                           |                 |
 | `IVF_METRIC`                                | Distance metric used by the similarity index: `angular` (cosine), `euclidean`, or `dot` (inner product). Changing it requires an index rebuild.                                                                                            | `angular`       |

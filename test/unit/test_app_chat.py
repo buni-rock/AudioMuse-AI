@@ -52,11 +52,15 @@ TRUTHY_SEARCH_FILTERS = {
 }
 
 
+def _rerank_aliases(prompt):
+    return json.loads(prompt.rsplit('Candidates: ', 1)[1])
+
+
 def _song(item_id, artist):
     return {'item_id': item_id, 'artist': artist, 'title': f'{artist} {item_id}'}
 
 
-def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None):
+def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None, filter_applied=True, plan_result_extra=None, translate_ids=None):
     import tasks.ai.planner as planner
     import tasks.mcp_helper as mcp_helper
 
@@ -68,7 +72,8 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None):
             'tools_used_history': [],
             'plan_notes': [],
             'executed_query_str': 'stub-query',
-            'filter_applied': True,
+            'filter_applied': filter_applied,
+            **(plan_result_extra or {}),
         }
 
     monkeypatch.setattr(planner, 'plan_and_execute_once', _fake_plan)
@@ -77,6 +82,11 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None):
         app_chat.app_server_context,
         'scope_results',
         lambda rows, _server, **kwargs: list(rows),
+    )
+    monkeypatch.setattr(
+        app_chat.app_server_context,
+        'translate_ids_for_request',
+        translate_ids or (lambda ids: {str(item_id): str(item_id) for item_id in ids}),
     )
 
     payload = {'userInput': 'build me a playlist', 'ai_provider': 'OLLAMA'}
@@ -88,6 +98,326 @@ def _run_pipeline_with_pool(monkeypatch, songs, payload_extra=None):
     )
     assert status == 200
     return response
+
+
+def test_planner_failure_is_visible_in_playlist_response(monkeypatch):
+    response = _run_pipeline_with_pool(
+        monkeypatch, [],
+        {'selection_mode': 'LLM_COMPOSE'},
+        plan_result_extra={'error': 'Ollama model process was killed by the server.'},
+    )
+    assert response['query_results'] is None
+    assert response['shortfall_reason'] == 'Ollama model process was killed by the server.'
+
+
+def test_compose_duration_only_finalizes_subset_and_receives_canonical_anchor(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    songs = [
+        {'item_id': str(i), 'title': 'Harvest' if i == 0 else f'Track {i}',
+         'artist': 'Nightwish' if i == 0 else f'Artist {i}'}
+        for i in range(23)
+    ]
+    anchor = {
+        'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+        'resolved_track': songs[0],
+        'resolved': {'title': 'Harvest', 'artist': 'Nightwish', 'track_id': '0'},
+        'user_reference': {'title': 'Harvest', 'artist': 'the Nightwish'},
+    }
+    seen = {}
+
+    def compose(_request, candidate_songs, _config, **kwargs):
+        seen['anchors'] = kwargs['resolved_anchors']
+        return {
+            'playlist': candidate_songs,
+            'requested_output': {'target_count': None, 'target_duration_seconds': 1800},
+            'anchor_decisions': [{'id': 'A001', 'include': True}],
+            'shortfall_reason': '30 minutes reached',
+        }, len(candidate_songs)
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm', compose)
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {
+        str(item_id): {'duration': 280 if str(item_id) != '22' else 412}
+        for item_id in ids
+    })
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs,
+        {'selection_mode': 'LLM_COMPOSE', 'userInput': 'Use Harvest by Nightwish as a seed. Make the playlist exactly 30 minutes.'},
+        plan_result_extra={
+            'intent': {'anchors': [], 'resolved_anchors': []},
+            'canonical_retrieval_anchors': [anchor],
+        },
+    )
+    assert seen['anchors'] == [anchor]
+    assert response['requested_output']['target_count'] is None
+    assert response['actual_duration_seconds'] == 1812
+    assert len(response['query_results']) == 6
+    assert response['query_results'][0]['item_id'] == '0'
+    assert 'Canonical anchors handed to Composer: 1' in response['message']
+    assert 'Final requested duration: 1800 s' in response['message']
+    assert 'Required anchors in final playlist: 1/1' in response['message']
+    assert 'Duration fallback:' not in response['message']
+    assert 'OK SUCCESS' in response['message']
+
+
+def test_harvest_30_minute_request_uses_broader_pool_only_after_preferred_failure(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    request = ("Can you create me a playlist which uses the Nightwish's song Harvest "
+               "as a seed? I want to have a playlist of exactly 30 minutes. "
+               "The songs should be similar to the seed.")
+    songs = [
+        {'item_id': 'canonical-harvest', 'title': 'Harvest', 'artist': 'Nightwish'},
+        {'item_id': 'preferred', 'title': 'Preferred', 'artist': 'Artist A'},
+        {'item_id': 'broader', 'title': 'Broader', 'artist': 'Artist B'},
+    ]
+    anchor = {'type': 'song', 'resolved_track': songs[0],
+              'resolved': {'title': 'Harvest', 'artist': 'Nightwish',
+                           'track_id': 'canonical-harvest'}}
+
+    def compose(user_request, pool, _config, **_kwargs):
+        assert user_request == request
+        assert len(pool) == 3
+        return {'playlist': pool[:2],
+                'requested_output': {'target_count': None, 'target_duration_seconds': 1800},
+                'anchor_decisions': [{'id': 'A001', 'include': True}]}, 3
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm', compose)
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {
+        str(item_id): {'duration': {'canonical-harvest': 600, 'preferred': 500,
+                                    'broader': 700}[str(item_id)]} for item_id in ids
+    })
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE', 'userInput': request},
+        plan_result_extra={'canonical_retrieval_anchors': [anchor]},
+    )
+    assert response['shortfall_reason'] is None
+    assert response['actual_duration_seconds'] == 1800
+    assert {song['item_id'] for song in response['query_results']} == {
+        'canonical-harvest', 'preferred', 'broader'
+    }
+    assert 'Duration fallback: tolerance met using broader candidate universe' in response['message']
+    assert 'Required anchors in final playlist: 1/1' in response['message']
+
+
+def test_four_song_request_returns_64_tracks_and_reports_four_required_anchors(monkeypatch):
+    from tasks import playlist_curation
+
+    request = ('Here is a list of songs I love:\n'
+               '- Temple of the King from Rainbow,\n'
+               '- Lound and clear from The Cranberries,\n'
+               '- Every breaking wave from U2,\n'
+               '- Paradise from Within Temptation.\n'
+               'Could you assemble a playlist to contain these songs and add another 60 similar songs?')
+    seeds = [('Temple Of The King', 'Rainbow'), ('Loud And Clear', 'The Cranberries'),
+             ('Every Breaking Wave', 'U2'),
+             ('Paradise (What About Us?) (Feat. Tarja)', 'Within Temptation')]
+    songs = [{'item_id': f'canonical-{i}', 'title': title, 'artist': artist}
+             for i, (title, artist) in enumerate(seeds)]
+    songs += [{'item_id': f'discovery-{i}', 'title': f'Discovery {i}',
+               'artist': f'Discovery Artist {i}'} for i in range(60)]
+    anchors = [{'type': 'song', 'resolved_track': song,
+                'resolved': {'title': song['title'], 'artist': song['artist'],
+                             'track_id': song['item_id']}} for song in songs[:4]]
+
+    def compose(user_request, pool, _config, **_kwargs):
+        assert user_request == request
+        return {'playlist': list(pool),
+                'requested_output': {'target_count': 64, 'target_duration_seconds': None},
+                'anchor_decisions': [{'id': f'A{i:03d}', 'include': True}
+                                     for i in range(1, 5)]}, 64
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm', compose)
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE', 'userInput': request},
+        plan_result_extra={'canonical_retrieval_anchors': anchors},
+    )
+    assert len(response['query_results']) == 64
+    assert {song['item_id'] for song in songs[:4]}.issubset(
+        {song['item_id'] for song in response['query_results']}
+    )
+    assert 'Required anchors in final playlist: 4/4' in response['message']
+
+
+def test_compose_duration_violation_cannot_report_success(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    song = {'item_id': 'long', 'title': 'Long track', 'artist': 'Artist'}
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm',
+                        lambda _request, songs, _config, **kwargs: ({
+                            'playlist': songs,
+                            'requested_output': {'target_count': None, 'target_duration_seconds': 1800},
+                            'anchor_decisions': [], 'shortfall_reason': '30 minutes reached',
+                        }, len(songs)))
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features',
+                        lambda ids: {item_id: {'duration': 6572} for item_id in ids})
+    response = _run_pipeline_with_pool(
+        monkeypatch, [song], {'selection_mode': 'LLM_COMPOSE'},
+    )
+    assert response['query_results'] == []
+    assert response['actual_duration_seconds'] == 6572
+    assert 'Playlist duration validation failed' in response['message']
+    assert 'OK SUCCESS' not in response['message']
+
+
+def test_compose_count_only_does_not_run_duration_optimizer(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    songs = [_song(str(i), f'Artist {i}') for i in range(3)]
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm',
+                        lambda _request, rows, _config, **kwargs: ({
+                            'playlist': rows[:2],
+                            'requested_output': {'target_count': 2, 'target_duration_seconds': None},
+                            'anchor_decisions': [], 'shortfall_reason': None,
+                        }, len(rows)))
+    monkeypatch.setattr(playlist_curation, 'finalize_composer_duration',
+                        lambda *args, **kwargs: pytest.fail('duration finalizer ran for count only'))
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {})
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE'},
+    )
+    assert len(response['query_results']) == 2
+    assert response['target_duration_seconds'] is None
+    assert 'OK SUCCESS' in response['message']
+
+
+def test_compose_count_and_duration_respects_both(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    songs = [_song(str(i), f'Artist {i}') for i in range(4)]
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm',
+                        lambda _request, rows, _config, **kwargs: ({
+                            'playlist': rows,
+                            'requested_output': {'target_count': 2, 'target_duration_seconds': 900},
+                            'anchor_decisions': [], 'shortfall_reason': None,
+                        }, len(rows)))
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {
+        item_id: {'duration': {'0': 600, '1': 300, '2': 310, '3': 1000}[item_id]}
+        for item_id in ids
+    })
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE'},
+    )
+    assert len(response['query_results']) == 2
+    assert response['actual_duration_seconds'] == 900
+    assert 'OK SUCCESS' in response['message']
+
+
+def test_compose_delivers_provider_ids_from_initial_availability_check(monkeypatch):
+    from tasks import playlist_curation
+    import tasks.ai.tool_impl as tool_impl
+
+    songs = [_song(str(i), f'Artist {i}') for i in range(3)]
+    translations = []
+    feature_calls = []
+
+    def translate(ids):
+        translations.append(list(ids))
+        return {str(item_id): f'provider-{item_id}' for item_id in ids}
+
+    def features(ids):
+        feature_calls.append(list(ids))
+        return {str(item_id): {'duration': 200} for item_id in ids}
+
+    monkeypatch.setattr(playlist_curation, 'compose_playlist_with_llm',
+                        lambda _request, rows, _config, **kwargs: ({
+                            'playlist': rows,
+                            'requested_output': {'target_count': 3, 'target_duration_seconds': None},
+                            'anchor_decisions': [], 'shortfall_reason': None,
+                        }, len(rows)))
+    monkeypatch.setattr(tool_impl, '_fetch_pool_features', features)
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs, {'selection_mode': 'LLM_COMPOSE'}, translate_ids=translate,
+    )
+    assert [row['item_id'] for row in response['query_results']] == [
+        'provider-0', 'provider-1', 'provider-2',
+    ]
+    assert len(translations) == 1
+    assert len(feature_calls) == 1
+    assert 'Playlist response ready: 3 tracks' in response['message']
+
+
+def test_resolved_explicit_song_is_mandatory_and_first_in_native_playlist(monkeypatch):
+    import tasks.ai.tool_impl as tool_impl
+
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist='': {
+        'item_id': 'anchor', 'title': 'Harvest', 'author': 'Nightwish', 'album': 'HVMAN. :II: NATURE.'
+    })
+    songs = [
+        {'item_id': f'optional-{i}', 'title': f'Optional {i}', 'artist': f'Artist {i}'}
+        for i in range(5)
+    ]
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs,
+        {'n': 3, 'userInput': 'Songs similar to Harvest by Nightwish.'},
+        filter_applied=True,
+        plan_result_extra={
+            'intent': {'anchors': [{'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+                                   'role': 'mandatory', 'include_in_final': True}],
+                       'resolved_anchors': []},
+            'mandatory_tracks': [{'item_id': 'anchor', 'title': 'Harvest', 'artist': 'Nightwish'}],
+        },
+    )
+    assert len(response['query_results']) == 3
+    assert response['query_results'][0]['item_id'] == 'anchor'
+    assert 'Mandatory tracks present in final playlist: 1/1' in response['message']
+
+
+def test_explicitly_excluded_song_is_not_mandatory(monkeypatch):
+    import tasks.ai.tool_impl as tool_impl
+
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist='': {
+        'item_id': 'anchor', 'title': 'Harvest', 'author': 'Nightwish', 'album': 'Album'
+    })
+    songs = [
+        {'item_id': f'optional-{i}', 'title': f'Optional {i}', 'artist': f'Artist {i}'}
+        for i in range(5)
+    ]
+    response = _run_pipeline_with_pool(
+        monkeypatch, songs,
+        {'n': 3, 'userInput': "Songs like Harvest but don't include Harvest."},
+        filter_applied=True,
+        plan_result_extra={
+            'intent': {'anchors': [{'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish',
+                                   'role': 'anchor', 'include_in_final': False}],
+                       'resolved_anchors': []},
+        },
+    )
+    assert all(song['item_id'] != 'anchor' for song in response['query_results'])
+    assert 'Mandatory tracks: 0' in response['message']
+
+
+def test_multiple_explicit_songs_raise_small_target_and_keep_mention_order(monkeypatch):
+    import tasks.ai.tool_impl as tool_impl
+
+    rows = {
+        'Harvest': {'item_id': 'harvest', 'title': 'Harvest', 'author': 'Nightwish'},
+        'Ghost Love Score': {'item_id': 'gls', 'title': 'Ghost Love Score', 'author': 'Nightwish'},
+    }
+    monkeypatch.setattr(tool_impl, 'resolve_song_by_title', lambda title, artist='': rows.get(title))
+    response = _run_pipeline_with_pool(
+        monkeypatch,
+        [{'item_id': 'other', 'title': 'Other Song', 'artist': 'Other Artist'}],
+        {'n': 1, 'userInput': 'Use Harvest and Ghost Love Score as seeds.'},
+        filter_applied=True,
+        plan_result_extra={
+            'intent': {'anchors': [
+                {'type': 'song', 'title': 'Harvest', 'artist': 'Nightwish', 'role': 'mandatory', 'include_in_final': True},
+                {'type': 'song', 'title': 'Ghost Love Score', 'artist': 'Nightwish', 'role': 'mandatory', 'include_in_final': True},
+            ], 'resolved_anchors': []},
+            'mandatory_tracks': [
+                {'item_id': 'harvest', 'title': 'Harvest', 'artist': 'Nightwish'},
+                {'item_id': 'gls', 'title': 'Ghost Love Score', 'artist': 'Nightwish'},
+            ],
+        },
+    )
+    assert [song['item_id'] for song in response['query_results']] == ['harvest', 'gls']
+    assert 'Mandatory tracks present in final playlist: 2/2' in response['message']
 
 
 class TestSeedSearchSongSeedValidation:
@@ -117,7 +447,10 @@ class TestSeedSearchSongSeedValidation:
 
         assert calls == []
         assert result['songs'] == []
-        assert 'seed_search: skipping malformed song seed' in result['message']
+        assert (
+            'seed_search: skipping song seed with no title' in result['message']
+            or 'seed_search: title-only seed could not be resolved' in result['message']
+        )
 
     def test_complete_song_seed_reaches_the_similarity_call_stripped_of_whitespace(
         self, monkeypatch
@@ -340,6 +673,45 @@ class TestArtistDiversityEnforcement:
 
 
 class TestPlaylistLength:
+    @pytest.mark.parametrize(
+        'ui_count,requested_count,expected',
+        [(25, 70, 70), (25, 12, 12), (45, 70, 70), (100, 100, 100)],
+    )
+    def test_llm_target_uses_explicit_request_with_infrastructure_limit(
+        self, monkeypatch, ui_count, requested_count, expected
+    ):
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_MAX_N_RESULTS', 200)
+        assert app_chat._resolve_llm_song_target(
+            {'n': ui_count}, requested_count
+        ) == (expected, ui_count, 200)
+
+    def test_llm_target_without_prompt_count_uses_ui_default(self, monkeypatch):
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS', 25)
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_MAX_N_RESULTS', 200)
+        assert app_chat._resolve_llm_song_target({}, None) == (25, 25, 200)
+
+    def test_composer_candidate_limit_is_context_capacity(self, monkeypatch):
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES', 300)
+        assert app_chat._resolve_llm_candidate_limit(10) == 300
+        assert app_chat._resolve_llm_candidate_limit(64) == 300
+
+    def test_no_duration_constraint_skips_optimizer_and_preserves_native_order(self, monkeypatch):
+        from tasks import playlist_curation
+
+        monkeypatch.setattr(config, 'INSTANT_PLAYLIST_SELECTION_MODE', 'NATIVE')
+        monkeypatch.setattr(
+            playlist_curation,
+            'optimize_playlist_duration',
+            lambda *args, **kwargs: pytest.fail('duration optimizer ran without a duration constraint'),
+        )
+        songs = [_song(f'u{i}', f'Solo{i}') for i in range(8)]
+        response = _run_pipeline_with_pool(
+            monkeypatch, songs, {'n': 4}, filter_applied=False,
+        )
+        assert [song['item_id'] for song in response['query_results']] == ['u0', 'u1', 'u2', 'u3']
+        assert 'Duration optimizer' not in response['message']
+        assert 'Playlist kept in native/curator rank order (no explicit duration constraint)' in response['message']
+
     def test_request_without_n_falls_back_to_the_configured_default(self, monkeypatch):
         monkeypatch.setattr(config, 'INSTANT_PLAYLIST_DEFAULT_N_RESULTS', 50)
         songs = [_song(f'u{i}', f'Solo{i}') for i in range(300)]
@@ -440,3 +812,58 @@ class TestStreamingErrorEvent:
         assert event['error_code'] == 9999
         assert event['error'] == 'An internal error has occurred.'
         assert 'secret detail' not in json.dumps(event)
+
+
+def test_ollama_model_api_lists_models_from_selected_server(monkeypatch):
+    from flask import Flask
+    import requests
+    import ssrf_guard
+
+    requested = {}
+    monkeypatch.setattr(ssrf_guard, 'validate_outbound_url', lambda _url: (True, None))
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {'models': [
+                {'name': 'qwen3.5:9b'}, {'model': 'llama3.2:latest'}, {'name': 'qwen3.5:9b'},
+            ]}
+
+    def fake_get(url, **kwargs):
+        requested.update(url=url, **kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, 'get', fake_get)
+    flask_app = Flask(__name__)
+    flask_app.register_blueprint(app_chat.chat_bp, url_prefix='/chat')
+    response = flask_app.test_client().post(
+        '/chat/api/ollama_models',
+        json={'server_url': 'http://ollama.local:11434/api/generate'},
+    )
+
+    assert response.status_code == 200
+    assert response.json['models'] == ['llama3.2:latest', 'qwen3.5:9b']
+    assert requested['url'] == 'http://ollama.local:11434/api/tags'
+    assert requested['timeout'] <= 8
+
+
+def test_ollama_model_api_rejects_invalid_url_and_handles_unavailable_server(monkeypatch):
+    from flask import Flask
+    import requests
+    import ssrf_guard
+
+    flask_app = Flask(__name__)
+    flask_app.register_blueprint(app_chat.chat_bp, url_prefix='/chat')
+    client = flask_app.test_client()
+    invalid = client.post('/chat/api/ollama_models', json={'server_url': 'file:///etc/passwd'})
+    assert invalid.status_code == 400
+
+    monkeypatch.setattr(ssrf_guard, 'validate_outbound_url', lambda _url: (True, None))
+    monkeypatch.setattr(requests, 'get', lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()))
+    unavailable = client.post(
+        '/chat/api/ollama_models', json={'server_url': 'http://ollama.local:11434'}
+    )
+    assert unavailable.status_code == 502
+    assert unavailable.json['models'] == []

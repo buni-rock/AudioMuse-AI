@@ -401,6 +401,137 @@ def build_tool_calls_schema(tools: List[Dict]) -> Dict:
     }
 
 
+def build_playlist_plan_tool(tools: List[Dict], retrieval_only: bool = False) -> Dict:
+    """Require structured user intent alongside the complete retrieval plan."""
+    call_branches = []
+    for tool in tools:
+        name = tool.get('name')
+        if not name:
+            continue
+        call_branches.append({
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "name": {"type": "string", "enum": [name]},
+                "arguments": copy.deepcopy(tool.get('inputSchema') or {"type": "object"}),
+            },
+            "required": ["name", "arguments"],
+        })
+    nullable_string = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    anchor_schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "type": {"type": "string", "enum": ["song", "artist", "album"]},
+            "title": nullable_string, "artist": nullable_string,
+            "name": nullable_string, "album": nullable_string,
+            "role": {"type": "string", "enum": ["anchor", "mandatory", "include", "reference_only", "exclusion", "preferred_artist", "style_reference", "start", "destination"]},
+            "include_in_final": {"type": "boolean"},
+        },
+        "required": ["type", "title", "artist", "name", "album", "role", "include_in_final"],
+    }
+    count_schema = {"anyOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": False,
+         "properties": {"mode": {"type": "string", "enum": ["total", "additional"]},
+                        "value": {"type": "integer", "minimum": 1}},
+         "required": ["mode", "value"]},
+    ]}
+    nullable_integer = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    constraints_schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "genres": {"type": "array", "items": {"type": "string"}},
+            "moods": {"type": "array", "items": {"type": "string"}},
+            "voices": {"type": "array", "items": {"type": "string"}},
+            "year_min": nullable_integer, "year_max": nullable_integer,
+            "energy_min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "energy_max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "tempo_min": nullable_integer, "tempo_max": nullable_integer,
+            "exclude_artists": {"type": "array", "items": {"type": "string"}},
+            "exclude_genres": {"type": "array", "items": {"type": "string"}},
+            "max_per_artist": nullable_integer,
+            "artist": nullable_string,
+            "allow_multiple_versions": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+        },
+        "required": ["genres", "moods", "voices", "year_min", "year_max", "energy_min", "energy_max", "tempo_min", "tempo_max", "exclude_artists", "exclude_genres", "max_per_artist", "artist", "allow_multiple_versions"],
+    }
+    intent_schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "anchors": {"type": "array", "items": anchor_schema},
+            "count": count_schema,
+            "duration_seconds": nullable_integer,
+            "constraints": constraints_schema,
+            "playlist_intent": {"type": "string"},
+            "activity": nullable_string,
+            "lyrical_theme": nullable_string,
+            "transition_intent": nullable_string,
+            "ordering_intent": nullable_string,
+            "diversity_intent": nullable_string,
+            "similarity_intent": nullable_string,
+            "retrieval_size_hint": nullable_integer,
+        },
+        "required": ["anchors", "count", "duration_seconds", "constraints", "playlist_intent", "activity", "lyrical_theme", "transition_intent", "ordering_intent", "diversity_intent", "similarity_intent", "retrieval_size_hint"],
+    }
+    if retrieval_only:
+        # In compose mode LLM1 is deliberately unable to return final-playlist
+        # decisions such as inclusion, count semantics, duration, or ordering.
+        retrieval_anchor_schema = {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "type": {"type": "string", "enum": ["song", "artist", "album"]},
+                "title": nullable_string, "artist": nullable_string,
+                "name": nullable_string, "album": nullable_string,
+            },
+            "required": ["type", "title", "artist", "name", "album"],
+        }
+        intent_schema = {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "anchors": {"type": "array", "items": retrieval_anchor_schema},
+            },
+            "required": ["anchors"],
+        }
+    wrapper_schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "intent": intent_schema,
+            "tool_calls": {
+                "type": "array", "minItems": 1,
+                "maxItems": max(12, int(config.AI_MAX_TOOL_CALLS) * 3),
+                "items": {"oneOf": call_branches} if call_branches else {"type": "object"},
+            },
+        }, "required": ["intent", "tool_calls"],
+    }
+    tool_lines = "\n".join(f"- {tool['name']}: {tool.get('description', '')}" for tool in tools)
+    return {
+        "name": "submit_playlist_plan",
+        "description": (
+            (
+                "Plan retrieval only: identify human-readable song, artist, and album references; "
+                "choose AudioMuse retrieval tools. Never decide final playlist "
+                "membership, anchor inclusion, count semantics, duration, exclusions, versions, artist "
+                "limits, or order. Preserve any explicitly supplied song title and artist exactly as written "
+                "in the anchor fields; do not substitute an artist based on outside knowledge. "
+                "Include each song "
+                "reference in seed_search. Retrieval filters may describe requested sound/style.\n"
+            ) if retrieval_only else (
+            "Interpret the complete user request into authoritative structured semantic intent, "
+            "then produce all retrieval/tool calls needed to carry it out. The semantic intent "
+            "must express every named song/artist/album and whether each is mandatory, reference-only, "
+            "excluded, a preferred artist, style reference, start, or destination. Resolve total versus "
+            "additional song counts, explicit duration, filters/exclusions, playlist purpose, and ordering "
+            "intent from the user's meaning. Do not infer semantics in the application from raw wording. "
+            "A seed artist is not an artist filter unless the request independently constrains the artist. "
+            "Set retrieval_size_hint for enough candidates to satisfy the final target after filtering and "
+            "selection; it is independent from the final playlist size. Include every song anchor in "
+            "seed_search and use all applicable retrieval tools. Return one complete plan.\n"
+            )
+            + "Available retrieval tools:\n" + tool_lines
+        ),
+        "inputSchema": wrapper_schema,
+    }
+
+
 def build_ai_brainstorm_prompt(user_request: str) -> str:
     from tasks.ai.vocab import GENRE_VOCAB
 

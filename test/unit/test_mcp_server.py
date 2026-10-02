@@ -633,7 +633,10 @@ class TestToolSurface:
             for array_schema in array_schemas(tool['inputSchema']):
                 seen += 1
                 assert 'uniqueItems' not in array_schema
-                assert 'maxItems' in array_schema
+                if tool['name'] == 'seed_search':
+                    assert 'maxItems' not in array_schema
+                else:
+                    assert 'maxItems' in array_schema
         assert seen
 
     def test_no_llm_facing_get_songs_or_dead_params(self):

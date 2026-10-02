@@ -332,6 +332,148 @@ def _fuzzy_match_author_title(
     }
 
 
+def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Dict]:
+    """Resolve a song title, preferring matches available on the selected server."""
+    title = (song_title or "").strip()
+    artist_hint = (artist_hint or "").strip()
+    # Natural references such as "the Nightwish's song Harvest" carry a
+    # grammatical article, not a different artist identity.
+    artist_hint = re.sub(r"^the\s+", "", artist_hint)
+    if not title:
+        return None
+    db_conn = get_db_connection()
+    try:
+        with db_conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(
+                """SELECT item_id, title, author, album,
+                          COUNT(*) OVER() AS _match_count
+                   FROM public.score
+                   WHERE LOWER(title) = LOWER(%s)
+                   ORDER BY CASE WHEN %s <> '' AND LOWER(COALESCE(author, '')) = LOWER(%s)
+                                 THEN 0 ELSE 1 END,
+                            LENGTH(COALESCE(author, '')), item_id""",
+                (title, artist_hint, artist_hint),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+        if rows:
+            match_count = int(rows[0].get('_match_count', len(rows)) or len(rows))
+            available_ids = set()
+            try:
+                from app_server_context import resolve_request_server_id
+                from tasks.mediaserver import registry
+
+                try:
+                    server_id = resolve_request_server_id()
+                except RuntimeError:  # Utility callers may not have an HTTP request.
+                    server_id = None
+                available_ids = set(registry.translate_ids(
+                    [row['item_id'] for row in rows], server_id, conn=db_conn
+                ))
+            except Exception:
+                logger.warning(
+                    "Could not scope exact song seed matches to the selected server; "
+                    "using deterministic library matching",
+                    exc_info=True,
+                )
+
+            def match_key(row):
+                return (
+                    0 if artist_hint and (row.get('author') or '').casefold() == artist_hint.casefold() else 1,
+                    0 if row['item_id'] in available_ids else 1,
+                    len(row.get('author') or ''),
+                    str(row.get('item_id') or ''),
+                )
+
+            exact_artist_rows = [
+                row for row in rows
+                if artist_hint and _normalize_for_match(row.get('author') or '')
+                == _normalize_for_match(artist_hint)
+            ]
+            # A title-only exact hit is not authoritative when the user
+            # supplied an artist and the exact-title rows belong to somebody
+            # else. Continue to the same-artist title-prefix/fuzzy lookup.
+            matching_rows = exact_artist_rows if artist_hint else rows
+            if matching_rows:
+                resolved = min(matching_rows, key=match_key)
+                resolved.pop('_match_count', None)
+                resolved['_match_count'] = match_count
+                if match_count > 1:
+                    logger.info(
+                        "Song seed title %r matched %d library tracks; selected %r by %r%s%s",
+                        title, match_count, resolved.get('title'), resolved.get('author'),
+                        " using the requested artist hint" if exact_artist_rows else
+                        " using deterministic best match",
+                        "; available on selected server" if resolved.get('item_id') in available_ids else
+                        "; unavailable on selected server",
+                    )
+                return resolved
+            logger.info(
+                "Exact song-title rows for %r did not match requested artist %r; trying same-artist fuzzy resolution",
+                title, artist_hint,
+            )
+        # A title-only mention often omits library annotations such as
+        # “(feat. Eyelar)” or “(PMEDIA)”. Prefer a title-prefix match by the
+        # requested artist before the broad fuzzy search, whose bounded pool can
+        # otherwise be filled by unrelated rows for prolific artists.
+        if artist_hint:
+            normalized_title_prefix = title.casefold().replace('%', r'\%').replace('_', r'\_') + '%'
+            normalized_artist_contains = '%' + artist_hint.casefold().replace('%', r'\%').replace('_', r'\_') + '%'
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute(
+                    """SELECT item_id, title, author, album, COUNT(*) OVER() AS _match_count
+                       FROM public.score
+                       WHERE LOWER(title) LIKE %s ESCAPE '\\'
+                         AND LOWER(COALESCE(author, '')) LIKE %s ESCAPE '\\'
+                       ORDER BY CASE WHEN LOWER(COALESCE(author, '')) = LOWER(%s) THEN 0 ELSE 1 END,
+                                LENGTH(COALESCE(title, '')), item_id
+                       LIMIT 50""",
+                    (normalized_title_prefix, normalized_artist_contains, artist_hint),
+                )
+                prefix_rows = [dict(row) for row in cur.fetchall()]
+            if prefix_rows:
+                available_ids = set()
+                try:
+                    from app_server_context import resolve_request_server_id
+                    from tasks.mediaserver import registry
+
+                    try:
+                        server_id = resolve_request_server_id()
+                    except RuntimeError:
+                        server_id = None
+                    available_ids = set(registry.translate_ids(
+                        [row['item_id'] for row in prefix_rows], server_id, conn=db_conn
+                    ))
+                except Exception:
+                    logger.debug("Could not scope title-prefix song matches", exc_info=True)
+                prefix_rows.sort(key=lambda row: (
+                    0 if row.get('item_id') in available_ids else 1,
+                    0 if (row.get('author') or '').casefold() == artist_hint.casefold() else 1,
+                    len(row.get('title') or ''),
+                    str(row.get('item_id') or ''),
+                ))
+                resolved = prefix_rows[0]
+                logger.info(
+                    "Song title-prefix match: requested=%r by %r resolved=%r by %r",
+                    title, artist_hint, resolved.get('title'), resolved.get('author'),
+                )
+                return resolved
+        match = _fuzzy_match_author_title(db_conn, artist_hint, title)
+        if match:
+            # Artist-only token overlap can score highly while selecting an
+            # entirely different song. Explicit song seeds need title fidelity.
+            from rapidfuzz import fuzz
+            if fuzz.ratio(_normalize_for_match(title), _normalize_for_match(match.get('title'))) < 75:
+                logger.warning("Rejected unrelated fuzzy song seed: %r by %r -> %r by %r",
+                               title, artist_hint, match.get('title'), match.get('author'))
+                return None
+            resolved = dict(match)
+            resolved['_match_count'] = 1
+            return resolved
+        return None
+    finally:
+        db_conn.close()
+
+
 def _normalized_ilike_sql(column: str) -> str:
     hyphen = chr(0x2010)
     return (
@@ -616,6 +758,7 @@ def _text_search_sync(
                 "title": r['title'],
                 "artist": r['author'],
                 "album": r.get('album', ''),
+                "dclap_similarity": r.get('similarity'),
             }
             for r in clap_results
         ]
@@ -668,6 +811,16 @@ def _seed_profile(seeds: List[Dict]) -> Optional[Dict]:
 
 def _journey_end_row(db_conn, seed: Dict, log_messages: List[str]):
     if (seed.get('type') or '').lower() == 'song':
+        seed_id = str(seed.get('track_id') or '').strip()
+        if seed_id:
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute(
+                    "SELECT item_id, title, author, album FROM public.score WHERE item_id = %s",
+                    (seed_id,),
+                )
+                row = cur.fetchone()
+            log_messages.append(f"Journey canonical seed ID: {seed_id}")
+            return row
         return _resolve_song_row(
             db_conn, (seed.get('title') or '').strip(), (seed.get('artist') or '').strip(), log_messages
         )
@@ -721,7 +874,8 @@ def _journey_sync(start_seed: Dict, end_seed: Dict, length: int) -> Dict:
     return {"songs": songs, "message": "\n".join(log_messages)}
 
 
-def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int) -> Dict:
+def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int,
+                              *, seed_id: str = "") -> Dict:
     from tasks.ivf_manager import find_nearest_neighbors_by_id
 
     get_songs = int(get_songs) if get_songs is not None else 100
@@ -741,9 +895,20 @@ def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int)
                 "message": "ERROR: song_similarity requires an artist name! Both title and artist are required.",
             }
 
-        log_messages.append(f"Looking up song in database: '{song_title}' by '{song_artist}'")
-
-        seed = _resolve_song_row(db_conn, song_title, song_artist, log_messages)
+        if seed_id:
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute(
+                    "SELECT item_id, title, author, album FROM public.score WHERE item_id = %s",
+                    (seed_id,),
+                )
+                seed = cur.fetchone()
+            log_messages.append(f"Using canonical AudioMuse seed ID: {seed_id}")
+            if not seed:
+                return {"songs": [], "message": "\n".join(log_messages) +
+                        "\nCanonical seed ID is unavailable in the library"}
+        else:
+            log_messages.append(f"Looking up song in database: '{song_title}' by '{song_artist}'")
+            seed = _resolve_song_row(db_conn, song_title, song_artist, log_messages)
 
         if not seed:
             return {
@@ -763,6 +928,10 @@ def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int)
         )
 
         similar_ids = [r['item_id'] for r in similar_results if r['item_id'] != seed_id][:get_songs]
+        similarity_by_id = {
+            str(row['item_id']): row for row in similar_results
+            if row.get('item_id') != seed_id
+        }
 
         if not similar_ids:
             songs = []
@@ -788,6 +957,7 @@ def _song_similarity_api_sync(song_title: str, song_artist: str, get_songs: int)
                     "title": r['title'],
                     "artist": r['author'],
                     "album": r.get('album', ''),
+                    "musicnn_distance": similarity_by_id.get(str(r['item_id']), {}).get('distance'),
                 }
                 for r in sorted_results
             ]

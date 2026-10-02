@@ -2,6 +2,24 @@
 
 {% block content %}
 <style>
+    #ollamaConfig #refreshOllamaModels {
+        width: auto;
+        min-width: 10rem;
+        flex-grow: 0;
+        margin: 0.45rem 0 0;
+        padding: 0.5rem 0.9rem;
+        color: var(--text-main);
+        background: var(--bg-input);
+        border: 1px solid var(--border-color-darker);
+    }
+    #ollamaConfig #refreshOllamaModels:hover {
+        background: var(--bg-table-hover);
+        border-color: var(--color-primary);
+    }
+    #ollamaConfig #refreshOllamaModels:focus-visible {
+        outline: 2px solid var(--color-primary);
+        outline-offset: 2px;
+    }
     .suggestion-btn {
         padding: 0.15rem 0.25rem !important;
         font-size: 0.88rem !important;
@@ -192,7 +210,15 @@
                             <span class="tooltip-text">The specific AI model running on your Ollama server. Popular choices: mistral:7b, llama2, phi. Larger models give better results but need more RAM.</span>
                         </span>
                     </label>
-                    <input type="text" id="ollamaModel" placeholder="e.g., mistral:7b">
+                    <select id="ollamaModel" aria-describedby="ollamaModelStatus">
+                        <option value="">Load models from server…</option>
+                    </select>
+                    <button type="button" id="refreshOllamaModels" class="btn btn-ghost btn-sm">Refresh models</button>
+                    <p id="ollamaModelStatus" class="form-text" role="status" aria-live="polite"></p>
+                    <div id="ollamaManualModelGroup" class="hidden" style="margin-top: .5rem;">
+                        <label for="ollamaManualModel">Model name</label>
+                        <input type="text" id="ollamaManualModel" placeholder="e.g., qwen3.5:9b">
+                    </div>
                     <div style="margin-top: 1.5rem;">
                         <label for="ollamaServerUrl" class="label-with-tooltip">
                             Ollama Server URL
@@ -273,10 +299,17 @@
                     Number of songs:
                     <span class="info-tooltip">
                         <span class="info-icon"></span>
-                        <span class="tooltip-text" id="numResultsHelp">How many songs the generated playlist should contain. Higher numbers give a longer playlist but may include songs that match your request less closely. Try 50 for a normal playlist, or 20-30 for a quick mix.</span>
+                        <span class="tooltip-text" id="numResultsHelp">Default playlist size when your request does not specify a count. An explicit count in your request takes priority, up to the server's configured maximum.</span>
                     </span>
                 </label>
                 <input id="numResults" name="numResults" type="number" aria-describedby="numResultsHelp" value="{{ instant_playlist_n_results_default }}" min="{{ instant_playlist_n_results_default|min_bound(1) }}" max="{{ instant_playlist_n_results_default|max_bound(instant_playlist_max_n_results) }}" />
+            </div>
+            <div>
+                <label for="selectionMode">Final selection:</label>
+                <select id="selectionMode" name="selection_mode">
+                    <option value="NATIVE" {% if instant_playlist_selection_mode == 'NATIVE' %}selected{% endif %}>Native AudioMuse</option>
+                    <option value="LLM_COMPOSE" {% if instant_playlist_selection_mode in ['LLM_COMPOSE', 'LLM_RERANK', 'LLM_CURATE'] %}selected{% endif %}>LLM Compose</option>
+                </select>
             </div>
         </div>
 
@@ -331,6 +364,10 @@
             const mistralConfigDiv = document.getElementById('mistralConfig');
             const ollamaModelSelect = document.getElementById('ollamaModel');
             const ollamaServerUrlInput = document.getElementById('ollamaServerUrl'); // Added Ollama Server URL input
+            const ollamaModelStatus = document.getElementById('ollamaModelStatus');
+            const ollamaManualModelGroup = document.getElementById('ollamaManualModelGroup');
+            const ollamaManualModelInput = document.getElementById('ollamaManualModel');
+            const refreshOllamaModelsButton = document.getElementById('refreshOllamaModels');
             const openaiModelSelect = document.getElementById('openaiModel');
             const openaiServerUrlInput = document.getElementById('openaiServerUrl');
             const geminiModelSelect = document.getElementById('geminiModel');
@@ -338,6 +375,7 @@
             const playlistForm = document.getElementById('playlistForm');
             const userInput = document.getElementById('userInput');
             const numResultsInput = document.getElementById('numResults');
+            const selectionModeInput = document.getElementById('selectionMode');
             const submitButton = document.getElementById('submitChat');
             const responseArea = document.getElementById('responseArea');
             const submitButtonText = submitButton.querySelector('span');
@@ -374,8 +412,7 @@
                     aiProviderSelect.value = globalConfig.default_ai_provider.toUpperCase();
                 }
 
-                // ollamaModelSelect.innerHTML = ''; // Not needed for input field
-                ollamaModelSelect.value = globalConfig.default_ollama_model_name || ""; // Set default value for input
+                ollamaManualModelInput.value = globalConfig.default_ollama_model_name || "";
                 ollamaServerUrlInput.value = globalConfig.ollama_server_url || "http://localhost:11434/api/generate"; // Pre-fill Ollama Server URL
 
                 openaiModelSelect.value = globalConfig.default_openai_model_name || ""; // Set default value for OpenAI
@@ -402,6 +439,7 @@
                     openaiConfigDiv.classList.add('hidden');
                     geminiConfigDiv.classList.add('hidden');
                     mistralConfigDiv.classList.add('hidden');
+                    if (globalConfig) loadOllamaModels();
                 } else if (provider === 'OPENAI') {
                     ollamaConfigDiv.classList.add('hidden');
                     openaiConfigDiv.classList.remove('hidden');
@@ -425,6 +463,65 @@
                 }
             }
 
+            function currentOllamaModel() {
+                return ollamaModelSelect.value === '__manual__'
+                    ? ollamaManualModelInput.value.trim()
+                    : ollamaModelSelect.value;
+            }
+
+            async function loadOllamaModels() {
+                const selectedBeforeLoad = currentOllamaModel() || ollamaManualModelInput.value.trim();
+                ollamaModelStatus.textContent = 'Loading models from Ollama…';
+                refreshOllamaModelsButton.disabled = true;
+                ollamaModelSelect.disabled = true;
+                try {
+                    const response = await fetch("{{ url_for('chat_bp.ollama_models_api') }}", {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ server_url: ollamaServerUrlInput.value.trim() })
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+                    const models = Array.isArray(data.models) ? data.models : [];
+                    ollamaModelSelect.innerHTML = '';
+                    models.forEach(name => {
+                        const option = document.createElement('option');
+                        option.value = name;
+                        option.textContent = name;
+                        ollamaModelSelect.appendChild(option);
+                    });
+                    const manualOption = document.createElement('option');
+                    manualOption.value = '__manual__';
+                    manualOption.textContent = 'Enter model name manually…';
+                    ollamaModelSelect.appendChild(manualOption);
+
+                    if (selectedBeforeLoad && models.includes(selectedBeforeLoad)) {
+                        ollamaModelSelect.value = selectedBeforeLoad;
+                        ollamaManualModelGroup.classList.add('hidden');
+                    } else {
+                        ollamaModelSelect.value = '__manual__';
+                        if (selectedBeforeLoad) ollamaManualModelInput.value = selectedBeforeLoad;
+                        ollamaManualModelGroup.classList.remove('hidden');
+                    }
+                    ollamaModelStatus.textContent = models.length
+                        ? `Loaded ${models.length} model${models.length === 1 ? '' : 's'} from this server.`
+                        : 'No models were listed. Enter a model name manually.';
+                } catch (error) {
+                    ollamaModelSelect.innerHTML = '<option value="__manual__">Enter model name manually…</option>';
+                    ollamaModelSelect.value = '__manual__';
+                    if (selectedBeforeLoad) ollamaManualModelInput.value = selectedBeforeLoad;
+                    ollamaManualModelGroup.classList.remove('hidden');
+                    ollamaModelStatus.textContent = `Could not load models: ${error.message}. Enter a model name manually.`;
+                } finally {
+                    ollamaModelSelect.disabled = false;
+                    refreshOllamaModelsButton.disabled = false;
+                }
+            }
+
+            function updateOllamaManualModelVisibility() {
+                ollamaManualModelGroup.classList.toggle('hidden', ollamaModelSelect.value !== '__manual__');
+            }
+
             /**
              * Handles the form submission to the chat API.
              * @param {Event} event - The form submission event.
@@ -444,11 +541,12 @@
                     userInput: userInput.value,
                     ai_provider: aiProviderSelect.value,
                     ai_model: null,
+                    selection_mode: selectionModeInput.value,
                     n: Math.min(Math.max(Number.isNaN(nInput) ? defaultN : nInput, 1), maxN)
                 };
 
                 if (payload.ai_provider === 'OLLAMA') {
-                    payload.ai_model = ollamaModelSelect.value;
+                    payload.ai_model = currentOllamaModel();
                     payload.ollama_server_url = ollamaServerUrlInput.value; // Include Ollama Server URL
                 } else if (payload.ai_provider === 'OPENAI') {
                     payload.ai_model = openaiModelSelect.value;
@@ -500,6 +598,14 @@
                 } catch (e) {
                     if (idleTimer) clearTimeout(idleTimer);
                     await fallbackChat(payload);
+                    return;
+                }
+
+                // API requests can lose authentication while the page is still
+                // open. Do not parse the login response as an empty SSE stream.
+                if (res.status === 401) {
+                    if (idleTimer) clearTimeout(idleTimer);
+                    window.location.assign("{{ url_for('login_page') }}");
                     return;
                 }
 
@@ -597,80 +703,91 @@
             // ---- Live stepper (real progress, driven by streamed log events) ----
 
             const LIVE_TITLES = {
-                understand: 'Understood your request',
-                tools: 'Picked the tools',
-                found: 'Found candidate songs',
-                filter: 'Applied your filters',
-                assemble: 'Built the playlist'
+                planner: 'Interpreted request',
+                retrieval: 'Retrieved candidates',
+                selection: 'Composed playlist',
+                rules: 'Applied playlist rules'
             };
             const LIVE_ICONS = {
-                understand: '🧭', tools: '🛠️', found: '🔎', filter: '🎚️', assemble: '🎼'
+                planner: '🧭', retrieval: '🔎', selection: '🧠', rules: '🎼'
             };
             const LIVE_PENDING = {
-                understand: 'Reading your request…',
-                tools: 'Choosing the right tools…',
-                found: 'Searching your library…',
-                filter: 'Applying your filters…',
-                assemble: 'Assembling the playlist…'
+                planner: 'Planning searches for useful candidates…',
+                retrieval: 'Searching your library…',
+                selection: 'Composing a playlist from retrieved candidates…',
+                rules: 'Applying playlist rules…'
             };
 
-            function understandHeadline(m) {
-                let h = m.reasoning ? m.reasoning : 'Read your request.';
-                if (m.hints.length) h += ' · Also spotted: ' + m.hints.join('; ');
-                return h;
-            }
-            function toolsHeadline(m) {
-                let toolList = m.composition ? m.primaries.slice() : m.seqTools.slice();
-                if (m.composition && m.compositionHasFilter && toolList.indexOf('search_database') === -1) toolList.push('search_database');
-                if (!toolList.length) return 'Selected the tools.';
-                return 'Using ' + toolList.map(n => TOOL_LABEL[n] || n).join(' + ') + '.';
-            }
-            function foundHeadline(m) {
-                if (m.composition && m.poolSize != null) return 'Gathered ' + m.poolSize + ' candidate songs.';
-                if (!m.composition && m.seqRetrieved > 0) return 'Retrieved ' + m.seqRetrieved + ' songs (' + m.seqAdded + ' new).';
-                return LIVE_PENDING.found;
-            }
-            function filterHeadline(m) {
-                if (m.categoricalPriority) {
-                    const sp = splitDims(m.filterDims);
-                    const catText = sp.cat.length ? sp.cat.join(' + ') : 'your filters';
-                    const contText = sp.cont.length ? sp.cont.join(' + ') : 'similarity';
-                    if (m.matched === 0) return 'No song has the requested ' + catText + ' - ordered by ' + contText + ' instead.';
-                    return 'Ranked ' + catText + ' first - ' + m.matched + ' of ' + m.total + ' match; rest ordered by ' + contText + '.';
+            function plannerHeadline(m) {
+                const pieces = [];
+                if (m.selectedTools && m.selectedTools.length) {
+                    const labels = m.selectedTools;
+                    const operation = labels.length === 1
+                        ? labels[0]
+                        : labels.slice(0, -1).join(', ') + ' and ' + labels[labels.length - 1];
+                    let detail = 'Selected ' + operation;
+                    if (m.selectedTools.indexOf('seed_search') >= 0 && m.songAnchorCount != null) {
+                        detail += ' with ' + m.songAnchorCount + ' song' + (m.songAnchorCount === 1 ? '' : 's');
+                    } else if (m.selectedTools.length > 1) {
+                        detail = 'Selected ' + m.selectedTools.length + ' retrieval operations';
+                    }
+                    pieces.push(detail);
                 }
-                const dims = humanDims(m.filterDims);
-                const dimText = dims.length ? dims.join(' + ') : 'your filters';
-                if (m.matched === 0) return 'Checked ' + dimText + ', no song matched - kept similarity order.';
-                if (m.moved === 0 && (m.matched != null || m.filterUnchanged)) return 'Checked ' + dimText + ' - ranking already optimal.';
-                if (m.moved != null) return 'Re-ranked by ' + dimText + ' - ' + (m.matched || 0) + ' of ' + (m.total || m.poolSize || '?') + ' matched and moved to the top.';
-                return LIVE_PENDING.filter;
+                if (!pieces.length && m.intentSummary) pieces.push(m.intentSummary);
+                return pieces.length ? pieces.join(' · ') : (m.reasoning || LIVE_PENDING.planner);
             }
-            function assembleHeadline(m) {
-                if (m.funnel) {
-                    let h = 'Trimmed ' + m.funnel.a + ' → ' + m.funnel.c + ' songs';
-                    const ex = [];
-                    if (m.diversityRemoved > 0) ex.push('artist variety');
-                    if (m.filterRankedOrder) ex.push('matched songs first');
-                    else if (m.ordered) ex.push('smooth tempo/energy flow');
-                    if (ex.length) h += ' with ' + ex.join(' and ');
-                    return h + '.';
+            function retrievalHeadline(m) {
+                if (m.candidatesRetrieved != null) {
+                    const seeds = m.seedNeighborhoods ? ' from ' + m.seedNeighborhoods + ' seeds' : '';
+                    return m.candidatesRetrieved + ' unique songs found' + seeds + '.';
                 }
-                if (m.planningFailed) return "The AI couldn't build a plan for this request - try rephrasing it.";
-                if (m.noSongs) return 'No songs matched this request.';
-                return LIVE_PENDING.assemble;
+                return LIVE_PENDING.retrieval;
+            }
+            function selectionHeadline(m) {
+                const evaluated = m.llmShortlisted != null ? m.llmShortlisted + ' candidates evaluated' : 'Candidates evaluated';
+                if (m.llmFailed) return m.llmFailure || 'Playlist composition failed.';
+                return m.llmActionCount != null
+                    ? evaluated + ' · ' + m.llmActionCount + ' tracks selected.'
+                    : evaluated + '.';
+            }
+            function rulesHeadline(m) {
+                if (m.planningFailed) return m.planningFailure || 'The AI planner could not run.';
+                if (m.llmFailed) return 'No Composer result was available; validation was skipped.';
+                if (m.responseReady && m.finalCount === 0) return 'No playlist was delivered. See the error below.';
+                const finalCount = m.finalCount != null ? m.finalCount : (m.funnel ? m.funnel.c : m.collected);
+                const mandatory = m.composerAnchorsTotal > 0
+                    ? m.composerAnchorsPresent + ' of ' + m.composerAnchorsTotal + ' requested anchors preserved'
+                    : (m.mandatoryTotal > 0
+                        ? m.mandatoryPresent + ' of ' + m.mandatoryTotal + ' requested songs preserved'
+                        : null);
+                const count = finalCount != null ? finalCount + ' tracks finalized' : LIVE_PENDING.rules;
+                const details = [mandatory, count].filter(Boolean).join(' · ');
+                return details;
+            }
+            function durationSummary(m) {
+                const parts = [];
+                const retrieved = m.candidatesRetrieved != null ? m.candidatesRetrieved : m.seqRetrieved;
+                if (retrieved > 0) parts.push('Retrieved ' + retrieved + ' songs');
+                if (m.llmShortlisted != null) parts.push('shortlisted ' + m.llmShortlisted + ' for LLM');
+                if (m.llmActionCount != null) parts.push(m.llmAction + ' ' + m.llmActionCount);
+                const minutes = m.targetDuration / 60;
+                const target = Number.isInteger(minutes) ? minutes + '-minute' : Math.floor(minutes) + ':' + String(m.targetDuration % 60).padStart(2, '0');
+                parts.push('selected ' + m.durationSelected + ' for the ' + target + ' target');
+                return parts.join(' · ') + '.';
             }
 
             /** Ordered live-step descriptors for the current parsed model. */
             function liveStepDefs(m) {
                 const defs = [
-                    { id: 'understand', done: (m.reasoning != null || m.emitted != null), headline: understandHeadline },
-                    { id: 'tools', done: m.emitted != null, headline: toolsHeadline },
-                    { id: 'found', done: (m.composition && m.poolSize != null) || (!m.composition && m.seqRetrieved > 0), headline: foundHeadline }
+                    { id: 'planner', done: m.selectedTools != null || m.emitted != null, headline: plannerHeadline },
+                    { id: 'retrieval', done: m.candidatesRetrieved != null, headline: retrievalHeadline }
                 ];
-                if (m.composition && m.compositionHasFilter) {
-                    defs.push({ id: 'filter', done: (m.moved != null || m.filterUnchanged || m.matched != null), headline: filterHeadline });
+                if (m.selectionMode && m.selectionMode !== 'NATIVE') {
+                    const title = m.llmFailed ? 'Playlist composition failed' : 'Composed playlist';
+                    defs.push({ id: 'selection', done: Number.isFinite(m.stageSeconds.selection) || m.llmActionCount != null || m.llmFailed, headline: selectionHeadline, title });
                 }
-                defs.push({ id: 'assemble', done: (m.funnel != null || m.success || m.noSongs || m.planningFailed), headline: assembleHeadline });
+                defs.push({ id: 'rules', done: (m.responseReady || m.noSongs || m.planningFailed || m.llmFailed), headline: rulesHeadline,
+                    title: m.planningFailed ? 'Planning failed' : (m.llmFailed ? 'Validation skipped' : (m.responseReady && m.finalCount === 0 ? 'Playlist unavailable' : 'Validated playlist')) });
                 return defs;
             }
 
@@ -685,7 +802,7 @@
                 body.className = 'pipeline-step-body';
                 const title = document.createElement('p');
                 title.className = 'pipeline-step-title';
-                title.textContent = LIVE_TITLES[def.id];
+                title.textContent = def.title || LIVE_TITLES[def.id];
                 if (timeText) {
                     const time = document.createElement('span');
                     time.className = 'pipeline-step-time';
@@ -727,7 +844,7 @@
                     let timeText = '';
                     if (statuses[i] === 'done') {
                         const at = liveState.doneAt[d.id] != null ? liveState.doneAt[d.id] : now;
-                        timeText = ((at - cursor) / 1000).toFixed(1) + 's';
+                        timeText = Number.isFinite(m.stageSeconds[d.id]) ? m.stageSeconds[d.id].toFixed(1) + 's' : ((at - cursor) / 1000).toFixed(1) + 's';
                         cursor = at;
                     } else if (statuses[i] === 'active') {
                         timeText = ((now - cursor) / 1000).toFixed(1) + 's';
@@ -828,18 +945,59 @@
                     request: null, provider: null,
                     reasoning: null, hints: [],
                     emitted: null,
-                    composition: false, compositionHasFilter: false, primaries: [], seqTools: [], poolSize: null,
+                    selectedTools: null, intentSummary: null, selectionMode: null,
+                    songAnchorCount: null,
+                    seedNeighborhoods: null, llmFailed: false, llmFailure: null,
+                    mandatoryPresent: null, mandatoryTotal: null, finalCount: null,
+                    composition: false, compositionHasFilter: false, primaries: [], seqTools: [], poolSize: null, stageSeconds: {},
                     seqRetrieved: 0, seqAdded: 0,
                     filterRan: false, filterDims: [], relaxSteps: [],
                     matched: null, total: null, moved: null, filterUnchanged: false, categoricalPriority: false,
                     collected: null, diversityRemoved: 0, ratingRemoved: 0,
+                    candidatesRetrieved: null, llmShortlisted: null, llmActionCount: null, llmAction: '',
+                    durationSelected: null, targetDuration: null,
                     funnel: null, ordered: false, filterRankedOrder: false,
-                    success: false, noSongs: false, planningFailed: false, notesPlain: null
+                    success: false, responseReady: false, noSongs: false, planningFailed: false, planningFailure: null, notesPlain: null
                 };
                 for (const raw of lines) {
                     const t = raw.trim();
                     if (!t) continue;
                     let m;
+                    if ((m = t.match(/^Planner wall-clock:\s*([\d.]+)s$/i))) model.stageSeconds.planner = (model.stageSeconds.planner || 0) + Number.parseFloat(m[1]);
+                    else if ((m = t.match(/^Retrieval wall-clock:\s*([\d.]+)s$/i))) model.stageSeconds.retrieval = (model.stageSeconds.retrieval || 0) + Number.parseFloat(m[1]);
+                    else if ((m = t.match(/^(?:LLM selection|Playlist composition) wall-clock:\s*([\d.]+)s$/i))) model.stageSeconds.selection = Number.parseFloat(m[1]);
+                    else if ((m = t.match(/^Playlist rules wall-clock:\s*([\d.]+)s$/i))) model.stageSeconds.rules = Number.parseFloat(m[1]);
+                    else if ((m = t.match(/^Candidates retrieved:\s*(\d+)$/i))) model.candidatesRetrieved = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^(?:Shortlisted for LLM|Candidates sent to LLM2):\s*(\d+)$/i))) model.llmShortlisted = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^(LLM ranked|LLM selected):\s*(\d+)$/i))) { model.llmAction = m[1]; model.llmActionCount = Number.parseInt(m[2], 10); }
+                    else if ((m = t.match(/^Composed playlist:\s*(\d+) candidates evaluated;\s*(\d+) tracks selected/i))) { model.llmShortlisted = Number.parseInt(m[1], 10); model.llmAction = 'Composed'; model.llmActionCount = Number.parseInt(m[2], 10); }
+                    else if ((m = t.match(/^Composer result: playlist IDs returned=(\d+)/i))) { model.llmAction = 'Selected'; model.llmActionCount = Number.parseInt(m[1], 10); }
+                    else if ((m = t.match(/^Playlist response ready:\s*(\d+) tracks/i))) { model.responseReady = true; model.finalCount = Number.parseInt(m[1], 10); }
+                    else if ((m = t.match(/^Selection mode:\s*(LLM_COMPOSE|LLM_RERANK|LLM_CURATE|NATIVE)/i))) model.selectionMode = m[1].toUpperCase();
+                    else if ((m = t.match(/^Playlist composition failed:\s*([A-Z_]+)/i))) {
+                        model.llmFailed = true;
+                        model.llmFailure = m[1].toUpperCase() === 'TIMEOUT'
+                            ? (model.candidatesRetrieved != null
+                                ? model.candidatesRetrieved + ' candidate songs were found, but the LLM composer timed out before it could build the final playlist.'
+                                : 'The LLM composer timed out before it could build the final playlist.')
+                            : 'LLM Compose failed: ' + m[1].toUpperCase() + '.';
+                    }
+                    else if (/^LLM curator failed: no exact valid candidate IDs/i.test(t)) { model.llmFailed = true; model.llmFailure = 'No valid candidate response; native fallback used.'; }
+                    else if ((m = t.match(/^LLM curator failed:\s*(.*)$/i))) { model.llmFailed = true; model.llmFailure = 'LLM selection failed: ' + (m[1] || 'no valid response') + '; native fallback used.'; }
+                    else if (/^LLM rerank unusable:/i.test(t)) { model.llmFailed = true; model.llmFailure = 'No valid ranked candidate response; native fallback used.'; }
+                    else if (/^LLM selection unusable:/i.test(t)) { model.llmFailed = true; model.llmFailure = 'The LLM candidate pool could not satisfy the requested count; full native fallback used.'; }
+                    else if ((m = t.match(/^Selected retrieval tools:\s*(.*)$/i))) model.selectedTools = m[1] && m[1] !== 'none' ? m[1].split(',').map(s => s.trim()) : [];
+                    else if ((m = t.match(/^Planner retrieval summary:\s*(\d+) song anchors;\s*size hint=(\d+)/i))) {
+                        const nAnchors = Number.parseInt(m[1], 10), value = Number.parseInt(m[2], 10);
+                        model.songAnchorCount = nAnchors;
+                        model.intentSummary = nAnchors + ' song anchors identified · retrieval budget ' + value;
+                    }
+                    else if ((m = t.match(/^Seed neighborhoods represented at retrieval:\s*(\d+)/i))) model.seedNeighborhoods = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^Composer anchors preserved:\s*(\d+)\/(\d+)/i))) { model.composerAnchorsPresent = Number.parseInt(m[1], 10); model.composerAnchorsTotal = Number.parseInt(m[2], 10); }
+                    else if ((m = t.match(/^Mandatory tracks present in final playlist:\s*(\d+)\/(\d+)/i))) { model.mandatoryPresent = Number.parseInt(m[1], 10); model.mandatoryTotal = Number.parseInt(m[2], 10); }
+                    else if ((m = t.match(/^OK SUCCESS! Generated playlist with\s*(\d+) songs/i))) { model.success = true; model.finalCount = Number.parseInt(m[1], 10); }
+                    else if ((m = t.match(/^Selected for duration target:\s*(\d+) songs$/i))) model.durationSelected = Number.parseInt(m[1], 10);
+                    else if ((m = t.match(/^Target duration:\s*(\d+) s$/i))) model.targetDuration = Number.parseInt(m[1], 10);
                     const reasoningMatch = t.match(/^AI reasoning:(.+)$/);
                     const roseMatch = t.match(/re-rank:\s*(\d+)\/(\d+)\s*matched the filter and rose to the top;\s*(\d+)\s*songs shifted/i);
                     if ((m = t.match(/^Request:\s*'(.*)'$/))) model.request = m[1];
@@ -880,7 +1038,7 @@
                     else if (/kept in filter-ranked order/i.test(t)) model.filterRankedOrder = true;
                     else if (/SUCCESS! Generated playlist/i.test(t)) model.success = true;
                     else if (/No songs collected/i.test(t)) model.noSongs = true;
-                    else if (/AI planning failed/i.test(t)) model.planningFailed = true;
+                    else if ((m = t.match(/^AI planning failed:\s*(.*)$/i))) { model.planningFailed = true; model.planningFailure = m[1]; }
                     else if (/No AI provider selected/i.test(t)) model.notesPlain = t;
                     else if (/API key is missing/i.test(t)) model.notesPlain = t;
                 }
@@ -905,78 +1063,13 @@
                     return steps;
                 }
 
-                // 1. Understood your request
-                const h1 = model.reasoning ? model.reasoning : 'Read your request.';
-                const step1 = { icon: '🧭', title: 'Understood your request', headline: h1 };
-                if (model.hints.length) step1.sub = 'Also spotted: ' + model.hints.join('; ');
-                steps.push(step1);
-
-                // 2. Picked the tools
-                let toolList = model.composition ? model.primaries.slice() : model.seqTools.slice();
-                if (model.composition && model.filterRan && toolList.indexOf('search_database') === -1) toolList.push('search_database');
-                if (toolList.length) {
-                    const friendly = toolList.map(n => TOOL_LABEL[n] || n);
-                    steps.push({ icon: '🛠️', title: 'Picked the tools', headline: 'Using ' + friendly.join(' + ') + '.' });
-                }
-
-                // 3. Found candidate songs
-                if (model.composition && model.poolSize != null) {
-                    steps.push({ icon: '🔎', title: 'Found candidate songs', headline: 'Gathered ' + model.poolSize + ' candidate songs from your seeds.' });
-                } else if (!model.composition && model.seqRetrieved > 0) {
-                    const step3 = { icon: '🔎', title: 'Found candidate songs', headline: 'Retrieved ' + model.seqRetrieved + ' songs (' + model.seqAdded + ' new added to the pool).' };
-                    if (model.relaxSteps.length) {
-                        const last = model.relaxSteps[model.relaxSteps.length - 1];
-                        step3.sub = 'Loosened the match threshold to ' + last.th + ' to reach enough songs.';
-                    }
-                    steps.push(step3);
-                }
-
-                // 4. Applied your filters (composition re-rank only)
-                if (model.filterRan && model.composition) {
-                    const dims = humanDims(model.filterDims);
-                    const dimText = dims.length ? dims.join(' + ') : 'your filters';
-                    let h4, variant;
-                    if (model.categoricalPriority) {
-                        const sp = splitDims(model.filterDims);
-                        const catText = sp.cat.length ? sp.cat.join(' + ') : 'your filters';
-                        const contText = sp.cont.length ? sp.cont.join(' + ') : 'similarity';
-                        if (model.matched === 0) {
-                            h4 = 'No song has the requested ' + catText + ' - ordered by ' + contText + ' instead.';
-                            variant = 'warn';
-                        } else {
-                            h4 = 'Ranked ' + catText + ' first - ' + model.matched + ' of ' + (model.total || model.poolSize || '?') + ' match; rest ordered by ' + contText + '.';
-                        }
-                    } else if (model.filterUnchanged || model.moved === 0) {
-                        if (model.matched === 0) {
-                            h4 = 'Checked ' + dimText + ', but no song matched - kept the pure similarity order.';
-                        } else {
-                            h4 = 'Checked ' + dimText + ' (' + (model.matched || 0) + ' matched), ranking already optimal - no song moved.';
-                        }
-                        variant = 'warn';
-                    } else {
-                        h4 = 'Re-ranked by ' + dimText + ' - ' + (model.matched || 0) + ' of ' + (model.total || model.poolSize || '?') + ' matched and moved to the top.';
-                    }
-                    steps.push({ icon: '🎚️', title: 'Applied your filters', headline: h4, variant: variant });
-                }
-
-                // 5. Built the playlist
-                if (model.funnel) {
-                    let h5 = 'Trimmed ' + model.funnel.a + ' → ' + model.funnel.c + ' songs';
-                    const extras = [];
-                    if (model.diversityRemoved > 0) extras.push('artist variety');
-                    if (model.filterRankedOrder) extras.push('matched songs first');
-                    else if (model.ordered) extras.push('smooth tempo/energy flow');
-                    if (extras.length) h5 += ' with ' + extras.join(' and ');
-                    h5 += '.';
-                    const step5 = { icon: '🎼', title: 'Built the playlist', headline: h5, variant: 'success' };
-                    if (model.ratingRemoved > 0) step5.sub = 'Removed ' + model.ratingRemoved + ' songs below your rating threshold.';
-                    steps.push(step5);
-                } else if (model.planningFailed) {
-                    steps.push({ icon: '⚠️', title: 'Planning failed', headline: "The AI couldn't build a plan for this request - try rephrasing it.", variant: 'warn' });
-                } else if (model.noSongs) {
-                    steps.push({ icon: '😕', title: 'No songs found', headline: 'Nothing matched this request. Try naming a song/artist or loosening filters.', variant: 'warn' });
-                }
-
+                liveStepDefs(model).forEach(def => {
+                    if (!def.done && model.planningFailed) return;
+                    const headline = def.headline(model);
+                    steps.push({ icon: LIVE_ICONS[def.id], title: def.title || LIVE_TITLES[def.id], headline, time: Number.isFinite(model.stageSeconds[def.id]) ? model.stageSeconds[def.id].toFixed(1) + 's' : '', variant: model.llmFailed && def.id === 'selection' ? 'warn' : (def.id === 'rules' && model.success ? 'success' : undefined) });
+                });
+                if (model.planningFailed) steps.push({ icon: '⚠️', title: 'Planning failed', headline: "The AI couldn't build a plan for this request - try rephrasing it.", variant: 'warn' });
+                else if (model.noSongs) steps.push({ icon: '😕', title: 'No songs found', headline: 'Nothing matched this request. Try naming a song/artist or loosening filters.', variant: 'warn' });
                 return steps;
             }
 
@@ -992,7 +1085,19 @@
                 const title = document.createElement('p');
                 title.className = 'pipeline-step-title';
                 title.textContent = step.title;
+                if (step.time) {
+                    const time = document.createElement('span');
+                    time.className = 'pipeline-step-time';
+                    time.textContent = step.time;
+                    title.appendChild(time);
+                }
                 body.appendChild(title);
+                if (step.time) {
+                    const time = document.createElement('span');
+                    time.className = 'pipeline-step-time';
+                    time.textContent = step.time;
+                    title.appendChild(time);
+                }
                 const headline = document.createElement('p');
                 headline.className = 'pipeline-step-headline';
                 headline.textContent = step.headline;
@@ -1049,6 +1154,7 @@
              * whatever stepper is already in the response area (live or static).
              */
             function renderFinalSections(responseData) {
+                responseData = responseData || {};
                 const logText = responseData.message || "No message from AI.";
 
                 // --- Tool chain (friendly node labels) ---
@@ -1141,12 +1247,12 @@
                     resultsDiv.appendChild(songScroll);
                     responseArea.appendChild(resultsDiv);
                     createPlaylistSection.classList.remove('hidden'); // Show the create playlist form
-                } else if (responseData.executed_query) {
+                } else {
                      const noResultsMessage = document.createElement('p');
                     noResultsMessage.className = 'italic';
                     noResultsMessage.style.marginTop = '1rem';
-                    noResultsMessage.style.color = cv('--text-muted');
-                    noResultsMessage.textContent = "The query returned no songs.";
+                    noResultsMessage.style.color = cv('--color-danger');
+                    noResultsMessage.textContent = responseData.shortfall_reason || 'No playlist was delivered. Check the technical details for the reason.';
                     responseArea.appendChild(noResultsMessage);
                 }
             }
@@ -1217,6 +1323,11 @@
             // --- Event Listeners ---
             document.addEventListener('DOMContentLoaded', fetchConfig);
             aiProviderSelect.addEventListener('change', updateAIProviderVisibility);
+            ollamaServerUrlInput.addEventListener('change', () => {
+                if (aiProviderSelect.value === 'OLLAMA') loadOllamaModels();
+            });
+            ollamaModelSelect.addEventListener('change', updateOllamaManualModelVisibility);
+            refreshOllamaModelsButton.addEventListener('click', loadOllamaModels);
             playlistForm.addEventListener('submit', handleChatSubmit);
             createPlaylistForm.addEventListener('submit', handleCreateMediaServerPlaylist);
             

@@ -1756,14 +1756,33 @@ MOOD_SIMILARITY_ENABLE = os.environ.get("MOOD_SIMILARITY_ENABLE", "False").lower
 ENABLE_PROXY_FIX = os.environ.get("ENABLE_PROXY_FIX", "False").lower() == "true"
 
 # --- Instant Playlist Optimization ---
-# How many songs the instant playlist targets when the caller sends no count, and
-# the ceiling the chat page puts on its own input box. The max is a FRONTEND-only
-# bound (the input's max= attribute): the API applies the default and the floor of
-# 1 but never the ceiling, so a direct API caller can ask for any number.
+# Native API default and chat UI default are separate. The chat input maximum is
+# frontend-only for Native mode; LLM modes also enforce their server-side cap.
 INSTANT_PLAYLIST_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_DEFAULT_N_RESULTS", "50"))
+# Default shown in the chat UI; kept separate so native API defaults remain stable.
+INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_UI_DEFAULT_N_RESULTS", "25"))
 INSTANT_PLAYLIST_MAX_N_RESULTS = int(os.environ.get("INSTANT_PLAYLIST_MAX_N_RESULTS", "200"))
 # Max songs from a single artist in the instant playlist (diversity enforcement)
 MAX_SONGS_PER_ARTIST_PLAYLIST = int(os.environ.get("MAX_SONGS_PER_ARTIST_PLAYLIST", "5"))
+# Optional final curation over a bounded set of grounded AudioMuse candidates.
+INSTANT_PLAYLIST_SELECTION_MODE = os.environ.get("INSTANT_PLAYLIST_SELECTION_MODE", "NATIVE").upper()
+if INSTANT_PLAYLIST_SELECTION_MODE in {"LLM_RERANK", "LLM_CURATE"}:
+    INSTANT_PLAYLIST_SELECTION_MODE = "LLM_COMPOSE"
+if INSTANT_PLAYLIST_SELECTION_MODE not in {"NATIVE", "LLM_COMPOSE"}:
+    INSTANT_PLAYLIST_SELECTION_MODE = "NATIVE"
+# Zero means no configured composer cap. When set, reduction is balanced across
+# per-seed neighborhoods and logged before the broad pool is sent to LLM2.
+INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES = max(
+    0, int(os.environ.get("INSTANT_PLAYLIST_COMPOSER_MAX_CANDIDATES", "300"))
+)
+INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE = max(2048, int(os.environ.get("INSTANT_PLAYLIST_COMPOSER_CONTEXT_SIZE", "32768")))
+COMPOSER_MAX_OUTPUT_TOKENS = max(1, int(os.environ.get("COMPOSER_MAX_OUTPUT_TOKENS", "8192")))
+INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS = max(
+    0, int(os.environ.get("INSTANT_PLAYLIST_COMPOSER_TIMEOUT_SECONDS", str(AI_REQUEST_TIMEOUT_SECONDS)))
+)
+INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES = max(1, int(os.environ.get("INSTANT_PLAYLIST_DURATION_OPTIMIZER_CANDIDATES", "100")))
+INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS = max(0, int(os.environ.get("INSTANT_PLAYLIST_DURATION_TOLERANCE_SECONDS", "15")))
+INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES = max(1, int(os.environ.get("INSTANT_PLAYLIST_RETRIEVAL_MAX_CANDIDATES", "600")))
 # Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down)
 PLAYLIST_ENERGY_ARC = os.environ.get("PLAYLIST_ENERGY_ARC", "False").lower() == "true"
 

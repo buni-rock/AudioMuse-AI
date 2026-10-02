@@ -133,13 +133,19 @@ def validate_ai_config(ai_config: Dict) -> Tuple[bool, Optional[str]]:
             msg = "Provider=OLLAMA but ollama_url is empty"
             logger.error("validate_ai_config: OLLAMA url empty")
             return False, msg
+        # Accept a base URL as well as an explicit endpoint. The provider
+        # derives /api/chat and /api/generate from the base URL when needed.
         if not ("/api/generate" in url or "/api/chat" in url):
-            msg = (
-                f"Provider=OLLAMA but URL {ai_config.get('ollama_url')!r} does not look like an Ollama endpoint "
-                "(expected path /api/generate or /api/chat)"
-            )
-            logger.error("validate_ai_config: OLLAMA url path mismatch")
-            return False, msg
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
+                msg = (
+                    f"Provider=OLLAMA but URL {ai_config.get('ollama_url')!r} is invalid. "
+                    "Use an Ollama base URL or /api/generate or /api/chat endpoint."
+                )
+                logger.error("validate_ai_config: OLLAMA url invalid")
+                return False, msg
         if not ai_config.get("ollama_model"):
             msg = "Provider=OLLAMA but ollama_model is empty"
             logger.error("validate_ai_config: OLLAMA model empty")
@@ -208,6 +214,14 @@ def generate_text(
     skip_delay: bool = False,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    structured_format: Optional[Dict | str] = None,
+    system_prompt: Optional[str] = None,
+    think: Optional[bool | str] = None,
+    num_ctx: Optional[int] = None,
+    call_metadata: Optional[Dict] = None,
+    timeout: Optional[float] = None,
+    allow_think_fallbacks: bool = True,
+    selection_stream: bool = False,
 ) -> str:
     valid, err = validate_ai_config(ai_config)
     if not valid:
@@ -218,14 +232,23 @@ def generate_text(
     if provider == "NONE":
         return AI_NAMING_SKIPPED
     if provider == "OLLAMA":
-        return ai_api_openai.generate_text(
+        # Unlike OpenAI URLs, Ollama configuration accepts a bare base URL.
+        # Route by the already-validated provider instead of asking the
+        # OpenAI-compatible URL detector to infer Ollama from an endpoint path.
+        return ai_api_openai.generate_text_ollama_chat(
             ai_config["ollama_url"],
             ai_config["ollama_model"],
             prompt,
-            api_key="no-key-needed",
-            skip_delay=skip_delay,
             temperature=temperature,
             max_tokens=max_tokens,
+            structured_format=structured_format,
+            system_prompt=system_prompt,
+            think=think,
+            num_ctx=num_ctx,
+            call_metadata=call_metadata,
+            timeout=timeout,
+            allow_think_fallbacks=allow_think_fallbacks,
+            selection_stream=selection_stream,
         )
     if provider == "OPENAI":
         return ai_api_openai.generate_text(

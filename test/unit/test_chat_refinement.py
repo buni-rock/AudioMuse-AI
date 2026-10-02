@@ -189,9 +189,119 @@ class TestShapeHints:
         assert _hints('songs added recently')['added_within_days'] == planner.RECENTLY_ADDED_DAYS
         assert _hints('songs added this week')['added_within_days'] == 7
 
-    def test_requested_playlist_shape(self):
-        shape = planner.requested_playlist_shape('give me 20 songs, one per artist')
-        assert shape == {'song_count': 20, 'max_per_artist': 1}
+    def test_named_seed_extraction_handles_starting_from_request(self):
+        request = (
+            'I would like a 30 minute playlist starting from Dark chest of wonders songs. '
+            'The playlist should contain similar songs to this one.'
+        )
+        assert planner.extract_named_song_seed_details(request)['title'] == 'Dark chest of wonders'
+
+    @pytest.mark.parametrize(
+        'request_text, expected_title, expected_artist',
+        [
+            (
+                'I would like you to build me a 30 minutes playlist starting from Dark chest of wonders songs. '
+                'The playlist should contain similar songs to this one.',
+                'Dark chest of wonders', None,
+            ),
+            ('make me songs similar to Dark Chest Of Wonders', 'Dark Chest Of Wonders', None),
+            ('start with Dark Chest Of Wonders by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
+            ('based on "Dark Chest Of Wonders" by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
+            ("Create a playlist using Nightwish's Harvest as a seed.", 'Harvest', 'Nightwish'),
+            ("Use Metallica's Nothing Else Matters as the seed.", 'Nothing Else Matters', 'Metallica'),
+        ],
+    )
+    def test_named_seed_parser_uses_explicit_cues(
+        self, request_text, expected_title, expected_artist
+    ):
+        details = planner.extract_named_song_seed_details(request_text)
+        assert details['title'] == expected_title
+        assert details.get('artist') == expected_artist
+
+    def test_named_seed_parser_does_not_treat_would_like_as_a_seed(self):
+        assert planner.extract_named_song_seed_details('I would like you to build a 30 minutes playlist') is None
+
+    def test_planner_failure_does_not_infer_seed_semantics_from_raw_text(self, monkeypatch):
+        monkeypatch.setattr(planner, 'call_ai_for_plan', lambda *a, **k: {'error': 'invalid JSON: unexpected text'})
+        request = 'starting from Dark Chest Of Wonders, make similar songs'
+        logs = []
+        pipeline = planner.plan_and_execute_once(
+            user_message=request, tools=[], ai_config={'provider': 'OLLAMA'},
+            log_messages=logs, raw_user_request=request,
+        )
+        with pytest.raises(StopIteration) as stopped:
+            while True:
+                next(pipeline)
+        assert stopped.value.value['error'] == 'invalid JSON: unexpected text'
+        assert any('invalid JSON: unexpected text' in line for line in logs)
+
+
+class TestSeedNormalization:
+    @pytest.mark.parametrize(
+        'seed',
+        [
+            {'type': 'song', 'title': 'Dark Chest of Wonders'},
+            {'type': 'song', 'name': 'Dark Chest of Wonders'},
+            {'kind': 'song', 'title': 'Dark Chest of Wonders'},
+            {'kind': 'track', 'song_title': 'Dark Chest of Wonders'},
+        ],
+    )
+    def test_title_only_song_aliases_resolve_to_internal_seed_shape(self, seed, monkeypatch):
+        monkeypatch.setattr(
+            tool_impl, 'resolve_song_by_title',
+            lambda title, artist_hint='': {
+                'item_id': 'seed-opaque', 'title': 'Dark Chest Of Wonders',
+                'author': 'Nightwish', 'album': 'Once',
+            },
+        )
+        logs = []
+        out = planner.validate_plan_args(
+            [{'name': 'seed_search', 'arguments': {'seeds': [seed]}}],
+            user_wants_rating=False, log_messages=logs,
+        )
+        assert out[0]['arguments']['seeds'] == [
+            {'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish'}
+        ]
+        assert any('seed normalized:' in line for line in logs)
+
+    def test_artist_kind_and_name_alias_normalize(self):
+        logs = []
+        out = planner.validate_plan_args(
+            [{'name': 'seed_search', 'arguments': {'seeds': [
+                {'kind': 'artist', 'artist_name': 'Nightwish'}
+            ]}}],
+            user_wants_rating=False, log_messages=logs,
+        )
+        assert out[0]['arguments']['seeds'] == [
+            {'type': 'artist', 'name': 'Nightwish'}
+        ]
+
+    def test_semantic_song_anchor_replaces_a_conflicting_seed_search(self, monkeypatch):
+        import tasks.ai.tool_impl as impl
+        monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, artist_hint=None: {
+            'item_id': 'fp-authoritative', 'title': 'Dark Chest Of Wonders',
+            'author': 'Nightwish', 'album': 'End Of An Era',
+        })
+        plan = ToolPlan(primaries=[
+            {'name': 'seed_search', 'arguments': {'seeds': [
+                {'type': 'artist', 'name': 'Dark Chest Of Wonders'}
+            ]}},
+            {'name': 'text_match', 'arguments': {'query': 'female vocals'}}
+        ])
+        logs = []
+        intent = {'anchors': [{
+            'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish',
+            'role': 'mandatory', 'include_in_final': True,
+        }]}
+        mandatory = planner._resolve_intent_anchors(intent, plan.primaries, logs)
+        assert plan.primaries == [
+            {'name': 'seed_search', 'arguments': {'seeds': [{
+                'type': 'song', 'title': 'Dark Chest Of Wonders', 'artist': 'Nightwish',
+                'track_id': 'fp-authoritative',
+            }], 'blend_mode': 'union'}},
+            {'name': 'text_match', 'arguments': {'query': 'female vocals'}},
+        ]
+        assert [track['item_id'] for track in mandatory] == ['fp-authoritative']
 
 
 class TestPlanRepairs:
@@ -283,7 +393,7 @@ class TestPlanRepairs:
         monkeypatch.setattr(tool_impl, '_fetch_pool_features', lambda ids: {i: {'mood_vector': 'rock:0.7'} for i in ids})
         out = planner._backfill_genre_matches({'genres': ['rock']}, pool, feats, {}, 5, [])
         assert [s['item_id'] for s in out] == ['p1', 'p2', 'x1']
-        assert calls[0]['genres'] == ['rock'] and calls[0]['get_songs'] == 200
+        assert calls[0]['genres'] == ['rock'] and calls[0]['get_songs'] == 5
 
     def test_songs_whose_main_style_is_the_genre_lead(self, monkeypatch):
         songs = [{'item_id': 'x'}, {'item_id': 'y'}, {'item_id': 'z'}]
@@ -521,6 +631,56 @@ class TestSeedModes:
     def _seed_call(self, seeds, blend='union'):
         return [{'name': 'seed_search', 'arguments': {'seeds': seeds, 'blend_mode': blend}}]
 
+    def test_explicit_song_reference_replaces_mutated_artist_before_seed_search(self, monkeypatch):
+        request = (
+            "Here is a list of songs I love:\n"
+            "- Temple of the King from Rainbow,\n"
+            "- Lound and clear from The Cranberries,\n"
+            "- Every breaking wave from U2,\n"
+            "- Paradise from Within Temptation.\n"
+            "Could you assemble a playlist?"
+        )
+        intent = {'anchors': [
+            {'type': 'song', 'title': 'Temple of the King', 'artist': 'Rainbow', 'role': 'anchor', 'include_in_final': True},
+            {'type': 'song', 'title': 'Lound and clear', 'artist': 'The Cranberries', 'role': 'anchor', 'include_in_final': True},
+            {'type': 'song', 'title': 'Every breaking wave', 'artist': 'U2', 'role': 'anchor', 'include_in_final': True},
+            {'type': 'song', 'title': 'Paradise', 'artist': 'Kaci', 'role': 'anchor', 'include_in_final': True},
+        ]}
+        logs = []
+        planner._preserve_explicit_song_references(intent, request, logs)
+        paradise = next(anchor for anchor in intent['anchors'] if anchor['title'] == 'Paradise')
+        assert paradise['artist'] == 'Within Temptation'
+
+        def resolve(title, artist_hint=None):
+            if title == 'Paradise':
+                return {'item_id': 'paradise-id', 'title': 'Paradise (What About Us?) (Feat. Tarja)', 'author': 'Within Temptation'}
+            return {'item_id': title, 'title': title, 'author': artist_hint}
+
+        monkeypatch.setattr(tool_impl, 'resolve_song_by_title', resolve)
+        calls = self._seed_call([{'type': 'song', 'title': 'Paradise', 'artist': 'Kaci'}])
+        planner._resolve_intent_anchors(intent, calls, logs)
+        plan = planner.validate_and_normalize_plan(calls)
+        plan.intent = intent
+        canonical = []
+        for anchor in intent['canonical_retrieval_anchors']:
+            track = anchor['resolved_track']
+            canonical.append({'type': 'song', 'title': track['title'], 'artist': track['artist'],
+                              'track_id': str(track['item_id'])})
+        calls[0]['arguments']['seeds'] = canonical
+
+        paradise_seed = next(seed for seed in calls[0]['arguments']['seeds'] if seed['title'].startswith('Paradise'))
+        assert paradise_seed == {
+            'type': 'song', 'title': 'Paradise (What About Us?) (Feat. Tarja)',
+            'artist': 'Within Temptation',
+            'track_id': 'paradise-id',
+        }
+        planner._assert_canonical_seed_search_args(calls[0]['arguments'], plan.intent)
+        with pytest.raises(ValueError, match='Canonical anchor mismatch'):
+            planner._assert_canonical_seed_search_args(
+                {'seeds': [{'type': 'song', 'title': 'Paradise', 'artist': 'Kaci'}]},
+                plan.intent,
+            )
+
     def test_the_model_blend_choice_is_kept_for_two_seeds(self):
         seeds = [{'type': 'artist', 'name': 'Artist A'}, {'type': 'artist', 'name': 'Artist B'}]
         out = planner.validate_plan_args(
@@ -529,26 +689,40 @@ class TestSeedModes:
         )
         assert out[0]['arguments']['blend_mode'] == 'union'
 
-    def test_from_one_seed_to_the_other_is_a_journey(self):
+    def test_planner_start_and_destination_roles_define_a_journey(self, monkeypatch):
+        import tasks.ai.tool_impl as impl
+        monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, artist_hint=None: {
+            'item_id': title, 'title': title, 'author': artist_hint,
+        })
         seeds = [
             {'type': 'song', 'title': 'Song 1', 'artist': 'Artist A'},
             {'type': 'song', 'title': 'Song 2', 'artist': 'Artist B'},
         ]
-        out = planner.validate_plan_args(
-            self._seed_call(seeds), user_wants_rating=False,
-            request_text='from Song 1 by Artist A to Song 2 by Artist B',
-        )
+        intent = {'anchors': [
+            {'type': 'song', 'title': 'Song 1', 'artist': 'Artist A', 'role': 'start', 'include_in_final': True},
+            {'type': 'song', 'title': 'Song 2', 'artist': 'Artist B', 'role': 'destination', 'include_in_final': True},
+        ]}
+        calls = self._seed_call(seeds)
+        planner._resolve_intent_anchors(intent, calls, [])
+        out = planner.validate_plan_args(calls, user_wants_rating=False)
         assert out[0]['arguments']['blend_mode'] == 'journey'
 
-    def test_an_empty_subtract_does_not_hide_a_journey(self):
+    def test_semantic_journey_roles_override_empty_subtract(self, monkeypatch):
+        import tasks.ai.tool_impl as impl
+        monkeypatch.setattr(impl, 'resolve_song_by_title', lambda title, artist_hint=None: {
+            'item_id': title, 'title': title, 'author': artist_hint,
+        })
         seeds = [
             {'type': 'song', 'title': 'Song 1', 'artist': 'Artist A'},
             {'type': 'song', 'title': 'Song 2', 'artist': 'Artist B'},
         ]
         calls = [{'name': 'seed_search', 'arguments': {'seeds': seeds, 'blend_mode': 'subtract', 'subtract': []}}]
-        out = planner.validate_plan_args(
-            calls, user_wants_rating=False, request_text='A journey from Song 1 to Song 2',
-        )
+        intent = {'anchors': [
+            {'type': 'song', 'title': 'Song 1', 'artist': 'Artist A', 'role': 'start', 'include_in_final': True},
+            {'type': 'song', 'title': 'Song 2', 'artist': 'Artist B', 'role': 'destination', 'include_in_final': True},
+        ]}
+        planner._resolve_intent_anchors(intent, calls, [])
+        out = planner.validate_plan_args(calls, user_wants_rating=False)
         assert out[0]['arguments']['blend_mode'] == 'journey'
         assert 'subtract' not in out[0]['arguments']
 
