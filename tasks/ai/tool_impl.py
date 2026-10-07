@@ -411,6 +411,30 @@ def resolve_song_by_title(song_title: str, artist_hint: str = "") -> Optional[Di
                 "Exact song-title rows for %r did not match requested artist %r; trying same-artist fuzzy resolution",
                 title, artist_hint,
             )
+        if not artist_hint:
+            # Some imported libraries prefix the performer in the title field
+            # (for example, ``Tony Carey - Room With A View``) while leaving
+            # the artist column unknown. A title-only request should still
+            # resolve that canonical library row.
+            normalized_title = _normalize_for_match(title)
+            if normalized_title:
+                with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                    cur.execute(
+                        """SELECT item_id, title, author, album
+                           FROM public.score
+                           WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(title), ' ', ''), '-', ''), '‐', ''), '/', ''), '''', '') ILIKE %s
+                           ORDER BY LENGTH(title), item_id
+                           LIMIT 50""",
+                        (f"%{normalized_title}%",),
+                    )
+                    contained_rows = [dict(row) for row in cur.fetchall()]
+                if contained_rows:
+                    resolved = contained_rows[0]
+                    logger.info(
+                        "Song title-contained match: requested=%r resolved=%r by %r",
+                        title, resolved.get('title'), resolved.get('author'),
+                    )
+                    return resolved
         # A title-only mention often omits library annotations such as
         # “(feat. Eyelar)” or “(PMEDIA)”. Prefer a title-prefix match by the
         # requested artist before the broad fuzzy search, whose bounded pool can
