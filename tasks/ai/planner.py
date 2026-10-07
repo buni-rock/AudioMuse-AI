@@ -1203,10 +1203,13 @@ _SEED_QUOTED_RE = re.compile(r"[\"'`]([^\"'`]{2,200})[\"'`]")
 _SEED_AS_BOUNDARY_RE = re.compile(r"\s+as\s+(?:a\s+)?seed\b", re.IGNORECASE)
 
 
-def _trim_seed_text(value: str, *, artist: bool = False) -> str:
+def _trim_seed_text(value: str, *, artist: bool = False, preserve_with: bool = False) -> str:
     value = value.strip().strip(" \t\r\n\"'`.,:;!?()[]{}")
     boundaries = [
-        _SEED_HARD_BOUNDARY_RE,
+        (_SEED_HARD_BOUNDARY_RE if not preserve_with else re.compile(
+            r"[,!?;\n]|\.(?=\s|$)|\s+(?:songs?|tracks?|and|that|which|but)\b",
+            re.IGNORECASE,
+        )),
         _SEED_CONTEXT_BOUNDARY_RE,
         _SEED_FOR_BOUNDARY_RE,
         _SEED_AS_BOUNDARY_RE,
@@ -1248,10 +1251,12 @@ def extract_named_song_seed_details(text: str) -> Optional[Dict[str, str]]:
             return {"title": title}
 
     capture = None
+    starting_from = False
     for cue in _NAMED_SEED_CUES:
         match = cue.search(text)
         if match:
             capture = text[match.end():].strip()
+            starting_from = cue.pattern.startswith(r"\bstarting")
             break
 
     if capture is None:
@@ -1276,7 +1281,9 @@ def extract_named_song_seed_details(text: str) -> Optional[Dict[str, str]]:
     else:
         by_match = _SEED_BY_RE.search(capture)
         title_source = capture[:by_match.start()] if by_match else capture
-        title = _trim_seed_text(title_source)
+        if starting_from:
+            title_source = re.sub(r"^(?:the\s+)?(?:song|track)\s+", "", title_source, count=1, flags=re.IGNORECASE)
+        title = _trim_seed_text(title_source, preserve_with=starting_from)
         remainder = capture[by_match.end():] if by_match else ""
 
     if not title:

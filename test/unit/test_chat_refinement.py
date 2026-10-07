@@ -204,6 +204,11 @@ class TestShapeHints:
                 'The playlist should contain similar songs to this one.',
                 'Dark chest of wonders', None,
             ),
+            (
+                'Can you create me a playlist starting from song Room with a View? '
+                'I would like similar songs to this one.',
+                'Room with a View', None,
+            ),
             ('make me songs similar to Dark Chest Of Wonders', 'Dark Chest Of Wonders', None),
             ('start with Dark Chest Of Wonders by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
             ('based on "Dark Chest Of Wonders" by Nightwish', 'Dark Chest Of Wonders', 'Nightwish'),
